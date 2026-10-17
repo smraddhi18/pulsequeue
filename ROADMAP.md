@@ -1,0 +1,59 @@
+# PulseQueue Roadmap
+
+PulseQueue is a distributed background job queue for Node.js services: producers enqueue jobs over an HTTP API, a pool of workers leases and runs them with retries and exponential backoff, failed jobs land in a dead-letter queue, and an operator dashboard API exposes queue health. Built in TypeScript with Fastify, PostgreSQL (source of truth) and Redis (fast lease/notify path).
+
+Status legend: [ ] planned, [~] in progress, [x] done
+
+## Milestone 0: Project foundation
+- [~] Repo created, roadmap written (2026-10-17)
+- [ ] TypeScript + Fastify skeleton with layered structure (routes, services, repositories, domain)
+- [ ] Config from env vars validated with zod, fail fast on bad config
+- [ ] Structured JSON logging with pino and request IDs
+- [ ] Central error handling with typed domain errors and consistent error responses
+- [ ] ESLint + Prettier, Vitest test setup, health and readiness endpoints
+- [ ] Dockerfile (multi-stage), docker-compose with Postgres and Redis
+- [ ] GitHub Actions CI: lint, typecheck, test
+
+## Milestone 1: Job model and enqueue API
+- [ ] Postgres schema and migrations for queues, jobs and job attempts
+- [ ] POST /queues/:name/jobs with payload validation, priority, delay and max attempts
+- [ ] Idempotency keys so producers can safely retry enqueue
+- [ ] GET job status, list jobs with cursor pagination
+
+## Milestone 2: Workers, leasing and retries
+- [ ] Worker process that leases jobs with SELECT ... FOR UPDATE SKIP LOCKED
+- [ ] Visibility timeout and heartbeats so crashed workers release jobs
+- [ ] Retries with exponential backoff and jitter
+- [ ] Graceful shutdown that drains in-flight jobs
+- [ ] Integration tests with real Postgres (testcontainers)
+
+## Milestone 3: Dead-letter queue and replay
+- [ ] Move jobs to DLQ after max attempts, keep full attempt history
+- [ ] DLQ inspect, replay and purge endpoints
+- [ ] Poison-message detection
+
+## Milestone 4: Scheduling
+- [ ] Delayed jobs and cron-style recurring jobs
+- [ ] Leader election so only one scheduler fires each tick
+
+## Milestone 5: Redis fast path and caching
+- [ ] Redis pub/sub wake-ups so idle workers stop polling
+- [ ] Cached queue stats with explicit invalidation
+
+## Milestone 6: Auth, multi-tenancy and rate limiting
+- [ ] API keys per tenant, hashed at rest
+- [ ] Per-tenant and per-queue rate limits (token bucket in Redis)
+- [ ] Queue-level concurrency limits
+
+## Milestone 7: Dashboard API and observability
+- [ ] Queue depth, throughput, latency and failure-rate endpoints
+- [ ] Prometheus metrics, OpenTelemetry tracing across enqueue and execution
+- [ ] Grafana dashboard in docker-compose
+
+## Milestone 8: Load testing and hardening
+- [ ] k6 load tests with documented throughput and latency numbers
+- [ ] Chaos tests: kill workers mid-job, restart Postgres
+- [ ] Scaling notes and capacity plan in README
+
+## Progress log
+- 2026-10-17: Project chosen, repo created, roadmap written.
