@@ -12,9 +12,30 @@ concurrency:
 
 jobs:
   build:
-    name: Lint, typecheck, test
+    name: Lint, typecheck, build, test
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pulsequeue
+          POSTGRES_PASSWORD: pulsequeue
+          POSTGRES_DB: pulsequeue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pulsequeue -d pulsequeue"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://pulsequeue:pulsequeue@localhost:5432/pulsequeue
+      TEST_DATABASE_URL: postgres://pulsequeue:pulsequeue@localhost:5432/pulsequeue
+      REDIS_URL: redis://localhost:6379
 
     steps:
       - name: Checkout
@@ -29,15 +50,25 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Format check
+        run: npm run format:check
+
       - name: Lint
         run: npm run lint
 
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Build
+        run: npm run build
+
+      # Exercises the compiled migration CLI exactly as the Docker image runs it,
+      # against a clean Postgres 16; running it twice proves it is idempotent.
+      - name: Run migrations
+        run: |
+          npm run migrate
+          npm run migrate
+
+      # Unit tests plus integration tests (each suite migrates its own schema).
       - name: Test
         run: npm test
-        env:
-          NODE_ENV: test
-          DATABASE_URL: postgres://pulsequeue:pulsequeue@localhost:5432/pulsequeue
-          REDIS_URL: redis://localhost:6379
