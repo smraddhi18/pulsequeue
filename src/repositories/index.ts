@@ -1,14 +1,13 @@
 /**
- * Repository layer stubs.
- * Milestone 1 introduces JobRepository / QueueRepository backed by Postgres.
- * Keep data access out of routes and services through these interfaces.
+ * Repository layer: the only place that knows SQL. Each repository takes a
+ * Queryable (pool or transaction client) and returns domain objects; driver
+ * errors are translated to typed domain errors in db/query.ts.
  */
-
-export interface RepositoryContext {
-  // Placeholder for a future DB client / transaction handle.
-  readonly ready: boolean;
-}
-
-export function createRepositoryContext(): RepositoryContext {
-  return { ready: false };
-}
+export { QueueRepository } from './queue.repository.js';
+export {
+  JobRepository,
+  type StoredJob,
+  type InsertJobParams,
+  type InsertJobResult,
+  type ListJobsParams,
+} from './job.repository.js';
