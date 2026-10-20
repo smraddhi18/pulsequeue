@@ -25,6 +25,8 @@ RUN useradd --system --uid 10001 --create-home pulsequeue
 COPY --from=build --chown=pulsequeue:pulsequeue /app/package.json /app/package-lock.json* ./
 COPY --from=build --chown=pulsequeue:pulsequeue /app/node_modules ./node_modules
 COPY --from=build --chown=pulsequeue:pulsequeue /app/dist ./dist
+# SQL migrations ship with the image; `node dist/db/migrate-cli.js` applies them.
+COPY --chown=pulsequeue:pulsequeue migrations ./migrations
 
 USER pulsequeue
 EXPOSE 3000

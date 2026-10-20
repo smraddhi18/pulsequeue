@@ -17,10 +17,12 @@ Status legend: [ ] planned, [~] in progress, [x] done
 
 ## Milestone 1: Job model and enqueue API
 
-- [ ] Postgres schema and migrations for queues, jobs and job attempts
-- [ ] POST /queues/:name/jobs with payload validation, priority, delay and max attempts
-- [ ] Idempotency keys so producers can safely retry enqueue
-- [ ] GET job status, list jobs with cursor pagination
+- [x] Postgres schema and migrations for queues, jobs and job attempts
+- [x] POST /queues/:name/jobs with payload validation, priority, delay and max attempts
+- [x] Idempotency keys so producers can safely retry enqueue
+- [x] GET job status, list jobs with cursor pagination
+- [x] Postgres pool from env config, readiness check, graceful pool shutdown
+- [x] Integration tests against real Postgres (CI postgres:16 service container)
 
 ## Milestone 2: Workers, leasing and retries
 
@@ -28,7 +30,7 @@ Status legend: [ ] planned, [~] in progress, [x] done
 - [ ] Visibility timeout and heartbeats so crashed workers release jobs
 - [ ] Retries with exponential backoff and jitter
 - [ ] Graceful shutdown that drains in-flight jobs
-- [ ] Integration tests with real Postgres (testcontainers)
+- [ ] Concurrency tests for leasing against real Postgres (many workers, no double-run)
 
 ## Milestone 3: Dead-letter queue and replay
 
@@ -69,3 +71,4 @@ Status legend: [ ] planned, [~] in progress, [x] done
 - 2026-10-17: Project chosen, repo created, roadmap written.
 - 2026-10-18: No commit — box infra stuck starting up; daily routine blocked.
 - 2026-10-19: Milestone 0 foundation landed locally — TypeScript/Fastify skeleton, zod config, pino + request IDs, typed errors, /health + /ready, Vitest, ESLint/Prettier, multi-stage Dockerfile, docker-compose (Postgres 16 + Redis 7), GitHub Actions CI.
+- 2026-10-20: Milestone 1 done — SQL migrations (queues, jobs, job_attempts) with a checksummed, advisory-locked runner; POST /queues/:name/jobs with zod validation and race-safe idempotency keys (unique index + ON CONFLICT, request fingerprint, 422 on reuse); GET /jobs/:id and keyset-paginated GET /queues/:name/jobs; pg pool wired into /ready and shutdown; unit + real-Postgres integration tests, CI Postgres service.

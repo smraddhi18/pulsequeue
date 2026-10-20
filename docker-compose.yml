@@ -1,18 +1,40 @@
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+  DATABASE_URL: postgres://pulsequeue:pulsequeue@postgres:5432/pulsequeue
+  REDIS_URL: redis://redis:6379
+
 services:
+  # One-shot schema migration. Runs to completion before the API starts, so
+  # the API never serves traffic against an old schema. The runner holds an
+  # advisory lock, so a second concurrent run (e.g. scaled replicas) just waits.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pulsequeue:local
+    command: ['node', 'dist/db/migrate-cli.js']
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    image: pulsequeue:local
     ports:
       - '${PORT:-3000}:3000'
     environment:
-      NODE_ENV: production
+      <<: *app-env
       HOST: 0.0.0.0
       PORT: 3000
-      LOG_LEVEL: info
-      DATABASE_URL: postgres://pulsequeue:pulsequeue@postgres:5432/pulsequeue
-      REDIS_URL: redis://redis:6379
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
