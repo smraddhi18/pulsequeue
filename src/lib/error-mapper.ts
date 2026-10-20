@@ -61,6 +61,20 @@ export function mapErrorToResponse(err: unknown): MappedError {
     };
   }
 
+  // Fastify's own client errors (malformed JSON, body over bodyLimit, wrong
+  // content type, ...). Their messages are written for clients, so keep them.
+  if (isFastifyClientError(err)) {
+    return {
+      statusCode: err.statusCode,
+      body: {
+        error: {
+          code: CLIENT_ERROR_CODES[err.statusCode] ?? 'BAD_REQUEST',
+          message: err.message,
+        },
+      },
+    };
+  }
+
   return {
     statusCode: 500,
     body: {
@@ -70,4 +84,24 @@ export function mapErrorToResponse(err: unknown): MappedError {
       },
     },
   };
+}
+
+const CLIENT_ERROR_CODES: Record<number, string> = {
+  400: 'BAD_REQUEST',
+  413: 'PAYLOAD_TOO_LARGE',
+  415: 'UNSUPPORTED_MEDIA_TYPE',
+};
+
+function isFastifyClientError(
+  err: unknown,
+): err is { statusCode: number; code: string; message: string } {
+  if (typeof err !== 'object' || err === null) return false;
+  const candidate = err as { statusCode?: unknown; code?: unknown };
+  return (
+    typeof candidate.statusCode === 'number' &&
+    candidate.statusCode >= 400 &&
+    candidate.statusCode < 500 &&
+    typeof candidate.code === 'string' &&
+    candidate.code.startsWith('FST_')
+  );
 }
