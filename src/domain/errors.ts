@@ -7,7 +7,11 @@ export type ErrorCode =
   | 'INTERNAL_ERROR'
   | 'NOT_FOUND'
   | 'VALIDATION_ERROR'
+  | 'BAD_REQUEST'
+  | 'PAYLOAD_TOO_LARGE'
+  | 'UNSUPPORTED_MEDIA_TYPE'
   | 'CONFLICT'
+  | 'IDEMPOTENCY_KEY_REUSED'
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
   | 'SERVICE_UNAVAILABLE';
@@ -65,6 +69,34 @@ export class ConflictError extends AppError {
     super(message, {
       statusCode: 409,
       code: 'CONFLICT',
+      ...(details !== undefined ? { details } : {}),
+    });
+  }
+}
+
+export class PayloadTooLargeError extends AppError {
+  constructor(message = 'Payload too large', details?: unknown) {
+    super(message, {
+      statusCode: 413,
+      code: 'PAYLOAD_TOO_LARGE',
+      ...(details !== undefined ? { details } : {}),
+    });
+  }
+}
+
+/**
+ * An Idempotency-Key was reused with a different request body. 422 follows the
+ * IETF httpapi Idempotency-Key draft: the request is well-formed but cannot be
+ * processed because it contradicts the request the key was first used with.
+ */
+export class IdempotencyKeyReusedError extends AppError {
+  constructor(
+    message = 'Idempotency-Key was already used with a different request',
+    details?: unknown,
+  ) {
+    super(message, {
+      statusCode: 422,
+      code: 'IDEMPOTENCY_KEY_REUSED',
       ...(details !== undefined ? { details } : {}),
     });
   }
