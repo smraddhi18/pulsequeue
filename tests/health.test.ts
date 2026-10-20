@@ -12,7 +12,11 @@ describe('health routes', () => {
       HOST: '127.0.0.1',
       PORT: '3000',
       LOG_LEVEL: 'silent',
-      DATABASE_URL: 'postgres://pulsequeue:pulsequeue@localhost:5432/pulsequeue',
+      // Deliberately unreachable: these tests must not depend on a running
+      // database. Readiness with a live Postgres is covered in tests/integration.
+      DATABASE_URL: 'postgres://pulsequeue:pulsequeue@127.0.0.1:1/pulsequeue',
+      PG_CONNECTION_TIMEOUT_MS: '500',
+      READINESS_TIMEOUT_MS: '1000',
       REDIS_URL: 'redis://localhost:6379',
     });
     app = await buildApp({ env, logger: false });
@@ -23,7 +27,7 @@ describe('health routes', () => {
     await app.close();
   });
 
-  it('GET /health returns liveness ok', async () => {
+  it('GET /health returns liveness ok without touching dependencies', async () => {
     const res = await app.inject({ method: 'GET', url: '/health' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { status: string; service: string; timestamp: string };
@@ -32,16 +36,16 @@ describe('health routes', () => {
     expect(body.timestamp).toBeTruthy();
   });
 
-  it('GET /ready returns ready when app is booted', async () => {
+  it('GET /ready returns 503 with the failing check when Postgres is unreachable', async () => {
     const res = await app.inject({ method: 'GET', url: '/ready' });
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode).toBe(503);
     const body = res.json() as {
       status: string;
-      checks: { app: string };
+      checks: { app: string; postgres: string };
       timestamp: string;
     };
-    expect(body.status).toBe('ready');
-    expect(body.checks.app).toBe('ok');
+    expect(body.status).toBe('not_ready');
+    expect(body.checks).toEqual({ app: 'ok', postgres: 'fail' });
   });
 
   it('echoes or assigns x-request-id', async () => {
@@ -58,5 +62,36 @@ describe('health routes', () => {
     expect(res.statusCode).toBe(404);
     const body = res.json() as { error: { code: string; message: string } };
     expect(body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('maps malformed JSON bodies to 400 BAD_REQUEST, not 500', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/queues/emails/jobs',
+      headers: { 'content-type': 'application/json' },
+      payload: '{not json',
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('BAD_REQUEST');
+  });
+
+  it('validates enqueue input before touching the database', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/queues/emails/jobs',
+      payload: { payload: {}, priority: 1000 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('maps database outages on API calls to 503 SERVICE_UNAVAILABLE', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/queues/emails/jobs',
+      payload: { payload: {} },
+    });
+    expect(res.statusCode).toBe(503);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('SERVICE_UNAVAILABLE');
   });
 });

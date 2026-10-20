@@ -47,4 +47,28 @@ describe('mapErrorToResponse', () => {
     );
     expect(mapped.statusCode).toBe(429);
   });
+
+  it('maps Fastify client errors to their 4xx status with a stable code', () => {
+    const tooLarge = Object.assign(new Error('Request body is too large'), {
+      statusCode: 413,
+      code: 'FST_ERR_CTP_BODY_TOO_LARGE',
+    });
+    const mapped = mapErrorToResponse(tooLarge);
+    expect(mapped.statusCode).toBe(413);
+    expect(mapped.body.error.code).toBe('PAYLOAD_TOO_LARGE');
+    expect(mapped.body.error.message).toBe('Request body is too large');
+
+    const unsupported = Object.assign(new Error('Unsupported Media Type'), {
+      statusCode: 415,
+      code: 'FST_ERR_CTP_INVALID_MEDIA_TYPE',
+    });
+    expect(mapErrorToResponse(unsupported).body.error.code).toBe('UNSUPPORTED_MEDIA_TYPE');
+  });
+
+  it('does not trust statusCode on arbitrary non-Fastify errors', () => {
+    const sneaky = Object.assign(new Error('internal detail'), { statusCode: 400 });
+    const mapped = mapErrorToResponse(sneaky);
+    expect(mapped.statusCode).toBe(500);
+    expect(mapped.body.error.message).toBe('Internal server error');
+  });
 });
