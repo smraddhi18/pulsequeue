@@ -8,11 +8,12 @@ export async function readinessRoutes(
   const { healthService } = opts;
 
   /**
-   * Readiness probe — safe to receive traffic.
-   * M0: app booted. Later: Postgres + Redis connectivity.
+   * Readiness probe — safe to receive traffic. 200 only when every dependency
+   * probe (Postgres from M1) passes; 503 otherwise so the load balancer stops
+   * routing here while the process stays alive (liveness is separate).
    */
   app.get('/ready', async (_request, reply) => {
-    const body = healthService.getReadiness();
+    const body = await healthService.getReadiness();
     const statusCode = body.status === 'ready' ? 200 : 503;
     return reply.status(statusCode).send(body);
   });
