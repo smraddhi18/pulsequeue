@@ -69,6 +69,17 @@ jobs:
           npm run migrate
           npm run migrate
 
+      # Boots the compiled worker exactly as the Docker image runs it, then sends
+      # SIGTERM: it must drain and exit 0 (graceful-shutdown wiring).
+      - name: Worker smoke test (start, SIGTERM, clean exit)
+        run: |
+          node dist/worker.js &
+          pid=$!
+          sleep 3
+          kill -0 "$pid"
+          kill -TERM "$pid"
+          wait "$pid"
+
       # Unit tests plus integration tests (each suite migrates its own schema).
       - name: Test
         run: npm test
