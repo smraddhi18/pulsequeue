@@ -11,3 +11,10 @@ export {
   type InsertJobResult,
   type ListJobsParams,
 } from './job.repository.js';
+export {
+  LeaseRepository,
+  MAX_ERROR_LENGTH,
+  truncateError,
+  type FailAttemptParams,
+  type LeaseJobsParams,
+} from './lease.repository.js';
