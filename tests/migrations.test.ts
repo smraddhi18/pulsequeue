@@ -84,5 +84,7 @@ describe('loadMigrations', () => {
     const migrations = await loadMigrations(DEFAULT_MIGRATIONS_DIR);
     expect(migrations.length).toBeGreaterThanOrEqual(1);
     expect(migrations[0]?.filename).toBe('0001_create_queues_jobs_attempts.sql');
+    expect(migrations.map((m) => m.filename)).toContain('0002_worker_leasing.sql');
+    expect(migrations.every((m) => m.transactional)).toBe(true);
   });
 });

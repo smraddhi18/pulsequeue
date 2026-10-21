@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { loadDatabaseEnv, loadEnv } from '../src/config/env.js';
+import { loadDatabaseEnv, loadEnv, loadWorkerEnv } from '../src/config/env.js';
 
 const validEnv = {
   NODE_ENV: 'test',
@@ -85,5 +85,64 @@ describe('loadDatabaseEnv', () => {
     expect(() => loadDatabaseEnv({ DATABASE_URL: 'mysql://x' })).toThrow(
       /Invalid environment configuration/,
     );
+  });
+});
+
+describe('loadWorkerEnv', () => {
+  const base = { DATABASE_URL: validEnv.DATABASE_URL };
+
+  it('needs only database settings and applies worker defaults', () => {
+    const env = loadWorkerEnv(base);
+    expect(env.WORKER_CONCURRENCY).toBe(10);
+    expect(env.WORKER_POLL_INTERVAL_MS).toBe(1_000);
+    expect(env.WORKER_LEASE_DURATION_MS).toBe(30_000);
+    expect(env.WORKER_HEARTBEAT_INTERVAL_MS).toBe(10_000);
+    expect(env.WORKER_JOB_TIMEOUT_MS).toBe(300_000);
+    expect(env.WORKER_REAPER_INTERVAL_MS).toBe(15_000);
+    expect(env.WORKER_SHUTDOWN_TIMEOUT_MS).toBe(25_000);
+    expect(env.RETRY_BACKOFF_BASE_MS).toBe(1_000);
+    expect(env.RETRY_BACKOFF_MAX_MS).toBe(300_000);
+    expect(env.WORKER_QUEUES).toBeUndefined();
+    expect(env.WORKER_ID).toBeUndefined();
+  });
+
+  it('parses WORKER_QUEUES as a de-duplicated, trimmed list', () => {
+    const env = loadWorkerEnv({ ...base, WORKER_QUEUES: ' emails, reports ,emails,' });
+    expect(env.WORKER_QUEUES).toEqual(['emails', 'reports']);
+  });
+
+  it.each([
+    ['WORKER_QUEUES', ' , '],
+    ['WORKER_QUEUES', 'Bad Queue'],
+    ['WORKER_CONCURRENCY', '0'],
+    ['WORKER_POLL_INTERVAL_MS', 'fast'],
+    ['WORKER_ID', 'has spaces'],
+  ])('rejects %s=%j', (key, value) => {
+    expect(() => loadWorkerEnv({ ...base, [key]: value })).toThrow(
+      /Invalid environment configuration/,
+    );
+  });
+
+  it('requires at least two heartbeats per lease', () => {
+    expect(() =>
+      loadWorkerEnv({
+        ...base,
+        WORKER_LEASE_DURATION_MS: '10000',
+        WORKER_HEARTBEAT_INTERVAL_MS: '6000',
+      }),
+    ).toThrow(/WORKER_HEARTBEAT_INTERVAL_MS/);
+    expect(
+      loadWorkerEnv({
+        ...base,
+        WORKER_LEASE_DURATION_MS: '10000',
+        WORKER_HEARTBEAT_INTERVAL_MS: '5000',
+      }).WORKER_HEARTBEAT_INTERVAL_MS,
+    ).toBe(5_000);
+  });
+
+  it('rejects a backoff base above the cap', () => {
+    expect(() =>
+      loadWorkerEnv({ ...base, RETRY_BACKOFF_BASE_MS: '5000', RETRY_BACKOFF_MAX_MS: '1000' }),
+    ).toThrow(/RETRY_BACKOFF_BASE_MS/);
   });
 });
