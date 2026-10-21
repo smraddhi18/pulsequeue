@@ -26,3 +26,11 @@ export {
   type EnqueueJobResult,
   type ListJobsInput,
 } from './job.js';
+
+export {
+  type AttemptOutcome,
+  type FailureDisposition,
+  type LeaseRef,
+  type LeasedJob,
+  type ReclaimedJob,
+} from './lease.js';

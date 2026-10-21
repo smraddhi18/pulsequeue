@@ -15,11 +15,13 @@ export const JOB_STATUSES = [
 
 /**
  * - queued:    runnable now
- * - scheduled: waiting for runAt (delayed enqueue, later also retry backoff)
- * - running:   leased by a worker (M2)
+ * - scheduled: waiting for runAt (delayed enqueue or retry backoff)
+ * - running:   leased by a worker, lease kept alive by heartbeats
  * - succeeded: terminal success
- * - failed:    terminal, non-retryable failure
- * - dead:      terminal, exhausted maxAttempts (dead-letter, M3)
+ * - failed:    terminal: non-retryable error, or maxAttempts exhausted (M2;
+ *              Milestone 3 routes exhausted jobs to `dead` via the worker's
+ *              onJobFailed hook)
+ * - dead:      terminal, dead-lettered (M3)
  */
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
