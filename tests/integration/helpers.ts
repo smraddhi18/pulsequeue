@@ -66,6 +66,16 @@ export async function createTestDatabase(
   };
 }
 
+/**
+ * An extra pool on the same isolated schema, standing in for another process
+ * (e.g. one per simulated worker). The caller must end() it.
+ */
+export function createSchemaPool(db: TestDatabase, max = 4): Pool {
+  return createPool(loadDatabaseEnv({ DATABASE_URL: db.url, PG_POOL_MAX: String(max) }), {
+    options: `-c search_path=${db.schema}`,
+  });
+}
+
 export function testEnv(overrides: Record<string, string> = {}): Env {
   return loadEnv({
     NODE_ENV: 'test',

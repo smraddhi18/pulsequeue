@@ -176,7 +176,7 @@ describeWithDb('schema invariants (Postgres)', () => {
     );
     const before = rows[0]!;
     const { rows: after } = await db.pool.query<{ updated_at: Date }>(
-      "UPDATE jobs SET status = 'running' WHERE id = $1 RETURNING updated_at",
+      'UPDATE jobs SET priority = 5 WHERE id = $1 RETURNING updated_at',
       [before.id],
     );
     expect(after[0]!.updated_at.getTime()).toBeGreaterThan(before.updated_at.getTime());
