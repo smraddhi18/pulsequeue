@@ -31,7 +31,14 @@ COPY --chown=pulsequeue:pulsequeue migrations ./migrations
 USER pulsequeue
 EXPOSE 3000
 
+# One image, two roles. API (default CMD) or worker:
+#   docker run pulsequeue:local node dist/worker.js
+# The worker has no HTTP port, so its container overrides this HEALTHCHECK
+# with a liveness-file check (see docker-compose.yml). Node runs as PID 1
+# without npm in between, so SIGTERM reaches the process and triggers the
+# graceful drain.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+STOPSIGNAL SIGTERM
 CMD ["node", "dist/server.js"]

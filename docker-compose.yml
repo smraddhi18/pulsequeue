@@ -41,6 +41,45 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Job workers: same image, different command. Scale horizontally with
+  # `docker compose up --scale worker=3`; FOR UPDATE SKIP LOCKED lets replicas
+  # share the queue without coordination, and every replica runs a reaper.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pulsequeue:local
+    command: ['node', 'dist/worker.js']
+    environment:
+      <<: *app-env
+      WORKER_CONCURRENCY: 10
+      WORKER_LEASE_DURATION_MS: 30000
+      WORKER_HEARTBEAT_INTERVAL_MS: 10000
+      WORKER_SHUTDOWN_TIMEOUT_MS: 25000
+      WORKER_LIVENESS_FILE: /tmp/pulsequeue-worker.alive
+    # Longer than WORKER_SHUTDOWN_TIMEOUT_MS so in-flight jobs can drain
+    # before Docker escalates SIGTERM to SIGKILL (default is only 10s).
+    stop_grace_period: 40s
+    healthcheck:
+      # The worker serves no HTTP; healthy = its loop touched the file recently.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "const s=require('fs').statSync('/tmp/pulsequeue-worker.alive');process.exit(Date.now()-s.mtimeMs<60000?0:1)",
+        ]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:

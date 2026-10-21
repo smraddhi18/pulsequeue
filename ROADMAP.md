@@ -26,11 +26,11 @@ Status legend: [ ] planned, [~] in progress, [x] done
 
 ## Milestone 2: Workers, leasing and retries
 
-- [ ] Worker process that leases jobs with SELECT ... FOR UPDATE SKIP LOCKED
-- [ ] Visibility timeout and heartbeats so crashed workers release jobs
-- [ ] Retries with exponential backoff and jitter
-- [ ] Graceful shutdown that drains in-flight jobs
-- [ ] Concurrency tests for leasing against real Postgres (many workers, no double-run)
+- [x] Worker process that leases jobs with SELECT ... FOR UPDATE SKIP LOCKED
+- [x] Visibility timeout and heartbeats so crashed workers release jobs
+- [x] Retries with exponential backoff and jitter
+- [x] Graceful shutdown that drains in-flight jobs
+- [x] Concurrency tests for leasing against real Postgres (many workers, no double-run)
 
 ## Milestone 3: Dead-letter queue and replay
 
@@ -72,3 +72,4 @@ Status legend: [ ] planned, [~] in progress, [x] done
 - 2026-10-18: No commit — box infra stuck starting up; daily routine blocked.
 - 2026-10-19: Milestone 0 foundation landed locally — TypeScript/Fastify skeleton, zod config, pino + request IDs, typed errors, /health + /ready, Vitest, ESLint/Prettier, multi-stage Dockerfile, docker-compose (Postgres 16 + Redis 7), GitHub Actions CI.
 - 2026-10-20: Milestone 1 done — SQL migrations (queues, jobs, job_attempts) with a checksummed, advisory-locked runner; POST /queues/:name/jobs with zod validation and race-safe idempotency keys (unique index + ON CONFLICT, request fingerprint, 422 on reuse); GET /jobs/:id and keyset-paginated GET /queues/:name/jobs; pg pool wired into /ready and shutdown; unit + real-Postgres integration tests, CI Postgres service.
+- 2026-10-21: Milestone 2 done — migration 0002 (lease columns, lease_token fencing, running-iff-leased CHECK, one-running-attempt unique index, partial lease-expiry index); worker process (`npm run worker`) with bounded concurrency leasing via a single `FOR UPDATE SKIP LOCKED` statement in priority/run_at order; queue-keyed handler registry with AbortSignal; heartbeats + per-worker reaper for crashed workers; per-attempt timeout; capped exponential backoff with full jitter; every attempt in job_attempts; exhausted jobs -> failed + onJobFailed hook for the M3 DLQ; SIGTERM drain with lease release (refunded attempt); zod worker config; compose worker service + CI SIGTERM smoke test; unit + real-Postgres tests incl. 8 workers x 400 jobs exactly-once.

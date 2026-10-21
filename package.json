@@ -10,6 +10,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
+    "worker": "node dist/worker.js",
+    "worker:dev": "tsx watch src/worker.ts",
     "migrate": "node dist/db/migrate-cli.js",
     "migrate:dev": "tsx src/db/migrate-cli.ts",
     "dev": "tsx watch src/server.ts",
