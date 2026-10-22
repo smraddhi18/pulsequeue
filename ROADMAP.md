@@ -34,9 +34,9 @@ Status legend: [ ] planned, [~] in progress, [x] done
 
 ## Milestone 3: Dead-letter queue and replay
 
-- [ ] Move jobs to DLQ after max attempts, keep full attempt history
-- [ ] DLQ inspect, replay and purge endpoints
-- [ ] Poison-message detection
+- [x] Move jobs to DLQ after max attempts, keep full attempt history
+- [x] DLQ inspect, replay and purge endpoints
+- [x] Poison-message detection
 
 ## Milestone 4: Scheduling
 
@@ -73,3 +73,4 @@ Status legend: [ ] planned, [~] in progress, [x] done
 - 2026-10-19: Milestone 0 foundation landed locally — TypeScript/Fastify skeleton, zod config, pino + request IDs, typed errors, /health + /ready, Vitest, ESLint/Prettier, multi-stage Dockerfile, docker-compose (Postgres 16 + Redis 7), GitHub Actions CI.
 - 2026-10-20: Milestone 1 done — SQL migrations (queues, jobs, job_attempts) with a checksummed, advisory-locked runner; POST /queues/:name/jobs with zod validation and race-safe idempotency keys (unique index + ON CONFLICT, request fingerprint, 422 on reuse); GET /jobs/:id and keyset-paginated GET /queues/:name/jobs; pg pool wired into /ready and shutdown; unit + real-Postgres integration tests, CI Postgres service.
 - 2026-10-21: Milestone 2 done — migration 0002 (lease columns, lease_token fencing, running-iff-leased CHECK, one-running-attempt unique index, partial lease-expiry index); worker process (`npm run worker`) with bounded concurrency leasing via a single `FOR UPDATE SKIP LOCKED` statement in priority/run_at order; queue-keyed handler registry with AbortSignal; heartbeats + per-worker reaper for crashed workers; per-attempt timeout; capped exponential backoff with full jitter; every attempt in job_attempts; exhausted jobs -> failed + onJobFailed hook for the M3 DLQ; SIGTERM drain with lease release (refunded attempt); zod worker config; compose worker service + CI SIGTERM smoke test; unit + real-Postgres tests incl. 8 workers x 400 jobs exactly-once.
+- 2026-10-22: Milestone 3 done — migration 0003 (DLQ as `status = dead` + `dead_reason` / `dead_lettered_at` / `replay_count` / `lease_expiries`, `jobs_dead_has_metadata` invariant, legacy `failed` backfilled into the DLQ and forbidden, partial `jobs_dlq_idx`); dead-lettering inside the lease_token-fenced fail/reap statement so a stale worker cannot dead-letter; poison detection (`NonRetryableError` / `retryable: false`, `InvalidPayloadError`, N lease expiries via `WORKER_POISON_LEASE_EXPIRIES`); `GET /queues/:name/dlq` (keyset, reason filter), `GET /dlq/:jobId` (attempt history), single + bulk replay (guarded UPDATE, exactly-one-wins, `SKIP LOCKED` batches, 409 `JOB_NOT_DEAD_LETTERED`), single + `olderThan` bulk purge; `dlq.*` structured log events; unit + real-Postgres tests incl. 10 concurrent replays, replay-vs-purge races and an end-to-end fail -> DLQ -> replay -> succeed run.
