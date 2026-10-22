@@ -22,10 +22,9 @@ async function main(): Promise<void> {
   const runtime = createWorkerRuntime(env, {
     registry,
     logger,
-    // Dead-letter hook: Milestone 3 moves the job to the DLQ here.
-    onJobFailed: (event) => {
-      logger.warn({ ...event, component: 'dlq-hook' }, 'Job failed permanently (DLQ: Milestone 3)');
-    },
+    // Dead-lettering itself happens inside the fenced fail/reap statement and
+    // is logged there (event: dlq.dead_lettered). Pass onJobFailed here to add
+    // side effects such as paging or a webhook.
   });
 
   let shuttingDown = false;
