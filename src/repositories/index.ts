@@ -17,4 +17,13 @@ export {
   truncateError,
   type FailAttemptParams,
   type LeaseJobsParams,
+  type ReapExpiredOptions,
 } from './lease.repository.js';
+export {
+  DeadLetterRepository,
+  type StoredDeadLetterJob,
+  type ListDeadLettersParams,
+  type ReplayParams,
+  type ReplayBatchParams,
+  type PurgeOlderThanParams,
+} from './dead-letter.repository.js';

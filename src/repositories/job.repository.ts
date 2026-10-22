@@ -34,7 +34,8 @@ export interface ListJobsParams {
   after?: { createdAt: string; id: string };
 }
 
-interface JobRow {
+/** Raw row for JOB_COLUMNS; shared with DeadLetterRepository. */
+export interface JobRow {
   id: string;
   queue_name: string;
   status: JobStatus;
@@ -53,13 +54,13 @@ interface JobRow {
 }
 
 /** Columns selected for every job read; `j` = jobs, `q` = queues. */
-const JOB_COLUMNS = `
+export const JOB_COLUMNS = `
   j.id, q.name AS queue_name, j.status, j.priority, j.payload, j.attempts,
   j.max_attempts, j.run_at, j.idempotency_key, j.request_fingerprint,
   j.last_error, j.finished_at, j.created_at, j.updated_at,
   to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_cursor`;
 
-function toStoredJob(row: JobRow): StoredJob {
+export function toStoredJob(row: JobRow): StoredJob {
   return {
     id: row.id as JobId,
     queue: row.queue_name as QueueName,

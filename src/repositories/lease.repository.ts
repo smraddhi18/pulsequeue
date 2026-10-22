@@ -1,3 +1,4 @@
+import type { DeadLetterReason } from '../domain/dead-letter.js';
 import type { JobId, QueueName } from '../domain/job.js';
 import type { FailureDisposition, LeaseRef, LeasedJob, ReclaimedJob } from '../domain/lease.js';
 import { runQuery } from '../db/query.js';
@@ -16,8 +17,19 @@ export interface FailAttemptParams {
   error: string;
   /** How the attempt ended: a thrown error or the per-attempt timeout. */
   attemptStatus: 'failed' | 'timed_out';
-  /** Delay before the next attempt, or null to fail the job terminally. */
+  /** Delay before the next attempt, or null to dead-letter the job. */
   retryDelayMs: number | null;
+  /** Why the job is dead-lettered when retryDelayMs is null (default attempts_exhausted). */
+  deadLetterReason?: DeadLetterReason;
+}
+
+export interface ReapExpiredOptions {
+  /**
+   * Poison-message threshold: dead-letter a job (reason poison_lease_expired)
+   * once its lease has expired this many times, even with attempts left.
+   * Omit to rely on max_attempts alone.
+   */
+  poisonLeaseExpiries?: number;
 }
 
 interface LeasedRow {
@@ -41,7 +53,9 @@ interface ReclaimedRow {
   previous_worker_id: string;
   attempts: number;
   max_attempts: number;
-  status: 'queued' | 'failed';
+  status: 'queued' | 'dead';
+  dead_reason: DeadLetterReason | null;
+  lease_expiries: number;
 }
 
 /** SET fragment that drops a lease; jobs_running_has_lease requires it whenever status leaves running. */
@@ -188,20 +202,31 @@ export class LeaseRepository {
 
   /**
    * Record a failed attempt and either reschedule the job after
-   * `retryDelayMs` (status scheduled, run_at on the database clock) or fail it
-   * terminally. null = lease lost, nothing written.
+   * `retryDelayMs` (status scheduled, run_at on the database clock) or move
+   * it to the dead-letter queue (status dead + reason + dead_lettered_at).
+   *
+   * Dead-lettering happens here, in the same fenced statement that records
+   * the attempt, not in a follow-up write: it is atomic with the outcome (no
+   * window where a crash leaves the job terminal but outside the DLQ), and a
+   * worker whose lease was lost matches zero rows, so it can neither
+   * dead-letter nor reschedule a job someone else now owns. null = lease
+   * lost, nothing written.
    */
   async fail(lease: LeaseRef, params: FailAttemptParams): Promise<FailureDisposition | null> {
     const error = truncateError(params.error);
-    const rows = await runQuery<{ status: FailureDisposition | 'scheduled' }>(
+    const deadReason =
+      params.retryDelayMs === null ? (params.deadLetterReason ?? 'attempts_exhausted') : null;
+    const rows = await runQuery<{ status: 'dead' | 'scheduled' }>(
       this.db,
       `WITH updated AS (
          UPDATE jobs
-         SET status      = CASE WHEN $4::bigint IS NULL THEN 'failed' ELSE 'scheduled' END::job_status,
-             run_at      = CASE WHEN $4::bigint IS NULL THEN run_at
-                                ELSE now() + ($4::bigint * interval '1 millisecond') END,
-             finished_at = CASE WHEN $4::bigint IS NULL THEN now() ELSE NULL END,
-             last_error  = $3,
+         SET status           = CASE WHEN $4::bigint IS NULL THEN 'dead' ELSE 'scheduled' END::job_status,
+             run_at           = CASE WHEN $4::bigint IS NULL THEN run_at
+                                     ELSE now() + ($4::bigint * interval '1 millisecond') END,
+             finished_at      = CASE WHEN $4::bigint IS NULL THEN now() ELSE NULL END,
+             dead_reason      = $7::dead_letter_reason,
+             dead_lettered_at = CASE WHEN $4::bigint IS NULL THEN now() ELSE NULL END,
+             last_error       = $3,
              ${CLEAR_LEASE}
          WHERE id = $1 AND status = 'running' AND lease_token = $2
          RETURNING id, status
@@ -220,11 +245,12 @@ export class LeaseRepository {
         params.retryDelayMs,
         lease.attemptId,
         params.attemptStatus,
+        deadReason,
       ],
     );
     const status = rows[0]?.status;
     if (status === undefined) return null;
-    return status === 'failed' ? 'failed' : 'retrying';
+    return status === 'dead' ? 'dead_lettered' : 'retrying';
   }
 
   /**
@@ -257,17 +283,24 @@ export class LeaseRepository {
    * Reclaim up to `limit` jobs whose lease expired (worker crashed, hung or
    * partitioned). The attempt is recorded as timed_out and *does* count: a
    * job that keeps killing its worker must eventually stop being retried. A
-   * job with attempts left becomes queued again; otherwise it fails.
+   * job with attempts left becomes queued again; otherwise it is
+   * dead-lettered. Every expiry also bumps lease_expiries, and reaching
+   * `poisonLeaseExpiries` dead-letters the job as a poison message even with
+   * attempts left (a job that OOMs its worker should not get 25 more tries).
    *
    * SKIP LOCKED lets every worker run a reaper without coordination, and it
    * skips rows a live worker is heartbeating right now; the WHERE is
    * re-checked after locking, so a heartbeat that just landed wins.
    */
-  async reapExpired(limit: number): Promise<ReclaimedJob[]> {
+  async reapExpired(limit: number, options: ReapExpiredOptions = {}): Promise<ReclaimedJob[]> {
     const rows = await runQuery<ReclaimedRow>(
       this.db,
       `WITH expired AS (
-         SELECT id, locked_by, lease_token
+         SELECT id, locked_by,
+                CASE
+                  WHEN $2::int IS NOT NULL AND lease_expiries + 1 >= $2::int THEN 'poison_lease_expired'
+                  WHEN attempts >= max_attempts THEN 'attempts_exhausted'
+                END::dead_letter_reason AS dead_reason
          FROM jobs
          WHERE status = 'running' AND lease_expires_at < now()
          ORDER BY lease_expires_at
@@ -276,14 +309,18 @@ export class LeaseRepository {
        ),
        reclaimed AS (
          UPDATE jobs j
-         SET status      = CASE WHEN j.attempts >= j.max_attempts THEN 'failed' ELSE 'queued' END::job_status,
-             run_at      = CASE WHEN j.attempts >= j.max_attempts THEN j.run_at ELSE now() END,
-             finished_at = CASE WHEN j.attempts >= j.max_attempts THEN now() ELSE NULL END,
-             last_error  = 'Lease expired: worker ' || e.locked_by || ' stopped heartbeating',
+         SET status           = CASE WHEN e.dead_reason IS NOT NULL THEN 'dead' ELSE 'queued' END::job_status,
+             run_at           = CASE WHEN e.dead_reason IS NOT NULL THEN j.run_at ELSE now() END,
+             finished_at      = CASE WHEN e.dead_reason IS NOT NULL THEN now() ELSE NULL END,
+             dead_reason      = e.dead_reason,
+             dead_lettered_at = CASE WHEN e.dead_reason IS NOT NULL THEN now() ELSE NULL END,
+             lease_expiries   = j.lease_expiries + 1,
+             last_error       = 'Lease expired: worker ' || e.locked_by || ' stopped heartbeating',
              ${CLEAR_LEASE}
          FROM expired e
          WHERE j.id = e.id
-         RETURNING j.id, j.queue_id, e.locked_by AS previous_worker_id, j.attempts, j.max_attempts, j.status
+         RETURNING j.id, j.queue_id, e.locked_by AS previous_worker_id, j.attempts, j.max_attempts,
+                   j.status, j.dead_reason, j.lease_expiries
        ),
        attempt_rows AS (
          UPDATE job_attempts a
@@ -293,10 +330,10 @@ export class LeaseRepository {
          WHERE a.job_id = r.id AND a.status = 'running'
        )
        SELECT r.id, q.name AS queue_name, r.previous_worker_id, r.attempts, r.max_attempts,
-              r.status::text AS status
+              r.status::text AS status, r.dead_reason::text AS dead_reason, r.lease_expiries
        FROM reclaimed r
        JOIN queues q ON q.id = r.queue_id`,
-      [limit],
+      [limit, options.poisonLeaseExpiries ?? null],
     );
     return rows.map((row) => ({
       jobId: row.id as JobId,
@@ -305,6 +342,8 @@ export class LeaseRepository {
       attempt: row.attempts,
       maxAttempts: row.max_attempts,
       status: row.status,
+      deadLetterReason: row.dead_reason,
+      leaseExpiries: row.lease_expiries,
     }));
   }
 }
