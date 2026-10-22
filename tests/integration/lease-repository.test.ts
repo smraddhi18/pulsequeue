@@ -177,7 +177,7 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     expect(await repo.complete(leased)).toBe(false);
   });
 
-  it('fail with a delay reschedules on the database clock; fail without one is terminal', async () => {
+  it('fail with a delay reschedules on the database clock; fail without one dead-letters', async () => {
     const id = await enqueue('q', { maxAttempts: 2 });
     const [first] = await leaseOne();
     if (!first) throw new Error('nothing leased');
@@ -201,9 +201,9 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     expect(second).toMatchObject({ attempt: 2, attemptNumber: 2 });
     expect(
       await repo.fail(second, { error: 'slow', attemptStatus: 'timed_out', retryDelayMs: null }),
-    ).toBe('failed');
+    ).toBe('dead_lettered');
     row = await jobRow(id);
-    expect(row).toMatchObject({ status: 'failed', attempts: 2, last_error: 'slow' });
+    expect(row).toMatchObject({ status: 'dead', attempts: 2, last_error: 'slow' });
     expect(row.finished_at).not.toBeNull();
     expect((await attempts(id)).map((a) => [a.status, a.error])).toEqual([
       ['failed', 'boom'],
@@ -240,7 +240,7 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     expect(await repo.release(leased, 'stale')).toBe(false);
   });
 
-  it('reaper reclaims expired leases (requeue, or fail on the last attempt) and fences the old owner', async () => {
+  it('reaper reclaims expired leases (requeue, or dead-letter on the last attempt) and fences the old owner', async () => {
     const retryable = await enqueue('q', { maxAttempts: 3, priority: 10 });
     const last = await enqueue('q', { maxAttempts: 1 });
     const healthy = await enqueue('q');
@@ -264,7 +264,7 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     expect(reclaimed.map((r) => [r.jobId, r.status, r.previousWorkerId]).sort()).toEqual(
       [
         [retryable, 'queued', 'crashed'],
-        [last, 'failed', 'crashed'],
+        [last, 'dead', 'crashed'],
       ].sort(),
     );
     expect(await jobRow(retryable)).toMatchObject({
@@ -273,7 +273,7 @@ describeWithDb('LeaseRepository (Postgres)', () => {
       locked_by: null,
     });
     expect((await jobRow(retryable)).last_error).toMatch(/Lease expired: worker crashed/);
-    expect(await jobRow(last)).toMatchObject({ status: 'failed', attempts: 1 });
+    expect(await jobRow(last)).toMatchObject({ status: 'dead', attempts: 1 });
     expect(await jobRow(healthy)).toMatchObject({ status: 'running', locked_by: 'alive' });
     expect((await attempts(retryable))[0]).toMatchObject({ status: 'timed_out' });
 

@@ -204,7 +204,7 @@ describeWithDb('worker (Postgres)', { timeout: 30_000 }, () => {
     ]);
   });
 
-  it('exhausts max attempts into failed and fires the dead-letter hook once', async () => {
+  it('exhausts max attempts into the DLQ and fires the dead-letter hook once', async () => {
     const id = await enqueue('broken', {}, 3);
     const events: JobFailedEvent[] = [];
     startWorker(
@@ -215,7 +215,7 @@ describeWithDb('worker (Postgres)', { timeout: 30_000 }, () => {
       },
       { onJobFailed: (e) => void events.push(e) },
     );
-    await waitFor(() => statusIs(id, 'failed'));
+    await waitFor(() => statusIs(id, 'dead'));
     const row = await job(id);
     expect(row).toMatchObject({ attempts: 3, last_error: 'always broken' });
     expect(row.finished_at).not.toBeNull();
@@ -226,14 +226,14 @@ describeWithDb('worker (Postgres)', { timeout: 30_000 }, () => {
     ]);
   });
 
-  it('fails immediately on NonRetryableError', async () => {
+  it('dead-letters immediately on NonRetryableError', async () => {
     const id = await enqueue('strict', {}, 5);
     startWorker({
       strict: async () => {
         throw new NonRetryableError('invalid payload');
       },
     });
-    await waitFor(() => statusIs(id, 'failed'));
+    await waitFor(() => statusIs(id, 'dead'));
     expect(await job(id)).toMatchObject({
       attempts: 1,
       last_error: 'NonRetryableError: invalid payload',
