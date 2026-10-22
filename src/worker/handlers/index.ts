@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { NonRetryableError } from '../errors.js';
+import { InvalidPayloadError, NonRetryableError } from '../errors.js';
 import type { HandlerRegistry, JobContext } from '../registry.js';
 
 /**
@@ -35,8 +35,9 @@ const demoPayload = z
 export async function demoHandler(ctx: JobContext): Promise<void> {
   const parsed = demoPayload.safeParse(ctx.job.payload);
   if (!parsed.success) {
-    // A malformed payload will be just as malformed next time.
-    throw new NonRetryableError(`Invalid demo payload: ${parsed.error.message}`);
+    // A malformed payload will be just as malformed next time: dead-letter it
+    // at once with reason invalid_payload instead of burning retries.
+    throw new InvalidPayloadError(`Invalid demo payload: ${parsed.error.message}`);
   }
   const { durationMs, failUntilAttempt, nonRetryable } = parsed.data;
   await abortableDelay(durationMs, ctx.signal);
