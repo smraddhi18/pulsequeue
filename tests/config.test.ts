@@ -100,6 +100,7 @@ describe('loadWorkerEnv', () => {
     expect(env.WORKER_JOB_TIMEOUT_MS).toBe(300_000);
     expect(env.WORKER_REAPER_INTERVAL_MS).toBe(15_000);
     expect(env.WORKER_SHUTDOWN_TIMEOUT_MS).toBe(25_000);
+    expect(env.WORKER_POISON_LEASE_EXPIRIES).toBe(3);
     expect(env.RETRY_BACKOFF_BASE_MS).toBe(1_000);
     expect(env.RETRY_BACKOFF_MAX_MS).toBe(300_000);
     expect(env.WORKER_QUEUES).toBeUndefined();
@@ -117,6 +118,8 @@ describe('loadWorkerEnv', () => {
     ['WORKER_CONCURRENCY', '0'],
     ['WORKER_POLL_INTERVAL_MS', 'fast'],
     ['WORKER_ID', 'has spaces'],
+    ['WORKER_POISON_LEASE_EXPIRIES', '0'],
+    ['WORKER_POISON_LEASE_EXPIRIES', '101'],
   ])('rejects %s=%j', (key, value) => {
     expect(() => loadWorkerEnv({ ...base, [key]: value })).toThrow(
       /Invalid environment configuration/,
