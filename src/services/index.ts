@@ -12,3 +12,4 @@ export {
   type JobStore,
   type QueueStore,
 } from './job.service.js';
+export { DlqService, type DeadLetterStore, type ReplayJobResult } from './dlq.service.js';
