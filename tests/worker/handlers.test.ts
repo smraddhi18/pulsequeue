@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { abortableDelay, demoHandler, echoHandler } from '../../src/worker/handlers/index.js';
-import { NonRetryableError } from '../../src/worker/errors.js';
+import { InvalidPayloadError, NonRetryableError } from '../../src/worker/errors.js';
 import type { JobContext } from '../../src/worker/registry.js';
 import { silentLogger } from './fake-store.js';
 
@@ -38,6 +38,11 @@ describe('built-in handlers', () => {
       NonRetryableError,
     );
     await expect(demoHandler(ctx({ extra: 1 }))).rejects.toBeInstanceOf(NonRetryableError);
+    // Bad payloads are the more specific InvalidPayloadError (DLQ reason invalid_payload).
+    await expect(demoHandler(ctx({ extra: 1 }))).rejects.toBeInstanceOf(InvalidPayloadError);
+    await expect(demoHandler(ctx({ nonRetryable: true }))).rejects.not.toBeInstanceOf(
+      InvalidPayloadError,
+    );
     await expect(demoHandler(ctx({ nonRetryable: true }))).rejects.toBeInstanceOf(
       NonRetryableError,
     );

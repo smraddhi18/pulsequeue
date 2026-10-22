@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { backoffCeilingMs, computeBackoffMs } from '../../src/worker/backoff.js';
 import { decideRetry } from '../../src/worker/retry-policy.js';
-import { NonRetryableError } from '../../src/worker/errors.js';
+import { InvalidPayloadError, NonRetryableError } from '../../src/worker/errors.js';
 
 const opts = { baseMs: 1_000, maxMs: 60_000 };
 
@@ -94,6 +94,28 @@ describe('decideRetry', () => {
     expect(
       decideRetry({ attempt: 1, maxAttempts: 10, error: new NonRetryableError('bad') }, opts, half),
     ).toEqual({ kind: 'fail', reason: 'non_retryable' });
+  });
+
+  it('classifies an InvalidPayloadError as invalid_payload (poison message, no retry)', () => {
+    expect(
+      decideRetry(
+        { attempt: 1, maxAttempts: 10, error: new InvalidPayloadError('bad') },
+        opts,
+        half,
+      ),
+    ).toEqual({ kind: 'fail', reason: 'invalid_payload' });
+  });
+
+  it('honours a retryable: false flag on any thrown object', () => {
+    const flagged = Object.assign(new Error('402 from billing'), { retryable: false });
+    expect(decideRetry({ attempt: 1, maxAttempts: 10, error: flagged }, opts, half)).toEqual({
+      kind: 'fail',
+      reason: 'non_retryable',
+    });
+    const explicitRetryable = Object.assign(new Error('503'), { retryable: true });
+    expect(
+      decideRetry({ attempt: 1, maxAttempts: 10, error: explicitRetryable }, opts, half).kind,
+    ).toBe('retry');
   });
 
   it('treats non-Error throwables as retryable', () => {

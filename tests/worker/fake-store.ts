@@ -15,7 +15,8 @@ export interface FakeJob {
   payload: unknown;
   attempts: number;
   maxAttempts: number;
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'scheduled';
+  status: 'queued' | 'running' | 'succeeded' | 'dead' | 'scheduled';
+  deadReason: string | null;
   leaseToken: string | null;
   retryDelays: number[];
   errors: string[];
@@ -47,6 +48,7 @@ export class FakeLeaseStore implements LeaseStore {
       attempts: 0,
       maxAttempts,
       status: 'queued',
+      deadReason: null,
       leaseToken: null,
       retryDelays: [],
       errors: [],
@@ -123,14 +125,18 @@ export class FakeLeaseStore implements LeaseStore {
     return true;
   }
 
-  async fail(lease: LeaseRef, params: FailAttemptParams): Promise<'retrying' | 'failed' | null> {
+  async fail(
+    lease: LeaseRef,
+    params: FailAttemptParams,
+  ): Promise<'retrying' | 'dead_lettered' | null> {
     const job = this.owned(lease);
     if (!job) return null;
     job.errors.push(params.error);
     this.settleAttempt(job, params.attemptStatus);
     if (params.retryDelayMs === null) {
-      job.status = 'failed';
-      return 'failed';
+      job.status = 'dead';
+      job.deadReason = params.deadLetterReason ?? 'attempts_exhausted';
+      return 'dead_lettered';
     }
     job.retryDelays.push(params.retryDelayMs);
     job.status = 'scheduled';

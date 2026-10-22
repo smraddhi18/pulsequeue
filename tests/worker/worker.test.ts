@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { JobId, QueueName } from '../../src/domain/job.js';
 import type { ReclaimedJob } from '../../src/domain/lease.js';
 import { HandlerRegistry, type JobHandler } from '../../src/worker/registry.js';
-import { NonRetryableError } from '../../src/worker/errors.js';
+import { InvalidPayloadError, NonRetryableError } from '../../src/worker/errors.js';
 import {
   Worker,
   runUntilAborted,
@@ -118,7 +118,7 @@ describe('Worker', () => {
     expect(job.retryDelays).toEqual([50, 100]);
   });
 
-  it('fails the job after max attempts and calls the dead-letter hook once', async () => {
+  it('dead-letters the job after max attempts and calls the dead-letter hook once', async () => {
     const store = new FakeLeaseStore();
     const job = store.add('q', {}, 2);
     const events: JobFailedEvent[] = [];
@@ -132,7 +132,8 @@ describe('Worker', () => {
       { onJobFailed: (e) => void events.push(e) },
     );
     worker.start();
-    await waitFor(() => job.status === 'failed');
+    await waitFor(() => job.status === 'dead');
+    expect(job.deadReason).toBe('attempts_exhausted');
     expect(job.attemptStatuses).toEqual(['failed', 'failed']);
     expect(events).toEqual([
       expect.objectContaining({
@@ -158,10 +159,55 @@ describe('Worker', () => {
       { onJobFailed: (e) => void events.push(e) },
     );
     worker.start();
-    await waitFor(() => job.status === 'failed');
+    await waitFor(() => job.status === 'dead');
+    expect(job.deadReason).toBe('non_retryable');
     expect(job.attempts).toBe(1);
     expect(job.errors).toEqual(['NonRetryableError: bad payload']);
     expect(events[0]?.reason).toBe('non_retryable');
+  });
+
+  it('dead-letters an InvalidPayloadError at once with reason invalid_payload', async () => {
+    const store = new FakeLeaseStore();
+    const job = store.add('q', {}, 5);
+    const events: JobFailedEvent[] = [];
+    const worker = makeWorker(
+      store,
+      {
+        q: async () => {
+          throw new InvalidPayloadError('missing field "to"');
+        },
+      },
+      { onJobFailed: (e) => void events.push(e) },
+    );
+    worker.start();
+    await waitFor(() => job.status === 'dead');
+    expect(job.attempts).toBe(1);
+    expect(job.deadReason).toBe('invalid_payload');
+    expect(events).toEqual([
+      expect.objectContaining({ jobId: job.id, reason: 'invalid_payload', source: 'worker' }),
+    ]);
+  });
+
+  it('does not dead-letter (or call the hook) when the lease was lost before fail', async () => {
+    const store = new FakeLeaseStore();
+    const job = store.add('q', {}, 1);
+    const events: JobFailedEvent[] = [];
+    const worker = makeWorker(
+      store,
+      {
+        q: async () => {
+          // Another worker re-leased the job meanwhile: our token is stale.
+          job.leaseToken = 'someone-else';
+          throw new Error('late failure');
+        },
+      },
+      { onJobFailed: (e) => void events.push(e) },
+    );
+    worker.start();
+    await waitFor(() => job.errors.length === 0 && store.leaseCalls.length > 3);
+    expect(job.status).toBe('running');
+    expect(job.deadReason).toBeNull();
+    expect(events).toEqual([]);
   });
 
   it('survives a throwing dead-letter hook', async () => {
@@ -177,9 +223,9 @@ describe('Worker', () => {
       },
     );
     worker.start();
-    await waitFor(() => a.status === 'failed');
+    await waitFor(() => a.status === 'dead');
     const b = store.add('q');
-    await waitFor(() => b.status === 'failed');
+    await waitFor(() => b.status === 'dead');
   });
 
   it('times out a slow attempt, records timed_out, aborts the signal and retries', async () => {
@@ -369,6 +415,8 @@ describe('Reaper', () => {
           attempt: 1,
           maxAttempts: 3,
           status: 'queued' as const,
+          deadLetterReason: null,
+          leaseExpiries: 1,
         },
         {
           jobId: 'b' as JobId,
@@ -376,7 +424,9 @@ describe('Reaper', () => {
           previousWorkerId: 'w1',
           attempt: 3,
           maxAttempts: 3,
-          status: 'failed' as const,
+          status: 'dead' as const,
+          deadLetterReason: 'attempts_exhausted' as const,
+          leaseExpiries: 1,
         },
       ],
       [],
@@ -395,6 +445,40 @@ describe('Reaper', () => {
     expect(calls).toBe(2);
     expect(events).toEqual([
       expect.objectContaining({ jobId: 'b', source: 'reaper', reason: 'attempts_exhausted' }),
+    ]);
+  });
+
+  it('passes the poison threshold to the store and reports poison dead-letters', async () => {
+    const seen: unknown[] = [];
+    const events: JobFailedEvent[] = [];
+    const reaper = new Reaper({
+      store: {
+        reapExpired: async (limit, options) => {
+          seen.push([limit, options]);
+          return [
+            {
+              jobId: 'p' as JobId,
+              queue: 'q' as QueueName,
+              previousWorkerId: 'w1',
+              attempt: 2,
+              maxAttempts: 10,
+              status: 'dead',
+              deadLetterReason: 'poison_lease_expired',
+              leaseExpiries: 2,
+            },
+          ];
+        },
+      },
+      logger: silentLogger,
+      intervalMs: 1_000,
+      batchSize: 5,
+      poisonLeaseExpiries: 2,
+      onJobFailed: (e) => void events.push(e),
+    });
+    await reaper.tick();
+    expect(seen).toEqual([[5, { poisonLeaseExpiries: 2 }]]);
+    expect(events).toEqual([
+      expect.objectContaining({ jobId: 'p', reason: 'poison_lease_expired', source: 'reaper' }),
     ]);
   });
 
