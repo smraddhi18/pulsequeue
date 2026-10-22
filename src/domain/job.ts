@@ -18,10 +18,12 @@ export const JOB_STATUSES = [
  * - scheduled: waiting for runAt (delayed enqueue or retry backoff)
  * - running:   leased by a worker, lease kept alive by heartbeats
  * - succeeded: terminal success
- * - failed:    terminal: non-retryable error, or maxAttempts exhausted (M2;
- *              Milestone 3 routes exhausted jobs to `dead` via the worker's
- *              onJobFailed hook)
- * - dead:      terminal, dead-lettered (M3)
+ * - failed:    legacy (M2). Since Milestone 3 no code path writes it: every
+ *              terminal failure is dead-lettered instead (migration 0003
+ *              moved existing `failed` rows to `dead`). Kept because Postgres
+ *              enum values cannot be dropped safely.
+ * - dead:      terminal, in the dead-letter queue with a reason; can be
+ *              replayed (back to queued/scheduled) or purged (M3)
  */
 export type JobStatus = (typeof JOB_STATUSES)[number];
 

@@ -12,6 +12,7 @@ export type ErrorCode =
   | 'UNSUPPORTED_MEDIA_TYPE'
   | 'CONFLICT'
   | 'IDEMPOTENCY_KEY_REUSED'
+  | 'JOB_NOT_DEAD_LETTERED'
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
   | 'SERVICE_UNAVAILABLE';
@@ -97,6 +98,22 @@ export class IdempotencyKeyReusedError extends AppError {
     super(message, {
       statusCode: 422,
       code: 'IDEMPOTENCY_KEY_REUSED',
+      ...(details !== undefined ? { details } : {}),
+    });
+  }
+}
+
+/**
+ * A DLQ operation (replay, purge) targeted a job that exists but is not
+ * dead-lettered, typically because a concurrent replay already moved it out.
+ * 409: the request is valid but conflicts with the job's current state; the
+ * caller can GET the job to see where it went.
+ */
+export class JobNotDeadLetteredError extends AppError {
+  constructor(message = 'Job is not in the dead-letter queue', details?: unknown) {
+    super(message, {
+      statusCode: 409,
+      code: 'JOB_NOT_DEAD_LETTERED',
       ...(details !== undefined ? { details } : {}),
     });
   }

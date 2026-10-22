@@ -1,3 +1,4 @@
+import type { DeadLetterReason } from './dead-letter.js';
 import type { JobId, QueueName } from './job.js';
 
 /**
@@ -38,8 +39,8 @@ export type AttemptOutcome = 'succeeded' | 'failed' | 'timed_out' | 'released';
 export type FailureDisposition =
   /** Rescheduled after a backoff delay (status = scheduled). */
   | 'retrying'
-  /** Terminal (status = failed): non-retryable error or attempts exhausted. */
-  | 'failed';
+  /** Terminal: moved to the dead-letter queue (status = dead) in the same statement. */
+  | 'dead_lettered';
 
 /** A job whose expired lease the reaper reclaimed. */
 export interface ReclaimedJob {
@@ -49,6 +50,10 @@ export interface ReclaimedJob {
   previousWorkerId: string;
   attempt: number;
   maxAttempts: number;
-  /** queued = will run again; failed = that was its last attempt. */
-  status: 'queued' | 'failed';
+  /** queued = will run again; dead = dead-lettered (last attempt, or poison). */
+  status: 'queued' | 'dead';
+  /** Why it was dead-lettered; null when requeued. */
+  deadLetterReason: DeadLetterReason | null;
+  /** Lease expiries so far, including this one (poison-message counter). */
+  leaseExpiries: number;
 }
