@@ -101,6 +101,12 @@ const workerEnvSchema = z
     WORKER_JOB_TIMEOUT_MS: positiveInt.min(100).max(86_400_000).default(300_000),
     /** How often this process looks for expired leases (crashed workers). */
     WORKER_REAPER_INTERVAL_MS: positiveInt.min(100).max(600_000).default(15_000),
+    /**
+     * Poison-message threshold: a job whose lease expired this many times (it
+     * keeps crashing or hanging its worker) is dead-lettered with reason
+     * poison_lease_expired even if it has attempts left.
+     */
+    WORKER_POISON_LEASE_EXPIRIES: positiveInt.max(100).default(3),
     /** Budget for draining in-flight jobs on SIGTERM before their leases are released. */
     WORKER_SHUTDOWN_TIMEOUT_MS: positiveInt.max(600_000).default(25_000),
     /** Optional file touched by the worker loop; container healthchecks read its mtime. */
