@@ -12,6 +12,38 @@ export class NonRetryableError extends Error {
   }
 }
 
+/**
+ * Throw from a handler when the payload itself is unusable (fails schema
+ * validation, references something that cannot exist). Non-retryable, and
+ * dead-lettered with reason invalid_payload so operators can tell "fix the
+ * producer" apart from "fix the handler or the downstream".
+ */
+export class InvalidPayloadError extends NonRetryableError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'InvalidPayloadError';
+  }
+}
+
+/**
+ * Poison-message classification for a thrown value. Besides the typed
+ * classes, any error carrying `retryable: false` counts as non-retryable:
+ * handlers can flag errors from libraries (or from another copy of this
+ * package, where instanceof fails) without wrapping them.
+ */
+export function classifyNonRetryable(err: unknown): 'invalid_payload' | 'non_retryable' | null {
+  if (err instanceof InvalidPayloadError) return 'invalid_payload';
+  if (err instanceof NonRetryableError) return 'non_retryable';
+  if (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { retryable?: unknown }).retryable === false
+  ) {
+    return 'non_retryable';
+  }
+  return null;
+}
+
 /** The attempt exceeded WORKER_JOB_TIMEOUT_MS. Recorded as timed_out and retried. */
 export class JobTimeoutError extends Error {
   constructor(readonly timeoutMs: number) {

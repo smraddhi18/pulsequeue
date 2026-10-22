@@ -10,9 +10,16 @@ export {
 export { Reaper, type ReaperOptions, type ReapStore } from './reaper.js';
 export { HandlerRegistry, type JobContext, type JobHandler } from './registry.js';
 export { computeBackoffMs, backoffCeilingMs, type BackoffOptions } from './backoff.js';
-export { decideRetry, type RetryDecision, type RetryInput } from './retry-policy.js';
+export {
+  decideRetry,
+  type RetryDecision,
+  type RetryInput,
+  type WorkerDeadLetterReason,
+} from './retry-policy.js';
 export {
   NonRetryableError,
+  InvalidPayloadError,
+  classifyNonRetryable,
   JobTimeoutError,
   LeaseLostError,
   ShutdownAbortError,

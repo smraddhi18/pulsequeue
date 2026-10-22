@@ -14,6 +14,8 @@ export interface ReaperOptions {
   batchSize?: number;
   /** Upper bound on batches per tick so one tick cannot run unbounded. */
   maxBatchesPerTick?: number;
+  /** Dead-letter a job as poison after this many lease expiries (see LeaseRepository.reapExpired). */
+  poisonLeaseExpiries?: number;
   onJobFailed?: JobFailedHook;
   random?: () => number;
 }
@@ -54,7 +56,12 @@ export class Reaper {
     const reclaimed: ReclaimedJob[] = [];
     try {
       for (let i = 0; i < this.maxBatches; i++) {
-        const batch = await this.options.store.reapExpired(this.batchSize);
+        const batch = await this.options.store.reapExpired(
+          this.batchSize,
+          this.options.poisonLeaseExpiries !== undefined
+            ? { poisonLeaseExpiries: this.options.poisonLeaseExpiries }
+            : {},
+        );
         reclaimed.push(...batch);
         for (const job of batch) await this.report(job);
         if (batch.length < this.batchSize) break;
@@ -80,13 +87,20 @@ export class Reaper {
       attempt: job.attempt,
       maxAttempts: job.maxAttempts,
       previousWorkerId: job.previousWorkerId,
+      leaseExpiries: job.leaseExpiries,
       status: job.status,
     };
     if (job.status === 'queued') {
       this.options.logger.warn(fields, 'Reclaimed expired lease, job requeued');
       return;
     }
-    this.options.logger.error(fields, 'Reclaimed expired lease on the last attempt, job failed');
+    const reason = job.deadLetterReason ?? 'attempts_exhausted';
+    this.options.logger.error(
+      { ...fields, event: 'dlq.dead_lettered', reason, source: 'reaper' },
+      reason === 'poison_lease_expired'
+        ? 'Reclaimed expired lease: poison message, job moved to the dead-letter queue'
+        : 'Reclaimed expired lease on the last attempt, job moved to the dead-letter queue',
+    );
     if (!this.options.onJobFailed) return;
     try {
       await this.options.onJobFailed({
@@ -95,7 +109,7 @@ export class Reaper {
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
         error: `Lease expired: worker ${job.previousWorkerId} stopped heartbeating`,
-        reason: 'attempts_exhausted',
+        reason,
         source: 'reaper',
       });
     } catch (err) {

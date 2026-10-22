@@ -1,5 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
+import type { DeadLetterReason } from '../domain/dead-letter.js';
 import type { LeasedJob } from '../domain/lease.js';
 import type { Logger } from '../lib/logger.js';
 import type { LeaseRepository } from '../repositories/lease.repository.js';
@@ -21,14 +22,19 @@ export type LeaseStore = Pick<
   'lease' | 'heartbeat' | 'complete' | 'fail' | 'release'
 >;
 
-/** A job reached a terminal failure. Milestone 3 moves it to the dead-letter queue from here. */
+/**
+ * A job was dead-lettered. Fired *after* the move committed (the move itself
+ * is part of the fenced fail/reap statement), so the hook is a notification
+ * point for side effects such as alerts or metrics, never the mechanism that
+ * puts the job in the DLQ: a crash or a throwing hook cannot lose the move.
+ */
 export interface JobFailedEvent {
   jobId: string;
   queue: string;
   attempt: number;
   maxAttempts: number;
   error: string;
-  reason: 'non_retryable' | 'attempts_exhausted';
+  reason: DeadLetterReason;
   source: 'worker' | 'reaper';
 }
 
@@ -47,7 +53,7 @@ export interface WorkerOptions {
   heartbeatIntervalMs: number;
   jobTimeoutMs: number;
   backoff: BackoffOptions;
-  /** Dead-letter hook (Milestone 3). Errors thrown here are logged, never fatal. */
+  /** Called after a job is dead-lettered. Errors thrown here are logged, never fatal. */
   onJobFailed?: JobFailedHook;
   /** Touched (throttled) on every loop iteration; a container healthcheck reads its mtime. */
   livenessFile?: string;
@@ -315,6 +321,7 @@ export class Worker {
         error: message,
         attemptStatus,
         retryDelayMs,
+        ...(decision.kind === 'fail' ? { deadLetterReason: decision.reason } : {}),
       });
       if (disposition === null) {
         log.warn({ durationMs, err: error }, 'Job failed but its lease was lost; nothing written');
@@ -328,8 +335,15 @@ export class Worker {
         return;
       }
       log.error(
-        { durationMs, err: error, outcome: attemptStatus, reason: decision.reason },
-        'Job failed permanently',
+        {
+          event: 'dlq.dead_lettered',
+          durationMs,
+          err: error,
+          outcome: attemptStatus,
+          reason: decision.reason,
+          source: 'worker',
+        },
+        'Job moved to the dead-letter queue',
       );
       await this.notifyFailed({
         jobId: job.jobId,

@@ -71,6 +71,7 @@ export function createWorkerRuntime(
     store,
     logger: logger.child({ workerId, subcomponent: 'reaper' }),
     intervalMs: env.WORKER_REAPER_INTERVAL_MS,
+    poisonLeaseExpiries: env.WORKER_POISON_LEASE_EXPIRIES,
     ...(options.onJobFailed ? { onJobFailed: options.onJobFailed } : {}),
   });
 
