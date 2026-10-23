@@ -2,6 +2,7 @@ import {
   IdempotencyKeyReusedError,
   NotFoundError,
   PayloadTooLargeError,
+  fieldValidationError,
 } from '../domain/errors.js';
 import {
   JOB_LIMITS,
@@ -22,6 +23,8 @@ export type JobStore = Pick<JobRepository, 'insertIdempotent' | 'findById' | 'li
 
 export interface JobServiceOptions {
   maxPayloadBytes: number;
+  /** Clock for the runAt horizon check (tests pin it). */
+  now?: () => number;
 }
 
 /**
@@ -36,11 +39,31 @@ export class JobService {
   ) {}
 
   async enqueue(input: EnqueueJobInput): Promise<EnqueueJobResult> {
+    const now = this.options.now?.() ?? Date.now();
+    const runAt = input.runAt;
+    if (runAt !== undefined) {
+      if (input.delayMs !== undefined) {
+        throw fieldValidationError('runAt', 'Specify either delayMs or runAt, not both');
+      }
+      if (Number.isNaN(runAt.getTime())) {
+        throw fieldValidationError('runAt', 'runAt is not a valid date');
+      }
+      if (runAt.getTime() - now > JOB_LIMITS.MAX_DELAY_MS) {
+        throw fieldValidationError(
+          'runAt',
+          `runAt must be at most ${JOB_LIMITS.MAX_DELAY_MS} ms (30 days) in the future; use a schedule for longer horizons`,
+        );
+      }
+    }
+
     const normalized = {
       payload: input.payload,
       priority: input.priority ?? JOB_LIMITS.DEFAULT_PRIORITY,
       delayMs: input.delayMs ?? 0,
       maxAttempts: input.maxAttempts ?? JOB_LIMITS.DEFAULT_MAX_ATTEMPTS,
+      // Only present when given, so fingerprints of requests without runAt
+      // are byte-identical to the ones stored before M4.
+      ...(runAt !== undefined ? { runAt: runAt.toISOString() } : {}),
     };
 
     const payloadBytes = Buffer.byteLength(JSON.stringify(normalized.payload), 'utf8');
@@ -59,11 +82,17 @@ export class JobService {
     const queue = await this.queues.ensure(input.queue);
     const { job, inserted } = await this.jobs.insertIdempotent({
       queueId: queue.id,
-      status: normalized.delayMs > 0 ? 'scheduled' : 'queued',
+      // Advisory only: workers promote due scheduled rows, and the lease query
+      // re-checks run_at <= now(), so a skewed app clock cannot start a job early.
+      status:
+        normalized.delayMs > 0 || (runAt !== undefined && runAt.getTime() > now)
+          ? 'scheduled'
+          : 'queued',
       priority: normalized.priority,
       payload: normalized.payload,
       maxAttempts: normalized.maxAttempts,
       delayMs: normalized.delayMs,
+      runAt: runAt ?? null,
       idempotencyKey,
       requestFingerprint: fingerprint,
     });
