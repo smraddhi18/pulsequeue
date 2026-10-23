@@ -6,10 +6,12 @@ import { registerErrorHandler } from './plugins/error-handler.js';
 import { DeadLetterRepository } from './repositories/dead-letter.repository.js';
 import { JobRepository } from './repositories/job.repository.js';
 import { QueueRepository } from './repositories/queue.repository.js';
+import { ScheduleRepository } from './repositories/schedule.repository.js';
 import { registerRoutes } from './routes/index.js';
 import { DlqService } from './services/dlq.service.js';
 import { HealthService } from './services/health.service.js';
 import { JobService } from './services/job.service.js';
+import { ScheduleService } from './services/schedule.service.js';
 
 export interface BuildAppOptions {
   env: Env;
@@ -69,6 +71,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
   });
   const dlqService = new DlqService(queueRepository, new DeadLetterRepository(pool));
+  const scheduleService = new ScheduleService(queueRepository, new ScheduleRepository(pool), {
+    maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
+  });
 
   await registerRequestId(app);
   await registerErrorHandler(app);
@@ -76,6 +81,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     healthService,
     jobService,
     dlqService,
+    scheduleService,
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
   });
 
