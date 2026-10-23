@@ -54,6 +54,7 @@ describeWithDb('migration runner (Postgres)', () => {
       'job_attempts',
       'jobs',
       'queues',
+      'schedules',
       'schema_migrations',
     ]);
   });
@@ -206,6 +207,57 @@ describeWithDb('schema invariants (Postgres)', () => {
         [queueId],
       );
       expect(text).toContain('jobs_lease_idx');
+      expect(text).not.toMatch(/\bSort\b/);
+    });
+
+    it('lease query (M4) walks jobs_ready_idx (queued rows only) without a sort', async () => {
+      const text = await plan(
+        `SELECT id FROM jobs
+         WHERE queue_id = $1 AND status = 'queued' AND run_at <= now()
+         ORDER BY priority DESC, run_at, id
+         LIMIT 10
+         FOR UPDATE SKIP LOCKED`,
+        [queueId],
+      );
+      expect(text).toContain('jobs_ready_idx');
+      expect(text).not.toMatch(/\bSort\b/);
+    });
+
+    it('promotion (M4) range-scans jobs_scheduled_due_idx by due time without a sort', async () => {
+      const text = await plan(
+        `SELECT id FROM jobs
+         WHERE queue_id = $1 AND status = 'scheduled' AND run_at <= now()
+         ORDER BY run_at, id
+         LIMIT 500
+         FOR UPDATE SKIP LOCKED`,
+        [queueId],
+      );
+      expect(text).toContain('jobs_scheduled_due_idx');
+      expect(text).toMatch(/Index Cond: .*run_at <= now\(\)/);
+      expect(text).not.toMatch(/\bSort\b/);
+    });
+
+    it('scheduler claim (M4) walks schedules_due_idx in due order without a sort', async () => {
+      const text = await plan(
+        `SELECT id FROM schedules
+         WHERE enabled AND next_run_at <= now()
+         ORDER BY next_run_at, id
+         LIMIT 100
+         FOR UPDATE SKIP LOCKED`,
+        [],
+      );
+      expect(text).toContain('schedules_due_idx');
+    });
+
+    it('schedule keyset page query uses schedules_queue_created_idx without a sort', async () => {
+      const text = await plan(
+        `SELECT id FROM schedules
+         WHERE queue_id = $1 AND (created_at, id) < ($2::timestamptz, $3::uuid)
+         ORDER BY created_at DESC, id DESC
+         LIMIT 50`,
+        [queueId, new Date().toISOString(), '00000000-0000-0000-0000-000000000000'],
+      );
+      expect(text).toContain('schedules_queue_created_idx');
       expect(text).not.toMatch(/\bSort\b/);
     });
 
