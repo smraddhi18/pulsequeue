@@ -62,6 +62,9 @@ interface ReclaimedRow {
 const CLEAR_LEASE = `locked_by = NULL, lease_token = NULL, locked_at = NULL,
              lease_expires_at = NULL, heartbeat_at = NULL`;
 
+/** Max scheduled -> queued promotions per lease call; see LeaseRepository.promoteDue. */
+export const PROMOTE_BATCH_SIZE = 500;
+
 /** Longest error text stored per attempt / job; handlers can throw huge messages. */
 export const MAX_ERROR_LENGTH = 4_000;
 
@@ -86,22 +89,29 @@ export class LeaseRepository {
   /**
    * Lease up to `limit` runnable jobs from `queues`.
    *
-   * FOR UPDATE SKIP LOCKED makes concurrent workers partition the ready set
-   * instead of queueing on each other's row locks: a row another transaction
-   * is leasing right now is skipped, not waited for. The candidate scan walks
-   * jobs_lease_idx in (priority DESC, run_at, id) order. Each leased job gets
-   * a fresh lease token, attempts + 1 and a `running` job_attempts row, all in
-   * the same statement.
+   * Two statements. First, due `scheduled` jobs (delayed enqueues, retry
+   * backoffs, delayed replays) of these queues are promoted to `queued`
+   * (see promoteDue). Then the lease itself: FOR UPDATE SKIP LOCKED makes
+   * concurrent workers partition the ready set instead of queueing on each
+   * other's row locks: a row another transaction is leasing right now is
+   * skipped, not waited for. The candidate scan walks jobs_ready_idx (queued
+   * rows only) in (priority DESC, run_at, id) order, so it never reads a job
+   * that is not due yet. Each leased job gets a fresh lease token, attempts + 1
+   * and a `running` job_attempts row, all in the same statement.
    */
   async lease(params: LeaseJobsParams): Promise<LeasedJob[]> {
     if (params.limit <= 0 || params.queues.length === 0) return [];
+    await this.promoteDue(params.queues, Math.max(params.limit, PROMOTE_BATCH_SIZE));
     const rows = await runQuery<LeasedRow>(
       this.db,
       `WITH candidates AS (
          SELECT j.id
          FROM jobs j
          WHERE j.queue_id IN (SELECT q.id FROM queues q WHERE q.name = ANY($1::text[]))
-           AND j.status IN ('queued', 'scheduled')
+           AND j.status = 'queued'
+           -- Defensive: queued rows are due by construction (promotion and
+           -- immediate enqueues set run_at <= now()), but a skewed producer
+           -- clock must never let a job start early.
            AND j.run_at <= now()
            -- Defensive: a runnable row must have budget left, otherwise the
            -- increment below would violate jobs_attempts_within_max and fail
@@ -160,6 +170,44 @@ export class LeaseRepository {
       leaseExpiresAt: row.lease_expires_at,
       createdAt: row.created_at,
     }));
+  }
+  /**
+   * Move up to `limit` due `scheduled` jobs of `queues` to `queued`, oldest
+   * due first; returns how many moved.
+   *
+   * The scan is a range on jobs_scheduled_due_idx (queue_id, run_at), so it
+   * reads only rows that are due: jobs delayed until tomorrow are never
+   * touched. SKIP LOCKED lets every worker run this on each poll without
+   * blocking another worker promoting the same rows; a row promoted by
+   * someone else simply stops matching `status = 'scheduled'`. Bounded so one
+   * poll after a long outage cannot turn into one giant transaction; the rest
+   * is promoted by the following polls.
+   */
+  async promoteDue(queues: readonly string[], limit: number = PROMOTE_BATCH_SIZE): Promise<number> {
+    if (limit <= 0 || queues.length === 0) return 0;
+    const rows = await runQuery<{ promoted: string }>(
+      this.db,
+      `WITH due AS (
+         SELECT j.id
+         FROM jobs j
+         WHERE j.queue_id IN (SELECT q.id FROM queues q WHERE q.name = ANY($1::text[]))
+           AND j.status = 'scheduled'
+           AND j.run_at <= now()
+         ORDER BY j.run_at, j.id
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED
+       ),
+       promoted AS (
+         UPDATE jobs j
+         SET status = 'queued'
+         FROM due d
+         WHERE j.id = d.id
+         RETURNING j.id
+       )
+       SELECT count(*)::text AS promoted FROM promoted`,
+      [queues, limit],
+    );
+    return Number(rows[0]?.promoted ?? 0);
   }
 
   /**
