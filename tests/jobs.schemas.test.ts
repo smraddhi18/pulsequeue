@@ -51,10 +51,38 @@ describe('enqueueJobBodySchema', () => {
     ['zero maxAttempts', { payload: {}, maxAttempts: 0 }],
     ['maxAttempts above max', { payload: {}, maxAttempts: JOB_LIMITS.MAX_MAX_ATTEMPTS + 1 }],
     ['unknown field (typo)', { payload: {}, delay: 1000 }],
+    ['runAt without offset (ambiguous local time)', { payload: {}, runAt: '2026-10-23T09:00:00' }],
+    ['runAt that is not a date', { payload: {}, runAt: 'tomorrow' }],
+    ['runAt as epoch number', { payload: {}, runAt: 1_790_000_000_000 }],
+    ['runAt date only', { payload: {}, runAt: '2026-10-23' }],
   ];
 
   it.each(invalid)('rejects %s', (_label, body) => {
     expect(enqueueJobBodySchema.safeParse(body).success).toBe(false);
+  });
+
+  describe('runAt', () => {
+    it('accepts UTC and offset instants and converts them to a Date', () => {
+      const utc = enqueueJobBodySchema.parse({ payload: {}, runAt: '2026-10-23T09:00:00Z' });
+      expect(utc.runAt).toEqual(new Date('2026-10-23T09:00:00.000Z'));
+      const ist = enqueueJobBodySchema.parse({
+        payload: {},
+        runAt: '2026-10-23T14:30:00.250+05:30',
+      });
+      expect(ist.runAt).toEqual(new Date('2026-10-23T09:00:00.250Z'));
+    });
+
+    it('rejects delayMs and runAt together, reporting it on the runAt field', () => {
+      const result = enqueueJobBodySchema.safeParse({
+        payload: {},
+        delayMs: 1000,
+        runAt: '2026-10-23T09:00:00Z',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error?.flatten().fieldErrors).toEqual({
+        runAt: ['Specify either delayMs or runAt, not both'],
+      });
+    });
   });
 });
 

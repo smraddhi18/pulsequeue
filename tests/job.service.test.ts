@@ -6,7 +6,8 @@ import {
   PayloadTooLargeError,
   ValidationError,
 } from '../src/domain/errors.js';
-import type { JobId, Queue, QueueName } from '../src/domain/job.js';
+import { JOB_LIMITS, type JobId, type Queue, type QueueName } from '../src/domain/job.js';
+import { requestFingerprint } from '../src/lib/fingerprint.js';
 import { decodeCursor, encodeCursor } from '../src/lib/cursor.js';
 import type {
   InsertJobParams,
@@ -114,6 +115,76 @@ describe('JobService.enqueue', () => {
     await service.enqueue({ queue, payload: {}, delayMs: 5_000 });
     expect(jobs.lastInsert?.status).toBe('scheduled');
     expect(jobs.lastInsert?.delayMs).toBe(5_000);
+  });
+
+  describe('runAt', () => {
+    const NOW = Date.UTC(2026, 9, 23, 12, 0, 0);
+    let pinned: JobService;
+
+    beforeEach(() => {
+      pinned = new JobService(queues, jobs, { maxPayloadBytes: 64, now: () => NOW });
+    });
+
+    it('enqueues a future runAt as scheduled and passes the instant to storage', async () => {
+      const runAt = new Date(NOW + 60_000);
+      await pinned.enqueue({ queue, payload: {}, runAt });
+      expect(jobs.lastInsert).toMatchObject({ status: 'scheduled', delayMs: 0, runAt });
+    });
+
+    it('enqueues a past or present runAt as queued (storage clamps it to now)', async () => {
+      await pinned.enqueue({ queue, payload: {}, runAt: new Date(NOW - 5_000) });
+      expect(jobs.lastInsert?.status).toBe('queued');
+      await pinned.enqueue({ queue, payload: {}, runAt: new Date(NOW) });
+      expect(jobs.lastInsert?.status).toBe('queued');
+    });
+
+    it('accepts exactly the 30-day horizon and rejects 1 ms beyond it before storage', async () => {
+      await pinned.enqueue({ queue, payload: {}, runAt: new Date(NOW + JOB_LIMITS.MAX_DELAY_MS) });
+      expect(jobs.rows).toHaveLength(1);
+      const err = await pinned
+        .enqueue({ queue, payload: {}, runAt: new Date(NOW + JOB_LIMITS.MAX_DELAY_MS + 1) })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ValidationError);
+      expect((err as ValidationError).details).toMatchObject({
+        formErrors: [],
+        fieldErrors: { runAt: [expect.stringContaining('30 days')] },
+      });
+      expect(jobs.rows).toHaveLength(1);
+      expect(queues.ensureCalls).toBe(1);
+    });
+
+    it('rejects delayMs and runAt together and invalid dates', async () => {
+      await expect(
+        pinned.enqueue({ queue, payload: {}, delayMs: 1, runAt: new Date(NOW) }),
+      ).rejects.toBeInstanceOf(ValidationError);
+      await expect(
+        pinned.enqueue({ queue, payload: {}, runAt: new Date(Number.NaN) }),
+      ).rejects.toBeInstanceOf(ValidationError);
+      expect(jobs.rows).toHaveLength(0);
+    });
+
+    it('keeps pre-M4 fingerprints stable and makes runAt part of the request identity', async () => {
+      await pinned.enqueue({ queue, payload: { a: 1 }, idempotencyKey: 'k1' });
+      const withoutRunAt = jobs.lastInsert?.requestFingerprint;
+      expect(withoutRunAt).toBe(
+        requestFingerprint({ payload: { a: 1 }, priority: 0, delayMs: 0, maxAttempts: 3 }),
+      );
+      await pinned.enqueue({
+        queue,
+        payload: { a: 1 },
+        runAt: new Date(NOW + 1000),
+        idempotencyKey: 'k2',
+      });
+      expect(jobs.lastInsert?.requestFingerprint).not.toBe(withoutRunAt);
+      await expect(
+        pinned.enqueue({
+          queue,
+          payload: { a: 1 },
+          runAt: new Date(NOW + 2000),
+          idempotencyKey: 'k2',
+        }),
+      ).rejects.toBeInstanceOf(IdempotencyKeyReusedError);
+    });
   });
 
   it('rejects payloads over the byte budget before touching storage', async () => {
