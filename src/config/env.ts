@@ -133,9 +133,59 @@ const workerEnvSchema = z
     }
   });
 
+/**
+ * Scheduler process settings (Milestone 4). Like the worker, the scheduler
+ * validates only database + logging + its own tuning.
+ */
+const schedulerEnvSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    LOG_LEVEL: z
+      .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+      .default('info'),
+    ...databaseEnvShape,
+    /** Stable scheduler identity for logs; defaults to host-pid-random. */
+    SCHEDULER_ID: z
+      .string()
+      .trim()
+      .min(1)
+      .max(200)
+      .regex(/^[A-Za-z0-9._:@-]+$/, 'Only letters, digits and ._:@- are allowed')
+      .optional(),
+    /** How often the leader looks for due schedules (jittered +-10%). */
+    SCHEDULER_TICK_INTERVAL_MS: positiveInt.min(100).max(60_000).default(1_000),
+    /** How often a follower retries to become leader (jittered +-20%). Bounds failover time. */
+    SCHEDULER_LEADER_RETRY_INTERVAL_MS: positiveInt.min(100).max(300_000).default(5_000),
+    /** Max schedules claimed per tick transaction; a full batch is followed immediately by another. */
+    SCHEDULER_BATCH_SIZE: positiveInt.max(1_000).default(100),
+    /**
+     * An occurrence at most this late is "on time" and always fires. Older
+     * occurrences (scheduler down, paused leader, long failover) are misfires
+     * and go through the schedule's misfire policy.
+     */
+    SCHEDULER_MISFIRE_GRACE_MS: positiveInt.min(1_000).max(3_600_000).default(60_000),
+    /** catch_up policy: max missed occurrences enqueued in one go (the most recent ones). */
+    SCHEDULER_MAX_CATCH_UP: z.coerce.number().int().min(0).max(1_000).default(10),
+    /** Budget for finishing the in-flight tick on SIGTERM before leadership is released. */
+    SCHEDULER_SHUTDOWN_TIMEOUT_MS: positiveInt.max(600_000).default(10_000),
+    /** Optional file touched by the scheduler loop (leader or follower) for container healthchecks. */
+    SCHEDULER_LIVENESS_FILE: z.string().min(1).optional(),
+  })
+  .superRefine((env, ctx) => {
+    if (env.SCHEDULER_MISFIRE_GRACE_MS < env.SCHEDULER_TICK_INTERVAL_MS * 2) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SCHEDULER_MISFIRE_GRACE_MS'],
+        message:
+          'Must be at least twice SCHEDULER_TICK_INTERVAL_MS, or normal tick latency would count as a misfire',
+      });
+    }
+  });
+
 export type Env = z.infer<typeof envSchema>;
 export type DatabaseEnv = z.infer<typeof databaseEnvSchema>;
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
+export type SchedulerEnv = z.infer<typeof schedulerEnvSchema>;
 
 function parseEnv<T extends z.ZodTypeAny>(schema: T, raw: NodeJS.ProcessEnv): z.infer<T> {
   const result = schema.safeParse(raw);
@@ -164,4 +214,9 @@ export function loadDatabaseEnv(raw: NodeJS.ProcessEnv = process.env): DatabaseE
 /** Worker process config (database + logging + worker tuning). */
 export function loadWorkerEnv(raw: NodeJS.ProcessEnv = process.env): WorkerEnv {
   return parseEnv(workerEnvSchema, raw);
+}
+
+/** Scheduler process config (database + logging + scheduler tuning). */
+export function loadSchedulerEnv(raw: NodeJS.ProcessEnv = process.env): SchedulerEnv {
+  return parseEnv(schedulerEnvSchema, raw);
 }
