@@ -86,6 +86,7 @@ describe('loadMigrations', () => {
     expect(migrations[0]?.filename).toBe('0001_create_queues_jobs_attempts.sql');
     expect(migrations.map((m) => m.filename)).toContain('0002_worker_leasing.sql');
     expect(migrations.map((m) => m.filename)).toContain('0003_dead_letter_queue.sql');
+    expect(migrations.map((m) => m.filename)).toContain('0004_scheduling.sql');
     expect(migrations.every((m) => m.transactional)).toBe(true);
   });
 });
