@@ -2,7 +2,7 @@
 
 A production-style distributed job queue for Node.js services, built in TypeScript with Fastify, PostgreSQL and Redis. Producers enqueue jobs over an HTTP API, workers lease and execute them with retries and exponential backoff, failed jobs go to a dead-letter queue, and a dashboard API reports queue health.
 
-This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 3 (dead-letter queue with inspect / replay / purge and poison-message detection) is done.**
+This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 4 (delayed jobs, cron schedules and a leader-elected scheduler) is done.**
 
 ## Architecture
 
@@ -11,17 +11,19 @@ flowchart LR
     P[Producer services] -->|"POST /queues/:name/jobs<br/>Idempotency-Key"| API
     O[Operators / dashboards] -->|"GET /jobs/:id<br/>GET /queues/:name/jobs"| API
     OP[Operators / runbooks] -->|"GET /queues/:name/dlq, GET /dlq/:jobId<br/>POST .../dlq/:jobId/replay, POST .../dlq/replay<br/>DELETE .../dlq/:jobId, DELETE .../dlq?olderThan="| API
+    OPS[Operators / producers] -->|"POST /queues/:name/schedules, GET .../schedules<br/>GET /schedules/:id, POST /schedules/:id/pause, /resume<br/>DELETE /schedules/:id"| API
     LB[Load balancer / k8s probes] -->|"/health, /ready"| API
 
     subgraph API[Fastify API]
         direction TB
-        RT[Routes<br/>zod validation, thin<br/>jobs + dlq] --> SV[Services<br/>JobService, DlqService, HealthService]
-        SV --> RP[Repositories<br/>Queue, Job, DeadLetter<br/>all SQL lives here]
+        RT[Routes<br/>zod validation, thin<br/>jobs + dlq + schedules] --> SV[Services<br/>JobService, DlqService,<br/>ScheduleService, HealthService]
+        SV --> RP[Repositories<br/>Queue, Job, DeadLetter, Schedule<br/>all SQL lives here]
     end
 
     subgraph PG["PostgreSQL 16"]
         direction TB
-        JT[jobs<br/>queued / scheduled / running / succeeded]
+        JT[jobs<br/>queued / scheduled / running / succeeded<br/>jobs_ready_idx: queued only<br/>jobs_scheduled_due_idx: by run_at]
+        ST[schedules<br/>cron, timezone, misfire_policy<br/>next_run_at, partial schedules_due_idx]
         DQ[DLQ = jobs WHERE status = dead<br/>dead_reason, dead_lettered_at, replay_count<br/>partial index jobs_dlq_idx]
         AT[job_attempts<br/>full history, kept across DLQ + replays]
         JT -.- AT
@@ -31,9 +33,19 @@ flowchart LR
     RP -->|"pg Pool<br/>replay / purge: one guarded statement<br/>WHERE status = dead"| PG
     MG[migrate job<br/>schema_migrations + advisory lock] -->|DDL| PG
 
+    subgraph SP[Scheduler - 2 replicas, one leader]
+        direction TB
+        SL[Leader<br/>holds pg_try_advisory_lock on its own session<br/>ticks every SCHEDULER_TICK_INTERVAL_MS]
+        SS[Standby<br/>retries the lock every<br/>SCHEDULER_LEADER_RETRY_INTERVAL_MS]
+        SL --> MP[Misfire planner<br/>skip / fire_once / catch_up<br/>grace window, catch-up limit]
+    end
+
+    SL -->|"tick = ONE transaction on the lock session:<br/>claim due schedules FOR UPDATE SKIP LOCKED,<br/>INSERT job ON CONFLICT (key schedule:id:fireTime),<br/>advance next_run_at"| PG
+    SS -.->|"lock attempt only"| PG
+
     subgraph WP[Worker pool - N processes x WORKER_CONCURRENCY]
         direction TB
-        WL[Worker loop<br/>lease free slots, poll with jitter] --> HR["Handler registry<br/>queue name to handler"]
+        WL[Worker loop<br/>promote due scheduled jobs, lease free slots,<br/>poll with jitter] --> HR["Handler registry<br/>queue name to handler"]
         WL --> RPOL[Retry policy<br/>retry with backoff, or dead-letter:<br/>non_retryable / invalid_payload / attempts_exhausted]
         WL --> HB[Heartbeats<br/>extend lease while running]
         RE[Reaper<br/>reclaims expired leases<br/>poison: N lease expiries]
@@ -100,9 +112,23 @@ Solid lines exist today; dotted lines are planned milestones.
 - Structured log events with a stable `event` field: `dlq.dead_lettered` (worker / reaper), `dlq.replayed`, `dlq.bulk_replayed`, `dlq.purged`, `dlq.bulk_purged` (API, with request id)
 - Tests: DLQ service rules and request schemas against in-memory fakes; real-Postgres tests for the schema invariants, the `0003` backfill, stale-lease fencing, poison detection, 10 concurrent replays of one job (exactly one wins), replay vs purge races, concurrent bulk replays, keyset listing, purge cutoffs, and the HTTP API end to end with a real worker (fail -> DLQ -> inspect -> replay -> succeed, attempt numbering continues)
 
+**Milestone 4: scheduling**
+
+- Delayed jobs: `POST /queues/:name/jobs` takes either `delayMs` or an absolute `runAt` (ISO-8601 with an offset), mutually exclusive, at most 30 days ahead; a `runAt` in the past runs now. `run_at` is clamped against the database clock
+- Workers never lease a job early: due `scheduled` jobs are first **promoted** to `queued` in a bounded `SKIP LOCKED` batch (via the new `jobs_scheduled_due_idx` range scan on `run_at`), then leased from `jobs_ready_idx`, which contains only `queued` rows, so the lease scan no longer walks future jobs that outrank due ones (migration `0004`)
+- Recurring schedules (migration `0004`, `schedules` table): `POST /queues/:name/schedules`, `GET /queues/:name/schedules` (keyset-paginated, `enabled` filter), `GET /schedules/:id`, `POST /schedules/:id/pause`, `POST /schedules/:id/resume`, `DELETE /schedules/:id`; unique name per queue (`409`)
+- Cron via the maintained [`cron-parser`](https://www.npmjs.com/package/cron-parser) v5 (Luxon): 5-field expressions (or 6 with seconds = 0) and `@daily`-style macros, any IANA timezone with correct DST handling, minute resolution; invalid expressions, zones or never-matching expressions are `400 VALIDATION_ERROR` with the same `details.fieldErrors` shape as every other validation error
+- Scheduler process (`npm run scheduler`, `src/scheduler.ts`) with **leader election through a Postgres advisory lock** held on a dedicated session; only the leader ticks, and each tick runs on the lock-holding session so a dead leader's transaction can never commit
+- Tick = one transaction: claim due schedules (`FOR UPDATE SKIP LOCKED`, batch), enqueue the job(s) with the deterministic idempotency key `schedule:<id>:<fire time>`, advance `next_run_at`; a full batch re-ticks immediately
+- Misfire policies per schedule (`skip`, `fire_once` (default), `catch_up`) with a grace window (`SCHEDULER_MISFIRE_GRACE_MS`) and a catch-up limit (`SCHEDULER_MAX_CATCH_UP`)
+- Fault isolation: a schedule that can no longer be evaluated (e.g. its queue's payload limit shrank) records `lastError` and backs off via a savepoint without blocking the rest of the batch; repeated tick failures make the leader step down so a healthy replica can take over
+- Graceful shutdown on SIGTERM/SIGINT: finish the in-flight tick (bounded by `SCHEDULER_SHUTDOWN_TIMEOUT_MS`), unlock, close the session, exit 0; the standby takes over within one retry interval
+- Structured log events: `scheduler.started`, `scheduler.leader_acquired`, `scheduler.leader_lost`, `scheduler.leader_released`, `scheduler.fired`, `scheduler.misfire_skipped`, `scheduler.duplicate_suppressed`, `scheduler.schedule_error`, `scheduler.tick_failed`, `scheduler.stopped`; API events `schedule.created`, `schedule.paused`, `schedule.resumed`, `schedule.deleted`
+- Zod-validated scheduler config (e.g. the grace window must cover at least two ticks); docker-compose `scheduler` service with 2 replicas, a liveness-file healthcheck and `stop_grace_period`; CI boots the compiled scheduler and requires it to take and release leadership and exit 0
+- Tests: cron parsing / next-run / DST walks, misfire planning, request schemas, config and the scheduler loop (fake lock) as unit tests; real-Postgres tests for promotion and "never leased early", the schedules API, two schedulers (only one leads, failover on stop and on a killed session, concurrent ticks never duplicate), misfire policies after an outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM
+
 ### Planned
 
-- Delayed / cron scheduling (M4)
 - Redis pub/sub wake-ups and cached stats (M5)
 - API keys, multi-tenancy, rate limits (M6)
 - Dashboard API, Prometheus, OpenTelemetry (M7)
@@ -148,6 +174,38 @@ sequenceDiagram
 
 Routes only parse input and shape output. `JobService` owns the business rules (defaults, payload budget, initial status, replay semantics, pagination). Repositories own every SQL statement and translate driver errors into domain errors. Domain types, limits and errors live under `src/domain/`.
 
+## Scheduler tick flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Scheduler A (leader)
+    participant B as Scheduler B (standby)
+    participant PG as PostgreSQL
+    participant W as Workers
+
+    A->>PG: pg_try_advisory_lock(key) on its dedicated session
+    PG-->>A: true (scheduler.leader_acquired)
+    B->>PG: pg_try_advisory_lock(key)
+    PG-->>B: false, retry every SCHEDULER_LEADER_RETRY_INTERVAL_MS
+    loop every SCHEDULER_TICK_INTERVAL_MS (same session as the lock)
+        A->>PG: BEGIN, SELECT now()
+        A->>PG: SELECT schedules WHERE enabled AND next_run_at <= now()<br/>ORDER BY next_run_at LIMIT batch FOR UPDATE SKIP LOCKED
+        loop each claimed schedule (SAVEPOINT)
+            A->>A: cron occurrences in [next_run_at, now], misfire policy
+            A->>PG: INSERT job (run_at = occurrence, key schedule:id:occurrence)<br/>ON CONFLICT DO NOTHING
+            A->>PG: UPDATE schedules SET next_run_at = next occurrence after now,<br/>last_run_at, last_job_id, fire_count
+        end
+        A->>PG: COMMIT, then log scheduler.fired / misfire_skipped
+    end
+    W->>PG: promote due scheduled jobs, lease queued jobs (unchanged worker path)
+    Note over A,PG: SIGTERM: finish the tick, pg_advisory_unlock_all(), close (scheduler.leader_released).<br/>Crash or partition: the session ends, Postgres drops the lock and aborts the open tick.
+    B->>PG: pg_try_advisory_lock(key)
+    PG-->>B: true (scheduler.leader_acquired), B ticks from the committed next_run_at
+```
+
+Duplicates are prevented three times over: only the lock holder ticks; the claim takes row locks and advances `next_run_at` in the same transaction, so even two concurrent ticks cannot evaluate the same occurrence; and the job insert uses the deterministic idempotency key `schedule:<id>:<occurrence ISO time>` against the existing unique index, so a replayed occurrence is a no-op (logged as `scheduler.duplicate_suppressed`).
+
 ## Dead-letter and replay flow
 
 ```mermaid
@@ -186,9 +244,9 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> queued: enqueue
-    [*] --> scheduled: enqueue with delayMs
+    [*] --> scheduled: enqueue with delayMs / future runAt, or fired by a schedule ahead of time
     queued --> running: leased (SKIP LOCKED), attempts + 1
-    scheduled --> running: leased once run_at is reached
+    scheduled --> queued: promoted once run_at <= now() (SKIP LOCKED batch)
     running --> running: heartbeat extends the lease
     running --> succeeded: handler resolved
     running --> scheduled: threw or timed out, attempts left (run_at = now + backoff)
@@ -214,8 +272,9 @@ sequenceDiagram
     participant H as Handler
     participant R as Reaper (in every worker)
 
+    W->>PG: promote due scheduled jobs to queued (bounded batch, SKIP LOCKED)
     W->>PG: lease(queues, limit = free slots) in ONE statement
-    Note over W,PG: SELECT ... ORDER BY priority DESC, run_at, id<br/>LIMIT n FOR UPDATE SKIP LOCKED, then UPDATE to running<br/>(new lease_token, attempts + 1) and INSERT a job_attempts row
+    Note over W,PG: SELECT ... WHERE status = queued ORDER BY priority DESC, run_at, id<br/>LIMIT n FOR UPDATE SKIP LOCKED, then UPDATE to running<br/>(new lease_token, attempts + 1) and INSERT a job_attempts row
     PG-->>W: leased jobs with lease_token and attempt id
     W->>H: handler(ctx) with AbortSignal and job logger
     loop every WORKER_HEARTBEAT_INTERVAL_MS while running
@@ -261,6 +320,7 @@ Register handlers in `src/worker/handlers/index.ts` (it ships `echo` and `demo`)
 ```mermaid
 erDiagram
     queues ||--o{ jobs : contains
+    queues ||--o{ schedules : "recurring jobs"
     jobs ||--o{ job_attempts : "attempt history"
 
     queues {
@@ -295,6 +355,25 @@ erDiagram
         timestamptz created_at
         timestamptz updated_at
     }
+    schedules {
+        uuid id PK
+        bigint queue_id FK
+        text name "unique per queue"
+        text cron_expression
+        text timezone "IANA, default UTC"
+        jsonb payload "job template"
+        smallint priority
+        int max_attempts
+        schedule_misfire_policy misfire_policy "skip fire_once catch_up"
+        boolean enabled
+        timestamptz next_run_at "NULL iff paused"
+        timestamptz last_run_at
+        uuid last_job_id
+        bigint fire_count
+        text last_error
+        timestamptz created_at
+        timestamptz updated_at
+    }
     job_attempts {
         bigint id PK
         uuid job_id FK
@@ -313,22 +392,44 @@ Schema invariants added in [`migrations/0002_worker_leasing.sql`](migrations/000
 
 Invariants added in [`migrations/0003_dead_letter_queue.sql`](migrations/0003_dead_letter_queue.sql): a job is `dead` **if and only if** it has `dead_reason` and `dead_lettered_at` (`jobs_dead_has_metadata`), and `failed` can no longer be written (`jobs_no_legacy_failed`).
 
-Indexes (see [`0001`](migrations/0001_create_queues_jobs_attempts.sql), [`0002`](migrations/0002_worker_leasing.sql) and [`0003`](migrations/0003_dead_letter_queue.sql)):
+Invariants added in [`migrations/0004_scheduling.sql`](migrations/0004_scheduling.sql): a schedule is `enabled` **if and only if** it has a `next_run_at` (`schedules_enabled_has_next_run`), names are unique per queue and match the API's name rule, and priority / attempts / cron / timezone lengths are range-checked.
 
-| Index                                                                                      | Serves                                                                                                             |
-| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `jobs_lease_idx (queue_id, priority DESC, run_at, id) WHERE status IN (queued, scheduled)` | M2 lease query `... ORDER BY priority DESC, run_at, id LIMIT n FOR UPDATE SKIP LOCKED`; partial, so it stays small |
-| `jobs_queue_created_idx (queue_id, created_at DESC, id DESC)`                              | `GET /queues/:name/jobs` keyset pages; also covers the `queue_id` foreign key                                      |
-| `jobs_queue_status_created_idx (queue_id, status, created_at DESC, id DESC)`               | the same listing filtered by `status`                                                                              |
-| `jobs_queue_idempotency_key_uq (queue_id, idempotency_key) WHERE key IS NOT NULL`          | race-safe idempotency via `ON CONFLICT`; partial, so keyless jobs cost nothing                                     |
-| `job_attempts_job_attempt_uq (job_id, attempt_number)`                                     | one row per attempt; attempt history in order                                                                      |
-| `jobs_running_lease_expiry_idx (lease_expires_at) WHERE status = running`                  | reaper scan for expired leases; holds only in-flight rows, so it is tiny                                           |
-| `job_attempts_one_running_per_job_uq (job_id) WHERE status = running`                      | invariant: never two in-flight attempts of one job                                                                 |
-| `jobs_dlq_idx (queue_id, dead_lettered_at DESC, id DESC) WHERE status = dead`              | DLQ keyset listing, bulk replay (oldest first) and `olderThan` purges; partial, so it is as small as the DLQ       |
+Indexes (see [`0001`](migrations/0001_create_queues_jobs_attempts.sql), [`0002`](migrations/0002_worker_leasing.sql), [`0003`](migrations/0003_dead_letter_queue.sql) and [`0004`](migrations/0004_scheduling.sql)):
+
+| Index                                                                                      | Serves                                                                                                       |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `jobs_lease_idx (queue_id, priority DESC, run_at, id) WHERE status IN (queued, scheduled)` | M2/M3 lease query; kept only for workers still running during a rolling deploy, dropped in a later migration |
+| `jobs_ready_idx (queue_id, priority DESC, run_at, id) WHERE status = queued`               | M4 lease query: only runnable rows, so the scan never walks a future job                                     |
+| `jobs_scheduled_due_idx (queue_id, run_at, id) WHERE status = scheduled`                   | promotion: range scan touching only the delayed / backoff rows that are due                                  |
+| `schedules_due_idx (next_run_at) WHERE enabled`                                            | scheduler claim, in due order; paused schedules are not in it                                                |
+| `schedules_queue_created_idx (queue_id, created_at DESC, id DESC)`                         | `GET /queues/:name/schedules` keyset pages                                                                   |
+| `jobs_queue_created_idx (queue_id, created_at DESC, id DESC)`                              | `GET /queues/:name/jobs` keyset pages; also covers the `queue_id` foreign key                                |
+| `jobs_queue_status_created_idx (queue_id, status, created_at DESC, id DESC)`               | the same listing filtered by `status`                                                                        |
+| `jobs_queue_idempotency_key_uq (queue_id, idempotency_key) WHERE key IS NOT NULL`          | race-safe idempotency via `ON CONFLICT`; partial, so keyless jobs cost nothing                               |
+| `job_attempts_job_attempt_uq (job_id, attempt_number)`                                     | one row per attempt; attempt history in order                                                                |
+| `jobs_running_lease_expiry_idx (lease_expires_at) WHERE status = running`                  | reaper scan for expired leases; holds only in-flight rows, so it is tiny                                     |
+| `job_attempts_one_running_per_job_uq (job_id) WHERE status = running`                      | invariant: never two in-flight attempts of one job                                                           |
+| `jobs_dlq_idx (queue_id, dead_lettered_at DESC, id DESC) WHERE status = dead`              | DLQ keyset listing, bulk replay (oldest first) and `olderThan` purges; partial, so it is as small as the DLQ |
 
 The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries and asserts that they use these indexes.
 
 ## Design decisions and trade-offs
+
+### Milestone 4
+
+| Decision                                                                                                                                                | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Trade-off                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Leader election with a session-level advisory lock** (`pg_try_advisory_lock`) on a dedicated connection, and **every tick runs on that same session** | The lock and the work share one session, which is a real fence: if the leader crashes, is partitioned or its backend is killed, Postgres drops the lock _and_ aborts the open tick transaction together, so a stale leader can never commit after a new one took over (tested with `pg_terminate_backend`). No TTL to tune and nothing to renew: a clean shutdown hands over within one standby retry interval, a killed process as soon as Postgres sees the session end. The lock key includes `current_schema()`, so deployments sharing a database elect separately. | Needs a real session: through PgBouncer only in session mode (or a direct connection for the scheduler). One connection per replica is held for its lifetime. A **lease row** (`UPDATE leader SET holder, expires_at WHERE expires_at < now()`) would work through transaction pooling and be visible in an admin UI, but needs a renewal loop, a TTL that trades failover time against false failovers, and an explicit fencing token on every write, or a paused leader can act after its lease expired. On a half-open TCP partition, failover waits for keepalive / server timeouts. |
+| **Claim with `FOR UPDATE SKIP LOCKED` + advance `next_run_at` in the same transaction**, even though only the leader ticks                              | Defence in depth: correctness does not depend on the election being perfect. Two ticks that ever overlapped (tested by running two ticks concurrently) partition the due rows instead of double-firing, and a crashed tick rolls back the job insert and the advance together. Batches are bounded; a full batch re-ticks at once.                                                                                                                                                                                                                                       | A schedule's row is locked for the length of a tick (milliseconds); a `pause` racing a tick waits for it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Deterministic idempotency key** `schedule:<id>:<occurrence ISO>` on the existing jobs unique index                                                    | A third guard that needs no new machinery: replaying the same occurrence (manual `next_run_at` edits, a future bug) inserts nothing and logs `scheduler.duplicate_suppressed`. The key also tells operators which occurrence produced a job.                                                                                                                                                                                                                                                                                                                             | The key occupies the producer-facing idempotency namespace of the queue (prefix `schedule:`); purging the job frees it, as with any key.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Misfire policies** `skip` / `fire_once` (default) / `catch_up` + grace window + catch-up limit                                                        | After an outage, what is right depends on the job: a cache refresh should run once (`fire_once`), a per-hour billing roll-up needs every hour (`catch_up`, but bounded by `SCHEDULER_MAX_CATCH_UP` so a week-long outage does not dump 10k stale jobs), a "send the 9am digest" job should not run at 3pm (`skip`). Occurrences within the grace window are never misfires, so normal ticks and failovers always fire. Every occurrence is fired or dropped exactly once; `next_run_at` then jumps past `now`.                                                           | `skipped` counts in logs are a lower bound on long outages (the walk stops once the policy is decided; `skippedMore` says so). The grace window must be at least two ticks (validated).                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Database clock everywhere** (`now()` of the tick transaction for occurrences, `greatest(runAt, now())` for delayed jobs)                              | Skewed scheduler or API hosts cannot fire early, late or twice; the same clock that workers lease against decides when a job is due.                                                                                                                                                                                                                                                                                                                                                                                                                                     | One extra `SELECT now()` per tick / create.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **Jobs are enqueued with `run_at` = the occurrence** (clamped to now)                                                                                   | Workers see when a run was _meant_ to happen; late catch-up runs are ordered by their original time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | None significant.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Pause stores `next_run_at = NULL`; resume recomputes from now**                                                                                       | A paused period is not replayed on resume (resume means "from now on"), and a CHECK keeps `enabled` and `next_run_at` in step so the tick can never pick up a paused schedule. Pause / resume are idempotent.                                                                                                                                                                                                                                                                                                                                                            | To replay a paused window, enqueue jobs explicitly.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **Per-schedule savepoints** in the tick                                                                                                                 | One broken schedule (e.g. its payload became too large after `JOB_MAX_PAYLOAD_BYTES` was lowered, or its zone disappeared from the tz database) records `lastError` and retries later, instead of rolling back and blocking every other schedule in the batch. Infrastructure errors still fail the whole tick, and repeated failures make the leader step down.                                                                                                                                                                                                         | A savepoint per schedule (cheap).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Delayed jobs promoted to `queued` before leasing**, ready index on `queued` only (expand/contract: old index kept)                                    | The M2 lease index sorted by priority first and could not skip future rows, so every poll walked all not-yet-due high-priority delayed/backoff jobs. Now the lease scan sees only runnable rows and promotion is a `run_at` range scan. `run_at <= now()` is still re-checked at lease time, so a job is never leased early.                                                                                                                                                                                                                                             | One extra small statement per poll; a job becomes runnable at the next poll after `run_at` (the same latency as before).                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Cron library**: `cron-parser` v5 (maintained, Luxon timezones), wrapped in `src/lib/cron.ts`                                                          | Correct DST behaviour and IANA zones without writing a cron engine; the wrapper pins the semantics we promise (5 fields or 6 with seconds = 0, minute resolution, explicit errors instead of the library's lenient padding of short expressions, "never matches" rejected).                                                                                                                                                                                                                                                                                              | One more dependency (plus Luxon); sub-minute schedules are intentionally unsupported.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **Separate scheduler process**, not inside the API or the worker                                                                                        | Its own scaling (2 replicas are enough), its own shutdown semantics and one long-lived connection, without coupling API latency or worker drains to it. Same image, different command.                                                                                                                                                                                                                                                                                                                                                                                   | One more deployable; compose and CI run it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ### Milestone 3
 
@@ -401,17 +502,19 @@ src/
   app.ts              # composition root: config -> pool -> repositories -> services -> routes
   server.ts           # process entry: loadEnv -> listen -> graceful shutdown
   worker.ts           # worker process entry: loadWorkerEnv -> runtime -> SIGTERM drain
-  config/             # zod env schema (app, database subset, worker)
+  scheduler.ts        # scheduler process entry: loadSchedulerEnv -> runtime -> SIGTERM release
+  config/             # zod env schema (app, database subset, worker, scheduler)
   db/                 # pg pool, query helper, pg error mapping, migration runner + CLI
-  domain/             # AppError hierarchy, job model, limits, lease + dead-letter types
-  lib/                # logger, error mapper, keyset cursor, request fingerprint
+  domain/             # AppError hierarchy, job + schedule models, limits, lease + dead-letter types
+  lib/                # logger, error mapper, keyset cursor, request fingerprint, cron wrapper
   plugins/            # request-id, central error handler
-  repositories/       # QueueRepository, JobRepository, LeaseRepository, DeadLetterRepository (all SQL)
-  routes/             # /health, /ready, jobs API, DLQ API + zod request schemas
-  services/           # HealthService, JobService, DlqService (business rules)
+  repositories/       # Queue, Job, Lease, DeadLetter and Schedule repositories (all SQL)
+  routes/             # /health, /ready, jobs, DLQ and schedules APIs + zod request schemas
+  services/           # HealthService, JobService, DlqService, ScheduleService (business rules)
+  scheduler/          # Scheduler loop, advisory-lock leader election, tick, misfire planner, runtime
   worker/             # Worker loop, Reaper, handler registry, backoff + retry policy,
                       # runtime (composition root), built-in handlers
-tests/                # unit tests (no database needed); tests/worker/ for the worker
+tests/                # unit tests (no database needed); tests/worker/, tests/scheduler/
 tests/integration/    # real-Postgres tests (each suite migrates its own schema)
 ```
 
@@ -443,18 +546,25 @@ npm run worker:dev
 # Enqueue a job that fails twice, then succeeds, and watch the worker logs
 curl -s -X POST http://localhost:3000/queues/demo/jobs -H 'content-type: application/json' \
   -d '{"payload":{"durationMs":500,"failUntilAttempt":3},"maxAttempts":5}'
+
+# In a third terminal: run the scheduler (start a second one to see leader election)
+npm run scheduler:dev
+
+# Echo a job every minute
+curl -s -X POST http://localhost:3000/queues/echo/schedules -H 'content-type: application/json' \
+  -d '{"name":"every-minute","cron":"* * * * *","payload":{"hello":"world"}}'
 ```
 
 Required env vars are documented in `.env.example`. Config validation fails the process immediately if anything required is missing or invalid.
 
-### Docker Compose (migrate + app + worker + Postgres 16 + Redis 7)
+### Docker Compose (migrate + app + worker + scheduler x2 + Postgres 16 + Redis 7)
 
 ```bash
 docker compose up --build
 docker compose up -d --scale worker=3   # more workers; SKIP LOCKED shares the queue
 ```
 
-Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory.
+Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The `scheduler` service runs 2 replicas of `node dist/scheduler.js` from the same image: one leads, the other waits on the advisory lock; `stop_grace_period` (20s) exceeds the 10s tick-finish budget so leadership is released cleanly. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory.
 
 ### Tests
 
@@ -486,7 +596,22 @@ npm run test:integration    # integration only (needs TEST_DATABASE_URL or DATAB
 
 The worker also reads `DATABASE_URL`, the `PG_*` pool settings, `NODE_ENV` and `LOG_LEVEL` (it does not need `PORT` or `REDIS_URL`). Size the worker's `PG_POOL_MAX` between about `WORKER_CONCURRENCY / 2 + 2` and `WORKER_CONCURRENCY + 2` (the 10 / 10 defaults are fine): heartbeats and outcome writes are short and share the pool with the lease and reaper queries. If the pool is too small, outcome writes wait for a connection and fail after `PG_CONNECTION_TIMEOUT_MS`; the job is then re-run after its lease expires (never lost, but wasted work).
 
-Integration suites create a uniquely named schema per suite (`pq_test_<random>`), run the real migrations into it, and drop it afterwards, so they run in parallel and never touch existing data. CI runs them against a `postgres:16` service container after running the compiled migration CLI twice (to prove it is idempotent) and a worker smoke test (start the compiled worker, send SIGTERM, require exit code 0). The worker suites include a concurrency test (8 workers with their own pools, 400 jobs: each runs exactly once and never concurrently with itself), lease-expiry reclaim with fencing of the crashed worker, retry-then-succeed, exhaust-to-failed, timeouts, heartbeats outliving the lease, drain and drain-timeout release, and the real `src/worker.ts` process draining a job on SIGTERM. The DLQ suites cover the `0003` invariants and backfill, stale-lease fencing of dead-lettering, poison detection, 10 concurrent replays of one job (exactly one wins), replay-vs-purge races, concurrent bulk replays (`SKIP LOCKED`, no overlap), and the HTTP API end to end with a real worker.
+Integration suites create a uniquely named schema per suite (`pq_test_<random>`), run the real migrations into it, and drop it afterwards, so they run in parallel and never touch existing data. CI runs them against a `postgres:16` service container after running the compiled migration CLI twice (to prove it is idempotent) and a worker smoke test (start the compiled worker, send SIGTERM, require exit code 0). The worker suites include a concurrency test (8 workers with their own pools, 400 jobs: each runs exactly once and never concurrently with itself), lease-expiry reclaim with fencing of the crashed worker, retry-then-succeed, exhaust-to-failed, timeouts, heartbeats outliving the lease, drain and drain-timeout release, and the real `src/worker.ts` process draining a job on SIGTERM. The DLQ suites cover the `0003` invariants and backfill, stale-lease fencing of dead-lettering, poison detection, 10 concurrent replays of one job (exactly one wins), replay-vs-purge races, concurrent bulk replays (`SKIP LOCKED`, no overlap), and the HTTP API end to end with a real worker. The scheduling suites cover promotion and "never leased before `run_at`", the schedules API, two schedulers in one process (exactly one leads, failover on graceful stop and on a terminated session, concurrent ticks never duplicate, a failed tick rolls back), each misfire policy after a simulated 5 h outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM.
+
+### Scheduler configuration
+
+| Variable                             | Default       | Meaning                                                                         |
+| ------------------------------------ | ------------- | ------------------------------------------------------------------------------- |
+| `SCHEDULER_ID`                       | host-pid-rand | identity in logs                                                                |
+| `SCHEDULER_TICK_INTERVAL_MS`         | `1000`        | leader loop period (100-60000, +-10% jitter); a full batch re-ticks immediately |
+| `SCHEDULER_LEADER_RETRY_INTERVAL_MS` | `5000`        | how often a standby retries the lock (+-20% jitter) = worst-case failover delay |
+| `SCHEDULER_BATCH_SIZE`               | `100`         | max due schedules claimed per tick transaction (1-1000)                         |
+| `SCHEDULER_MISFIRE_GRACE_MS`         | `60000`       | an occurrence older than this is a misfire; must be >= 2x the tick interval     |
+| `SCHEDULER_MAX_CATCH_UP`             | `10`          | `catch_up` policy: max missed occurrences replayed per schedule (0-1000)        |
+| `SCHEDULER_SHUTDOWN_TIMEOUT_MS`      | `10000`       | budget to finish the in-flight tick on SIGTERM before releasing leadership      |
+| `SCHEDULER_LIVENESS_FILE`            | unset         | file the loop touches (leader and standby); used by the compose healthcheck     |
+
+The scheduler also reads `DATABASE_URL`, `PG_*`, `NODE_ENV` and `LOG_LEVEL`. It uses one dedicated connection (the lock session; `PG_STATEMENT_TIMEOUT_MS` applies to it) and no pool. Point it at Postgres directly or through PgBouncer in **session** mode: advisory locks are session state.
 
 ### Scripts
 
@@ -497,6 +622,8 @@ Integration suites create a uniquely named schema per suite (`pq_test_<random>`)
 | `npm start`                | run compiled server                            |
 | `npm run worker`           | run compiled worker                            |
 | `npm run worker:dev`       | tsx watch worker                               |
+| `npm run scheduler`        | run compiled scheduler                         |
+| `npm run scheduler:dev`    | tsx watch scheduler                            |
 | `npm run migrate`          | apply migrations (compiled, used in Docker/CI) |
 | `npm run migrate:dev`      | apply migrations from source via tsx           |
 | `npm run lint`             | ESLint                                         |
@@ -507,7 +634,7 @@ Integration suites create a uniquely named schema per suite (`pq_test_<random>`)
 | `npm run format`           | Prettier write                                 |
 | `npm run format:check`     | Prettier check                                 |
 
-CI runs format check, lint, typecheck, build, migrations, a worker SIGTERM smoke test and tests on Node 20 (see `.github/workflows/ci.yml`).
+CI runs format check, lint, typecheck, build, migrations, worker and scheduler SIGTERM smoke tests and tests on Node 20 (see `.github/workflows/ci.yml`).
 
 ## API
 
@@ -522,9 +649,10 @@ Enqueue a job. The queue is created on first use. Queue names: 1-64 chars of `a-
 | `payload`     | any JSON | -       | required; at most `JOB_MAX_PAYLOAD_BYTES` (default 256 KiB) |
 | `priority`    | integer  | `0`     | `0`-`100`, higher runs first                                |
 | `delayMs`     | integer  | `0`     | `0`-`2592000000` (30 days); `> 0` makes the job `scheduled` |
+| `runAt`       | string   | -       | ISO-8601 with offset, at most 30 days ahead; past = now     |
 | `maxAttempts` | integer  | `3`     | `1`-`25`                                                    |
 
-Unknown fields are rejected. Optional header `Idempotency-Key`: 1-255 printable ASCII characters, scoped to the queue.
+`delayMs` and `runAt` are mutually exclusive (`400`, `details.fieldErrors.runAt`). Either way a delayed job is never leased before its `run_at` (database clock). Unknown fields are rejected. Optional header `Idempotency-Key`: 1-255 printable ASCII characters, scoped to the queue.
 
 ```bash
 curl -i -X POST http://localhost:3000/queues/emails/jobs \
@@ -707,6 +835,77 @@ curl -X DELETE 'http://localhost:3000/queues/billing/dlq?olderThan=2026-10-15T00
 # -> { "purged": 42 }
 ```
 
+### Schedules
+
+A schedule enqueues a job into its queue at every occurrence of a cron expression, evaluated in an IANA timezone. Requires a running scheduler process (`npm run scheduler`). Schedule object:
+
+```json
+{
+  "id": "0b7e...",
+  "queue": "reports",
+  "name": "daily-digest",
+  "cron": "0 9 * * 1-5",
+  "timezone": "Asia/Kolkata",
+  "payload": { "report": "digest" },
+  "priority": 0,
+  "maxAttempts": 3,
+  "misfirePolicy": "fire_once",
+  "enabled": true,
+  "nextRunAt": "2026-10-26T03:30:00.000Z",
+  "lastRunAt": "2026-10-23T03:30:00.000Z",
+  "lastJobId": "8d21...",
+  "fireCount": 12,
+  "lastError": null,
+  "createdAt": "2026-10-10T08:00:00.000Z",
+  "updatedAt": "2026-10-23T03:30:00.412Z"
+}
+```
+
+#### `POST /queues/:name/schedules`
+
+| Body field      | Type     | Default     | Rules                                                                                                           |
+| --------------- | -------- | ----------- | --------------------------------------------------------------------------------------------------------------- |
+| `name`          | string   | -           | required, unique per queue; 1-128 chars `A-Z a-z 0-9 . _ : -`, starting alphanumeric                            |
+| `cron`          | string   | -           | required; 5 fields (`min hour dom month dow`), 6 with a leading seconds field of `0`, or `@hourly`-style macros |
+| `timezone`      | string   | `UTC`       | IANA zone, e.g. `Europe/Berlin`                                                                                 |
+| `payload`       | any JSON | -           | required; job payload template, at most `JOB_MAX_PAYLOAD_BYTES`                                                 |
+| `priority`      | integer  | `0`         | `0`-`100`                                                                                                       |
+| `maxAttempts`   | integer  | `3`         | `1`-`25`                                                                                                        |
+| `misfirePolicy` | string   | `fire_once` | `skip`, `fire_once` or `catch_up` (see below)                                                                   |
+| `enabled`       | boolean  | `true`      | `false` creates the schedule paused                                                                             |
+
+```bash
+curl -i -X POST http://localhost:3000/queues/reports/schedules -H 'content-type: application/json' \
+  -d '{"name":"daily-digest","cron":"0 9 * * 1-5","timezone":"Asia/Kolkata","payload":{"report":"digest"}}'
+# 201 Created, Location: /schedules/0b7e..., body = the schedule
+```
+
+`400 VALIDATION_ERROR` for an invalid expression, zone or field (for example `details.fieldErrors.cron: ["Invalid cron expression: expected 5 fields ..."]`, an expression that never matches, or seconds other than `0`), `409 CONFLICT` if the name exists in the queue, `413 PAYLOAD_TOO_LARGE`.
+
+Misfire policies decide what happens to occurrences older than `SCHEDULER_MISFIRE_GRACE_MS` (default 60s) when the scheduler gets to them, e.g. after every scheduler was down. Occurrences within the window always fire.
+
+| Policy      | After a 5 h outage of an hourly schedule                                 |
+| ----------- | ------------------------------------------------------------------------ |
+| `skip`      | nothing fires for the missed hours; the schedule continues with the next |
+| `fire_once` | one job (for the latest missed hour)                                     |
+| `catch_up`  | one job per missed hour, at most `SCHEDULER_MAX_CATCH_UP`, newest kept   |
+
+#### `GET /queues/:name/schedules`
+
+Newest first, keyset-paginated. Query: `enabled` (`true` / `false`), `limit` (`1`-`200`, default `50`), `cursor`. Returns `{ "data": [...], "nextCursor": "..." | null }`; unknown queue -> `404`.
+
+#### `GET /schedules/:id`
+
+The schedule; `404` if unknown, `400` for a non-UUID id.
+
+#### `POST /schedules/:id/pause` and `POST /schedules/:id/resume`
+
+`200` with the schedule. Pause sets `enabled: false` and `nextRunAt: null`; resume computes the next occurrence after now (a paused period is not replayed). Both are idempotent.
+
+#### `DELETE /schedules/:id`
+
+`204`. Jobs already enqueued by the schedule are not touched.
+
 ### `GET /health`
 
 Liveness probe. Does **not** check Postgres or Redis.
@@ -729,7 +928,7 @@ Readiness probe: `200` when every dependency check passes, `503` otherwise. Each
 
 ### Errors
 
-Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `NOT_FOUND` (404), `JOB_NOT_DEAD_LETTERED` (409), `PAYLOAD_TOO_LARGE` (413), `IDEMPOTENCY_KEY_REUSED` (422), `SERVICE_UNAVAILABLE` (503), `INTERNAL_ERROR` (500). All errors use a consistent shape:
+Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `NOT_FOUND` (404), `CONFLICT` / `JOB_NOT_DEAD_LETTERED` (409), `PAYLOAD_TOO_LARGE` (413), `IDEMPOTENCY_KEY_REUSED` (422), `SERVICE_UNAVAILABLE` (503), `INTERNAL_ERROR` (500). All errors use a consistent shape:
 
 ```json
 {
@@ -746,12 +945,13 @@ Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `NOT_FOUND` (404), `JOB_NOT_DEA
 - **API tier** is stateless: run N replicas behind a load balancer. Each holds a pool of `PG_POOL_MAX` connections, so keep `replicas x PG_POOL_MAX` well under Postgres `max_connections`; beyond a few dozen replicas put PgBouncer (transaction pooling) in front. Nothing here relies on session state, so transaction pooling is compatible.
 - **Enqueue cost** is one indexed `SELECT` for the queue (cacheable in-process later) plus one `INSERT` touching the PK, the lease index (partial) and two listing indexes; idempotency adds one partial unique index entry only when a key is sent.
 - **Workers** scale horizontally (`--scale worker=N` or more pods): `SKIP LOCKED` partitions the ready set without coordination, and each lease call asks only for free slots. Total in-flight jobs = replicas x `WORKER_CONCURRENCY`; size it to what downstream dependencies tolerate, not just to CPU, since most handlers are I/O bound.
-- **Leasing cost**: `jobs_lease_idx` contains only runnable rows, so it stays small even with millions of finished jobs, and a lease of n jobs is one statement. With one queue per worker the scan is an ordered index walk; a worker consuming many queues pays a small sort over the candidates. Many far-future scheduled jobs with high priority are walked past by the `run_at` filter; if that shows up in M8 load tests, a separate "promote scheduled -> queued" step with a `status = queued` index is the fix.
+- **Leasing cost**: `jobs_lease_idx` contains only runnable rows, so it stays small even with millions of finished jobs, and a lease of n jobs is one statement. With one queue per worker the scan is an ordered index walk; a worker consuming many queues pays a small sort over the candidates. Since M4 the lease index holds only `queued` rows and due delayed jobs are promoted in bounded batches first, so far-future high-priority jobs are never walked by the lease scan.
 - **Heartbeat load** is `replicas x WORKER_CONCURRENCY / heartbeat interval` single-row updates per second (100 slots at 10s = 10 writes/s), which is why the heartbeat default is a third of the lease rather than something like 1s.
 - **Connections**: every worker replica holds up to `PG_POOL_MAX` connections; add replicas x pool size of API and workers together against `max_connections`, and use PgBouncer in transaction mode beyond a few dozen processes (no session state is used: leases are rows, not advisory locks).
 - **Crash recovery time** is bounded by `WORKER_LEASE_DURATION_MS + WORKER_REAPER_INTERVAL_MS`; graceful shutdowns release immediately.
 - **Table growth**: `jobs` is append-heavy and its status updates are not HOT (status is indexed); heartbeats are also not HOT because `lease_expires_at` is indexed, which is one more reason not to heartbeat too often. Dead-lettered jobs are purged explicitly (`DELETE /queues/:name/dlq?olderThan=`, e.g. from a daily cron); plan retention for succeeded jobs (M8), per-table autovacuum tuning, and time-based partitioning of `jobs` / `job_attempts` once volume demands it.
 - **DLQ** reads, bulk replays and purges walk the partial `jobs_dlq_idx`, so their cost is proportional to the DLQ, not the table; bulk operations are bounded per call so their row locks and cascades stay short. A mass replay after an outage (say 100k jobs) is best done in `limit=1000` batches with a `delayMs` spread so downstreams are not hit all at once.
+- **Scheduler**: one leader does all firing, so run 2 replicas for availability, not throughput. A tick costs one indexed claim plus one insert and one update per due schedule; at the default batch of 100 with immediate re-ticks a single leader fires thousands of schedules per second, far beyond typical needs (100k schedules at one per minute are about 1.7k fires/s spread over the minute). Each replica holds one connection. Failover time is about `SCHEDULER_LEADER_RETRY_INTERVAL_MS` on graceful exit or a killed process; on a network partition it is bounded by TCP keepalive and Postgres' `tcp_keepalives_*` / `idle_session_timeout` settings. If firing ever outgrows one leader, shard schedules by a hash of the id across several lock keys.
 - **Pagination** cost is O(limit) at any depth thanks to keyset cursors; there are no `OFFSET` scans or total counts.
 - **Redis (M5)** removes idle polling with pub/sub wake-ups; Postgres stays the lease authority, so losing Redis degrades latency, not correctness.
 - Capacity numbers and k6 results land in Milestone 8.
