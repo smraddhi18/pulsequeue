@@ -14,6 +14,7 @@ export {
 export {
   LeaseRepository,
   MAX_ERROR_LENGTH,
+  PROMOTE_BATCH_SIZE,
   truncateError,
   type FailAttemptParams,
   type LeaseJobsParams,
@@ -27,3 +28,10 @@ export {
   type ReplayBatchParams,
   type PurgeOlderThanParams,
 } from './dead-letter.repository.js';
+export {
+  ScheduleRepository,
+  type StoredSchedule,
+  type InsertScheduleParams,
+  type ListSchedulesParams,
+  type RecordFireParams,
+} from './schedule.repository.js';
