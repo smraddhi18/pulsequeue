@@ -75,6 +75,7 @@ export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): P
         payload: body.payload,
         ...(body.priority !== undefined ? { priority: body.priority } : {}),
         ...(body.delayMs !== undefined ? { delayMs: body.delayMs } : {}),
+        ...(body.runAt !== undefined ? { runAt: body.runAt } : {}),
         ...(body.maxAttempts !== undefined ? { maxAttempts: body.maxAttempts } : {}),
         ...(headers['idempotency-key'] !== undefined
           ? { idempotencyKey: headers['idempotency-key'] }
@@ -82,7 +83,15 @@ export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): P
       });
 
       if (created) {
-        request.log.info({ jobId: job.id, queue: job.queue, status: job.status }, 'Job enqueued');
+        request.log.info(
+          {
+            jobId: job.id,
+            queue: job.queue,
+            status: job.status,
+            runAt: job.runAt.toISOString(),
+          },
+          'Job enqueued',
+        );
       }
 
       reply.header('location', `/jobs/${job.id}`);
