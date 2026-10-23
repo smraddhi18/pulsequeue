@@ -15,7 +15,10 @@ export interface InsertJobParams {
   priority: number;
   payload: unknown;
   maxAttempts: number;
+  /** Relative delay from the database clock; ignored when runAt is set. */
   delayMs: number;
+  /** Absolute earliest start; clamped to now() so a past time means "run now". */
+  runAt?: Date | null;
   idempotencyKey: string | null;
   requestFingerprint: string | null;
 }
@@ -96,8 +99,12 @@ export class JobRepository {
    * separate statement. DO NOTHING (rather than a no-op DO UPDATE) keeps
    * replays read-only: no row lock, no dead tuple, updated_at untouched.
    *
-   * run_at is computed from the database clock so API replicas with skewed
-   * clocks agree on when a delayed job becomes runnable.
+   * A relative delay is applied to the database clock so API replicas with
+   * skewed clocks agree on when a delayed job becomes runnable; an absolute
+   * runAt is clamped to the database's now() so run_at is never in the past.
+   *
+   * Takes any Queryable: the scheduler calls it on its transaction client so
+   * the enqueue commits or rolls back together with advancing the schedule.
    */
   async insertIdempotent(params: InsertJobParams): Promise<InsertJobResult> {
     for (let attempt = 1; attempt <= MAX_IDEMPOTENT_INSERT_ATTEMPTS; attempt++) {
@@ -109,7 +116,11 @@ export class JobRepository {
              idempotency_key, request_fingerprint
            )
            VALUES (
-             $1, $2, $3, $4::jsonb, $5, now() + ($6::bigint * interval '1 millisecond'),
+             $1, $2, $3, $4::jsonb, $5,
+             CASE WHEN $9::timestamptz IS NULL
+                  THEN now() + ($6::bigint * interval '1 millisecond')
+                  ELSE greatest($9::timestamptz, now())
+             END,
              $7, $8
            )
            ON CONFLICT (queue_id, idempotency_key) WHERE idempotency_key IS NOT NULL
@@ -130,6 +141,7 @@ export class JobRepository {
           params.delayMs,
           params.idempotencyKey,
           params.requestFingerprint,
+          params.runAt ?? null,
         ],
       );
 
