@@ -25,6 +25,7 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
+    "cron-parser": "^5.10.2",
     "fastify": "^5.2.1",
     "pg": "^8.23.1",
     "pino": "^9.6.0",
