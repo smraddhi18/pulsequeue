@@ -31,10 +31,11 @@ COPY --chown=pulsequeue:pulsequeue migrations ./migrations
 USER pulsequeue
 EXPOSE 3000
 
-# One image, two roles. API (default CMD) or worker:
+# One image, three roles. API (default CMD), worker or scheduler:
 #   docker run pulsequeue:local node dist/worker.js
-# The worker has no HTTP port, so its container overrides this HEALTHCHECK
-# with a liveness-file check (see docker-compose.yml). Node runs as PID 1
+#   docker run pulsequeue:local node dist/scheduler.js
+# Workers and schedulers have no HTTP port, so their containers override this
+# HEALTHCHECK with a liveness-file check (see docker-compose.yml). Node runs as PID 1
 # without npm in between, so SIGTERM reaches the process and triggers the
 # graceful drain.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \

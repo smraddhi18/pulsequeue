@@ -80,6 +80,50 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Cron scheduler: turns due schedules into jobs. Run 2 replicas for HA:
+  # they elect a leader through a Postgres advisory lock, only the leader
+  # ticks, and a standby takes over within SCHEDULER_LEADER_RETRY_INTERVAL_MS
+  # if the leader dies. More than 2 adds nothing but idle standbys.
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pulsequeue:local
+    command: ['node', 'dist/scheduler.js']
+    environment:
+      <<: *app-env
+      PG_POOL_MAX: 4
+      SCHEDULER_TICK_INTERVAL_MS: 1000
+      SCHEDULER_LEADER_RETRY_INTERVAL_MS: 5000
+      SCHEDULER_MISFIRE_GRACE_MS: 60000
+      SCHEDULER_MAX_CATCH_UP: 10
+      SCHEDULER_SHUTDOWN_TIMEOUT_MS: 10000
+      SCHEDULER_LIVENESS_FILE: /tmp/pulsequeue-scheduler.alive
+    deploy:
+      replicas: 2
+    # Longer than SCHEDULER_SHUTDOWN_TIMEOUT_MS so the leader can finish its
+    # tick and release the lock before SIGKILL.
+    stop_grace_period: 20s
+    healthcheck:
+      # Leader and standby both touch the file from their loop.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "const s=require('fs').statSync('/tmp/pulsequeue-scheduler.alive');process.exit(Date.now()-s.mtimeMs<60000?0:1)",
+        ]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:
