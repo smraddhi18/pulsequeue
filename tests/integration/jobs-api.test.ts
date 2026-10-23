@@ -128,12 +128,59 @@ describeWithDb('jobs API (Postgres)', () => {
       expect(delta).toBeLessThanOrEqual(60_001);
     });
 
+    it('schedules a job at an absolute runAt (offset honoured, millisecond precision)', async () => {
+      const target = new Date(Date.now() + 10 * 60_000);
+      target.setUTCMilliseconds(123);
+      // Same instant written in IST.
+      const ist = new Date(target.getTime() + 5.5 * 3_600_000).toISOString().replace('Z', '+05:30');
+      const res = await enqueue('delayed', { payload: {}, runAt: ist });
+      expect(res.statusCode).toBe(201);
+      const job = res.json<JobBody>();
+      expect(job.status).toBe('scheduled');
+      expect(new Date(job.runAt).getTime()).toBe(target.getTime());
+    });
+
+    it('treats a runAt in the past as "now" (clamped to the database clock)', async () => {
+      const res = await enqueue('delayed', { payload: {}, runAt: '2001-01-01T00:00:00Z' });
+      expect(res.statusCode).toBe(201);
+      const job = res.json<JobBody>();
+      expect(job.status).toBe('queued');
+      expect(new Date(job.runAt).getTime()).toBe(new Date(job.createdAt).getTime());
+    });
+
+    it('rejects delayMs + runAt and a runAt beyond 30 days with field-level 400s', async () => {
+      const both = await enqueue('validation', {
+        payload: {},
+        delayMs: 1000,
+        runAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      expect(both.statusCode).toBe(400);
+      expect(both.json<ErrorBody>().error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: { fieldErrors: { runAt: ['Specify either delayMs or runAt, not both'] } },
+      });
+
+      const far = await enqueue('validation', {
+        payload: {},
+        runAt: new Date(Date.now() + 31 * 24 * 3_600_000).toISOString(),
+      });
+      expect(far.statusCode).toBe(400);
+      expect(far.json<ErrorBody>().error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: { formErrors: [], fieldErrors: { runAt: [expect.stringContaining('30 days')] } },
+      });
+      expect(await countJobs(`queue_id IN (SELECT id FROM queues WHERE name = 'validation')`)).toBe(
+        0,
+      );
+    });
+
     it.each([
       ['priority above range', { payload: {}, priority: 101 }],
       ['maxAttempts zero', { payload: {}, maxAttempts: 0 }],
       ['negative delay', { payload: {}, delayMs: -5 }],
       ['unknown field', { payload: {}, delay: 5 }],
       ['missing payload', { priority: 1 }],
+      ['runAt without offset', { payload: {}, runAt: '2026-10-23T09:00:00' }],
     ])('returns 400 VALIDATION_ERROR for %s', async (_label, body) => {
       const res = await enqueue('validation', body);
       expect(res.statusCode).toBe(400);
