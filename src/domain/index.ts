@@ -2,6 +2,7 @@ export {
   AppError,
   NotFoundError,
   ValidationError,
+  fieldValidationError,
   ConflictError,
   PayloadTooLargeError,
   IdempotencyKeyReusedError,
@@ -52,3 +53,16 @@ export {
   type PurgeResult,
   type ReplayJobInput,
 } from './dead-letter.js';
+
+export {
+  MISFIRE_POLICIES,
+  SCHEDULE_LIMITS,
+  SCHEDULE_NAME_PATTERN,
+  scheduleJobIdempotencyKey,
+  type CreateScheduleInput,
+  type ListSchedulesInput,
+  type MisfirePolicy,
+  type Schedule,
+  type ScheduleId,
+  type SchedulePage,
+} from './schedule.js';
