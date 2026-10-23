@@ -13,3 +13,8 @@ export {
   type QueueStore,
 } from './job.service.js';
 export { DlqService, type DeadLetterStore, type ReplayJobResult } from './dlq.service.js';
+export {
+  ScheduleService,
+  type ScheduleServiceOptions,
+  type ScheduleStore,
+} from './schedule.service.js';
