@@ -65,6 +65,19 @@ export class ValidationError extends AppError {
   }
 }
 
+/**
+ * A ValidationError about one request field, with the same `details` shape as
+ * a flattened ZodError (`{ formErrors, fieldErrors }`), so a rule checked in a
+ * service (e.g. one that depends on the current time) produces exactly the
+ * same 400 body as a schema rule.
+ */
+export function fieldValidationError(field: string, message: string): ValidationError {
+  return new ValidationError('Validation failed', {
+    formErrors: [],
+    fieldErrors: { [field]: [message] },
+  });
+}
+
 export class ConflictError extends AppError {
   constructor(message = 'Conflict', details?: unknown) {
     super(message, {

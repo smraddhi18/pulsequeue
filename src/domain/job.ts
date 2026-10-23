@@ -14,8 +14,9 @@ export const JOB_STATUSES = [
 ] as const;
 
 /**
- * - queued:    runnable now
- * - scheduled: waiting for runAt (delayed enqueue or retry backoff)
+ * - queued:    runnable now (run_at <= now()); the only status workers lease
+ * - scheduled: waiting for runAt (delayed enqueue, retry backoff or delayed
+ *              replay); workers promote it to queued once it is due (M4)
  * - running:   leased by a worker, lease kept alive by heartbeats
  * - succeeded: terminal success
  * - failed:    legacy (M2). Since Milestone 3 no code path writes it: every
@@ -35,7 +36,11 @@ export const JOB_LIMITS = {
   MIN_MAX_ATTEMPTS: 1,
   MAX_MAX_ATTEMPTS: 25,
   DEFAULT_MAX_ATTEMPTS: 3,
-  /** 30 days. Longer horizons belong to the scheduler (M4), not a delay. */
+  /**
+   * 30 days: the furthest ahead a job may be delayed, whether given as delayMs
+   * or as an absolute runAt. Longer horizons and repetition belong to a
+   * schedule (M4), not to a parked job row.
+   */
   MAX_DELAY_MS: 30 * 24 * 60 * 60 * 1000,
   IDEMPOTENCY_KEY_MAX_LENGTH: 255,
 } as const;
@@ -78,7 +83,13 @@ export interface EnqueueJobInput {
   queue: QueueName;
   payload: unknown;
   priority?: number;
+  /** Relative delay; mutually exclusive with runAt. */
   delayMs?: number;
+  /**
+   * Absolute earliest start (M4); mutually exclusive with delayMs. A time in
+   * the past means "now" (clock skew between producer and database is normal).
+   */
+  runAt?: Date;
   maxAttempts?: number;
   idempotencyKey?: string;
 }
