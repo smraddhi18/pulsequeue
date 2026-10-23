@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { QueueName } from '../../src/domain/job.js';
 import type { LeasedJob } from '../../src/domain/lease.js';
 import { JobRepository } from '../../src/repositories/job.repository.js';
@@ -136,6 +136,65 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     expect(await leaseOne('q')).toEqual([]);
     expect(await repo.lease({ queues: [], workerId: 'w', limit: 5, leaseMs: 1000 })).toEqual([]);
     expect(await repo.lease({ queues: ['q'], workerId: 'w', limit: 0, leaseMs: 1000 })).toEqual([]);
+  });
+
+  describe('delayed jobs (M4)', () => {
+    it('never leases a runAt or delayMs job early; leases it once due, by priority', async () => {
+      const viaRunAt = (
+        await jobs.enqueue({
+          queue: 'q' as QueueName,
+          payload: { kind: 'runAt' },
+          runAt: new Date(Date.now() + 3_600_000),
+          priority: 10,
+        })
+      ).job.id;
+      const viaDelay = await enqueue('q', { delayMs: 3_600_000, priority: 20 });
+      const ready = await enqueue('q', { priority: 0 });
+
+      // Only the immediately runnable job is handed out, despite lower priority.
+      const first = await repo.lease({ queues: ['q'], workerId: 'w', limit: 10, leaseMs: 30_000 });
+      expect(first.map((j) => j.jobId)).toEqual([ready]);
+      expect((await jobRow(viaRunAt)).status).toBe('scheduled');
+      expect((await jobRow(viaDelay)).status).toBe('scheduled');
+      expect(await repo.promoteDue(['q'])).toBe(0);
+
+      // Time passes (simulated by moving run_at into the past).
+      await db.pool.query(
+        `UPDATE jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)`,
+        [[viaRunAt, viaDelay]],
+      );
+      const due = await repo.lease({ queues: ['q'], workerId: 'w', limit: 10, leaseMs: 30_000 });
+      expect(due.map((j) => j.jobId)).toEqual([viaDelay, viaRunAt]);
+    });
+
+    it('a scheduled job one second from due is not leased; promotion is per queue and bounded', async () => {
+      const soon = await enqueue('q', { delayMs: 1_000 });
+      expect(await leaseOne('q')).toEqual([]);
+      expect((await jobRow(soon)).status).toBe('scheduled');
+
+      const ids: string[] = [];
+      for (let i = 0; i < 5; i++) ids.push(await enqueue('q', { delayMs: 60_000 }));
+      const otherQueue = await enqueue('other', { delayMs: 60_000 });
+      await db.pool.query(`UPDATE jobs SET run_at = now() - interval '1 second'`);
+
+      expect(await repo.promoteDue(['q'], 2)).toBe(2);
+      expect(await repo.promoteDue(['q'], 100)).toBe(4);
+      expect(await repo.promoteDue(['q'], 100)).toBe(0);
+      expect((await jobRow(otherQueue)).status).toBe('scheduled');
+      expect(await repo.promoteDue([], 100)).toBe(0);
+    });
+
+    it('a retry backoff (fail with delay) is not re-leased until its run_at', async () => {
+      await enqueue('q');
+      const [leased] = await leaseOne();
+      if (!leased) throw new Error('expected a lease');
+      expect(
+        await repo.fail(leased, { error: 'boom', attemptStatus: 'failed', retryDelayMs: 60_000 }),
+      ).toBe('retrying');
+      expect(await leaseOne()).toEqual([]);
+      await db.pool.query(`UPDATE jobs SET run_at = now() - interval '1 second'`);
+      expect((await leaseOne()).map((j) => j.jobId)).toEqual([leased.jobId]);
+    });
   });
 
   it('leases from several queues at once and ignores unknown queue names', async () => {
