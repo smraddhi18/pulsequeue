@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { loadDatabaseEnv, loadEnv, loadWorkerEnv } from '../src/config/env.js';
+import { loadDatabaseEnv, loadEnv, loadSchedulerEnv, loadWorkerEnv } from '../src/config/env.js';
 
 const validEnv = {
   NODE_ENV: 'test',
@@ -147,5 +147,63 @@ describe('loadWorkerEnv', () => {
     expect(() =>
       loadWorkerEnv({ ...base, RETRY_BACKOFF_BASE_MS: '5000', RETRY_BACKOFF_MAX_MS: '1000' }),
     ).toThrow(/RETRY_BACKOFF_BASE_MS/);
+  });
+});
+
+describe('loadSchedulerEnv', () => {
+  const db = { DATABASE_URL: validEnv.DATABASE_URL };
+
+  it('needs only DATABASE_URL and applies defaults', () => {
+    const env = loadSchedulerEnv(db);
+    expect(env).toMatchObject({
+      SCHEDULER_TICK_INTERVAL_MS: 1_000,
+      SCHEDULER_LEADER_RETRY_INTERVAL_MS: 5_000,
+      SCHEDULER_BATCH_SIZE: 100,
+      SCHEDULER_MISFIRE_GRACE_MS: 60_000,
+      SCHEDULER_MAX_CATCH_UP: 10,
+      SCHEDULER_SHUTDOWN_TIMEOUT_MS: 10_000,
+    });
+    expect(env.SCHEDULER_ID).toBeUndefined();
+    expect(env.SCHEDULER_LIVENESS_FILE).toBeUndefined();
+    expect(env).not.toHaveProperty('REDIS_URL');
+  });
+
+  it('parses overrides, including a zero catch-up limit', () => {
+    const env = loadSchedulerEnv({
+      ...db,
+      SCHEDULER_ID: 'sched-a',
+      SCHEDULER_TICK_INTERVAL_MS: '250',
+      SCHEDULER_MAX_CATCH_UP: '0',
+      SCHEDULER_LIVENESS_FILE: '/tmp/scheduler-alive',
+    });
+    expect(env).toMatchObject({
+      SCHEDULER_ID: 'sched-a',
+      SCHEDULER_TICK_INTERVAL_MS: 250,
+      SCHEDULER_MAX_CATCH_UP: 0,
+      SCHEDULER_LIVENESS_FILE: '/tmp/scheduler-alive',
+    });
+  });
+
+  it.each([
+    ['tick interval below 100 ms', { SCHEDULER_TICK_INTERVAL_MS: '50' }],
+    ['batch size above 1000', { SCHEDULER_BATCH_SIZE: '1001' }],
+    ['negative catch-up', { SCHEDULER_MAX_CATCH_UP: '-1' }],
+    ['grace below 1 s', { SCHEDULER_MISFIRE_GRACE_MS: '500' }],
+    ['id with spaces', { SCHEDULER_ID: 'a b' }],
+    ['non-numeric interval', { SCHEDULER_LEADER_RETRY_INTERVAL_MS: 'soon' }],
+  ])('rejects %s', (_label, overrides) => {
+    expect(() => loadSchedulerEnv({ ...db, ...overrides })).toThrow(
+      /Invalid environment configuration/,
+    );
+  });
+
+  it('requires the misfire grace to cover at least two ticks', () => {
+    expect(() =>
+      loadSchedulerEnv({
+        ...db,
+        SCHEDULER_TICK_INTERVAL_MS: '30000',
+        SCHEDULER_MISFIRE_GRACE_MS: '45000',
+      }),
+    ).toThrow(/SCHEDULER_MISFIRE_GRACE_MS: Must be at least twice/);
   });
 });
