@@ -80,6 +80,20 @@ jobs:
           kill -TERM "$pid"
           wait "$pid"
 
+      # Boots the compiled scheduler: it must win the leader lock, then on
+      # SIGTERM release it and exit 0.
+      - name: Scheduler smoke test (start, lead, SIGTERM, clean exit)
+        run: |
+          node dist/scheduler.js > scheduler.log 2>&1 &
+          pid=$!
+          sleep 3
+          kill -0 "$pid"
+          kill -TERM "$pid"
+          wait "$pid"
+          cat scheduler.log
+          grep -q '"event":"scheduler.leader_acquired"' scheduler.log
+          grep -q '"event":"scheduler.leader_released"' scheduler.log
+
       # Unit tests plus integration tests (each suite migrates its own schema).
       - name: Test
         run: npm test
