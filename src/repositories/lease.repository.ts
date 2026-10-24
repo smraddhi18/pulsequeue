@@ -211,6 +211,39 @@ export class LeaseRepository {
   }
 
   /**
+   * Milliseconds until the earliest `scheduled` job of `queues` is due (0 if
+   * one is already due), or null when none is scheduled. Measured on the
+   * database clock, like run_at itself.
+   *
+   * Used by workers in push mode (Milestone 5): wake-ups announce new work,
+   * but nothing publishes when a delayed job or a retry *becomes* due, so the
+   * idle worker sleeps at most until then. One index probe per queue on
+   * jobs_scheduled_due_idx (queue_id, run_at): cheap enough to run on every
+   * idle cycle.
+   */
+  async nextDueInMs(queues: readonly string[]): Promise<number | null> {
+    if (queues.length === 0) return null;
+    const rows = await runQuery<{ due_in_ms: string | null }>(
+      this.db,
+      // No GREATEST(0, ...) here: GREATEST skips NULLs, so "nothing
+      // scheduled" would come back as 0 (due now). Clamped below instead.
+      `SELECT ceil(EXTRACT(EPOCH FROM (min(n.run_at) - now())) * 1000)::bigint::text AS due_in_ms
+       FROM queues q
+       CROSS JOIN LATERAL (
+         SELECT j.run_at
+         FROM jobs j
+         WHERE j.queue_id = q.id AND j.status = 'scheduled'
+         ORDER BY j.run_at
+         LIMIT 1
+       ) n
+       WHERE q.name = ANY($1::text[])`,
+      [queues],
+    );
+    const value = rows[0]?.due_in_ms;
+    return value === null || value === undefined ? null : Math.max(0, Number(value));
+  }
+
+  /**
    * Extend the lease to now() + leaseMs. Returns the new expiry, or null when
    * the lease is gone (reaped and possibly re-leased): the caller must stop.
    */
