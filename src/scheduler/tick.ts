@@ -17,6 +17,12 @@ export interface TickOptions {
   graceMs: number;
   maxCatchUp: number;
   logger: Logger;
+  /**
+   * Called after COMMIT with the distinct queues that received new jobs
+   * (Milestone 5: wake workers, invalidate stats). Never called for a
+   * rolled-back tick; a throwing hook is logged and does not fail the tick.
+   */
+  onCommitted?: (queues: string[]) => void;
 }
 
 export interface TickResult {
@@ -109,6 +115,16 @@ export async function runTick(db: Queryable, options: TickOptions): Promise<Tick
     throw err;
   }
 
+  const queues = [
+    ...new Set(events.filter((e) => e.kind === 'fired').map((e) => e.schedule.queue)),
+  ];
+  if (queues.length > 0 && options.onCommitted) {
+    try {
+      options.onCommitted(queues);
+    } catch (err) {
+      options.logger.warn({ err, queues }, 'Tick onCommitted hook threw');
+    }
+  }
   return report(events, claimed.length, options.logger);
 
   async function evaluate(schedule: StoredSchedule, now: Date): Promise<void> {
