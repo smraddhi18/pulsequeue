@@ -7,4 +7,5 @@ export {
   type DatabaseEnv,
   type WorkerEnv,
   type SchedulerEnv,
+  type RedisEnv,
 } from './env.js';

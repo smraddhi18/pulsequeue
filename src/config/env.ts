@@ -17,6 +17,16 @@ const redisUrl = z
 
 const positiveInt = z.coerce.number().int().positive();
 
+/** "true"/"false"/"1"/"0" (any case) -> boolean; anything else is a config error. */
+const booleanFlag = (defaultValue: boolean) =>
+  z
+    .string()
+    .trim()
+    .toLowerCase()
+    .pipe(z.enum(['true', 'false', '1', '0']))
+    .default(defaultValue ? 'true' : 'false')
+    .transform((v) => v === 'true' || v === '1');
+
 /**
  * Database settings. Split out so the migration CLI can validate only what it
  * needs (it must not require REDIS_URL just to apply schema changes).
@@ -35,22 +45,94 @@ const databaseEnvShape = {
 
 const databaseEnvSchema = z.object(databaseEnvShape);
 
-const envSchema = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  HOST: z.string().min(1).default('0.0.0.0'),
-  PORT: z.coerce.number().int().positive().max(65535).default(3000),
-  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
-  ...databaseEnvShape,
-  REDIS_URL: redisUrl,
-  /** Max serialized size of a job payload (UTF-8 bytes of its JSON). */
-  JOB_MAX_PAYLOAD_BYTES: positiveInt.max(10 * 1024 * 1024).default(256 * 1024),
-  /** Readiness probe budget per dependency check. */
-  READINESS_TIMEOUT_MS: positiveInt.max(30_000).default(2_000),
-});
+/**
+ * Redis settings (Milestone 5), shared by the API, worker and scheduler.
+ * Redis is an accelerator, never the source of truth: with REDIS_URL unset
+ * every Redis feature is off and the system behaves exactly as before
+ * (workers poll, stats are computed from Postgres on every request).
+ */
+const redisEnvShape = {
+  /** Unset = Redis features disabled. */
+  REDIS_URL: redisUrl.optional(),
+  /** Namespace for every key and channel, so environments can share one Redis. */
+  REDIS_KEY_PREFIX: z
+    .string()
+    .regex(/^[A-Za-z0-9._:-]{1,64}$/, 'Only letters, digits and ._:- are allowed (max 64)')
+    .default('pq'),
+  /** TCP connect + handshake budget per attempt. */
+  REDIS_CONNECT_TIMEOUT_MS: positiveInt.max(60_000).default(2_000),
+  /** Per-command budget: a slow Redis must not slow down requests, they fall back to Postgres. */
+  REDIS_COMMAND_TIMEOUT_MS: positiveInt.max(60_000).default(500),
+  /** Reconnect backoff: delay = random(cap/2, cap), cap = min(MAX, BASE * 2^(attempt-1)). */
+  REDIS_RECONNECT_BASE_MS: positiveInt.max(60_000).default(100),
+  REDIS_RECONNECT_MAX_MS: positiveInt.max(300_000).default(5_000),
+  /** Publish wake-ups on enqueue/replay/retry and let idle workers block on them instead of polling. */
+  WAKEUP_ENABLED: booleanFlag(true),
+  /** Per-queue publish coalescing window: at most ~2 publishes per queue per window. */
+  WAKEUP_COALESCE_MS: positiveInt.max(10_000).default(50),
+  /** Cache GET /queues/:name/stats in Redis (API) and mark it dirty on writes (all processes). */
+  STATS_CACHE_ENABLED: booleanFlag(true),
+  /**
+   * Hard expiry of a cached stats entry (and of dirty flags): the staleness
+   * bound if every invalidation for a queue were lost (Redis blip, crashed
+   * writer). Shared so every process writes dirty flags with the same expiry.
+   */
+  STATS_CACHE_TTL_MS: positiveInt.min(100).max(3_600_000).default(10_000),
+  /** Per-queue invalidation coalescing window (dirty-flag writes). */
+  STATS_INVALIDATION_COALESCE_MS: positiveInt.max(60_000).default(100),
+} as const;
+
+export const redisEnvSchema = z.object(redisEnvShape);
+
+function refineRedis(
+  env: { REDIS_RECONNECT_BASE_MS: number; REDIS_RECONNECT_MAX_MS: number },
+  ctx: z.RefinementCtx,
+): void {
+  if (env.REDIS_RECONNECT_BASE_MS > env.REDIS_RECONNECT_MAX_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['REDIS_RECONNECT_BASE_MS'],
+      message: 'Must not exceed REDIS_RECONNECT_MAX_MS',
+    });
+  }
+}
+
+const envSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    HOST: z.string().min(1).default('0.0.0.0'),
+    PORT: z.coerce.number().int().positive().max(65535).default(3000),
+    LOG_LEVEL: z
+      .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+      .default('info'),
+    ...databaseEnvShape,
+    ...redisEnvShape,
+    /** Max serialized size of a job payload (UTF-8 bytes of its JSON). */
+    JOB_MAX_PAYLOAD_BYTES: positiveInt.max(10 * 1024 * 1024).default(256 * 1024),
+    /** Readiness probe budget per dependency check. */
+    READINESS_TIMEOUT_MS: positiveInt.max(30_000).default(2_000),
+    /**
+     * A dirty entry younger than this is still served (x-cache: STALE), which
+     * caps recomputes at ~1 per queue per interval across all API instances
+     * no matter how hot the queue is.
+     */
+    STATS_CACHE_MIN_REFRESH_MS: z.coerce.number().int().min(0).max(3_600_000).default(1_000),
+  })
+  .superRefine((env, ctx) => {
+    refineRedis(env, ctx);
+    if (env.STATS_CACHE_MIN_REFRESH_MS >= env.STATS_CACHE_TTL_MS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['STATS_CACHE_MIN_REFRESH_MS'],
+        message: 'Must be lower than STATS_CACHE_TTL_MS',
+      });
+    }
+  });
 
 /**
  * Worker process settings (Milestone 2). The worker validates only what it
- * needs: database + logging + these, so it does not require HTTP settings.
+ * needs: database + Redis + logging + these, so it does not require HTTP
+ * settings.
  */
 const workerEnvSchema = z
   .object({
@@ -59,6 +141,7 @@ const workerEnvSchema = z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),
     ...databaseEnvShape,
+    ...redisEnvShape,
     /** Stable worker identity for logs and job.locked_by; defaults to host-pid-random. */
     WORKER_ID: z
       .string()
@@ -91,8 +174,17 @@ const workerEnvSchema = z
       }),
     /** Max jobs this process runs at once. */
     WORKER_CONCURRENCY: positiveInt.max(1_000).default(10),
-    /** Idle poll interval (jittered +-20%); a full lease batch re-polls immediately. */
+    /**
+     * Idle poll interval (jittered +-20%) without wake-ups (Redis disabled or
+     * down); a full lease batch re-polls immediately.
+     */
     WORKER_POLL_INTERVAL_MS: positiveInt.min(10).max(60_000).default(1_000),
+    /**
+     * Idle poll interval (jittered +-20%) while subscribed to wake-ups. Only
+     * a safety net for lost messages; delayed jobs and retries get their own
+     * timer from the next due run_at.
+     */
+    WORKER_WAKEUP_FALLBACK_POLL_MS: positiveInt.min(10).max(600_000).default(30_000),
     /** Visibility timeout: how long a lease lives without a heartbeat. */
     WORKER_LEASE_DURATION_MS: positiveInt.min(1_000).max(3_600_000).default(30_000),
     /** How often a running job extends its lease. Must fit at least twice into the lease. */
@@ -116,6 +208,14 @@ const workerEnvSchema = z
     RETRY_BACKOFF_MAX_MS: positiveInt.max(86_400_000).default(300_000),
   })
   .superRefine((env, ctx) => {
+    refineRedis(env, ctx);
+    if (env.WORKER_WAKEUP_FALLBACK_POLL_MS < env.WORKER_POLL_INTERVAL_MS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['WORKER_WAKEUP_FALLBACK_POLL_MS'],
+        message: 'Must be at least WORKER_POLL_INTERVAL_MS (wake-ups exist to poll less, not more)',
+      });
+    }
     if (env.WORKER_HEARTBEAT_INTERVAL_MS * 2 > env.WORKER_LEASE_DURATION_MS) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -135,7 +235,7 @@ const workerEnvSchema = z
 
 /**
  * Scheduler process settings (Milestone 4). Like the worker, the scheduler
- * validates only database + logging + its own tuning.
+ * validates only database + Redis + logging + its own tuning.
  */
 const schedulerEnvSchema = z
   .object({
@@ -144,6 +244,7 @@ const schedulerEnvSchema = z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),
     ...databaseEnvShape,
+    ...redisEnvShape,
     /** Stable scheduler identity for logs; defaults to host-pid-random. */
     SCHEDULER_ID: z
       .string()
@@ -172,6 +273,7 @@ const schedulerEnvSchema = z
     SCHEDULER_LIVENESS_FILE: z.string().min(1).optional(),
   })
   .superRefine((env, ctx) => {
+    refineRedis(env, ctx);
     if (env.SCHEDULER_MISFIRE_GRACE_MS < env.SCHEDULER_TICK_INTERVAL_MS * 2) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -186,6 +288,8 @@ export type Env = z.infer<typeof envSchema>;
 export type DatabaseEnv = z.infer<typeof databaseEnvSchema>;
 export type WorkerEnv = z.infer<typeof workerEnvSchema>;
 export type SchedulerEnv = z.infer<typeof schedulerEnvSchema>;
+/** The Redis settings every process shares (see redisEnvShape). */
+export type RedisEnv = z.infer<typeof redisEnvSchema>;
 
 function parseEnv<T extends z.ZodTypeAny>(schema: T, raw: NodeJS.ProcessEnv): z.infer<T> {
   const result = schema.safeParse(raw);
@@ -211,12 +315,12 @@ export function loadDatabaseEnv(raw: NodeJS.ProcessEnv = process.env): DatabaseE
   return parseEnv(databaseEnvSchema, raw);
 }
 
-/** Worker process config (database + logging + worker tuning). */
+/** Worker process config (database + Redis + logging + worker tuning). */
 export function loadWorkerEnv(raw: NodeJS.ProcessEnv = process.env): WorkerEnv {
   return parseEnv(workerEnvSchema, raw);
 }
 
-/** Scheduler process config (database + logging + scheduler tuning). */
+/** Scheduler process config (database + Redis + logging + scheduler tuning). */
 export function loadSchedulerEnv(raw: NodeJS.ProcessEnv = process.env): SchedulerEnv {
   return parseEnv(schedulerEnvSchema, raw);
 }
