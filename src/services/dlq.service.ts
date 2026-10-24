@@ -11,6 +11,7 @@ import type {
   ReplayJobInput,
 } from '../domain/dead-letter.js';
 import type { Job, JobId, Queue, QueueName } from '../domain/job.js';
+import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
 import { decodeCursor, encodeCursor } from '../lib/cursor.js';
 import type {
   DeadLetterRepository,
@@ -30,6 +31,11 @@ export type DeadLetterStore = Pick<
   | 'purgeOlderThan'
 >;
 
+export interface DlqServiceOptions {
+  /** Replays wake workers; purges invalidate stats (Milestone 5). */
+  signals?: QueueSignals;
+}
+
 /** Result of a single replay: the job as it is now (queued or scheduled). */
 export interface ReplayJobResult {
   job: Job;
@@ -46,10 +52,15 @@ export interface ReplayJobResult {
  * into the right typed error (404 vs 409) for the caller.
  */
 export class DlqService {
+  private readonly signals: QueueSignals;
+
   constructor(
     private readonly queues: QueueStore,
     private readonly deadLetters: DeadLetterStore,
-  ) {}
+    options: DlqServiceOptions = {},
+  ) {
+    this.signals = options.signals ?? NOOP_QUEUE_SIGNALS;
+  }
 
   async list(input: ListDeadLettersInput): Promise<DeadLetterPage> {
     // Decode first: a malformed cursor is a 400 regardless of the queue.
@@ -120,6 +131,7 @@ export class DlqService {
       if (!current) throw new NotFoundError('Job not found', { id: input.jobId });
       throw new JobNotDeadLetteredError(undefined, { id: input.jobId, status: current.status });
     }
+    this.signals.jobsRunnable(input.queue);
     return { job: toJob(replayed), replayCount: replayed.replayCount, previousReason };
   }
 
@@ -131,13 +143,17 @@ export class DlqService {
       delayMs: input.delayMs ?? 0,
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
     });
+    if (jobIds.length > 0) this.signals.jobsRunnable(input.queue);
     return { replayed: jobIds.length, jobIds };
   }
 
   /** Permanently delete one dead-lettered job and its attempt history. */
   async purge(queueName: QueueName, jobId: JobId): Promise<void> {
     const queue = await this.requireQueue(queueName);
-    if (await this.deadLetters.purge(jobId, queue.id)) return;
+    if (await this.deadLetters.purge(jobId, queue.id)) {
+      this.signals.jobsChanged(queueName);
+      return;
+    }
 
     const current = await this.deadLetters.findById(jobId);
     if (!current || current.queue !== queueName) {
@@ -153,6 +169,7 @@ export class DlqService {
       olderThan: input.olderThan,
       limit: input.limit,
     });
+    if (purged > 0) this.signals.jobsChanged(input.queue);
     return { purged };
   }
 

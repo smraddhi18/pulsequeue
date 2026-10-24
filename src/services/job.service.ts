@@ -12,6 +12,7 @@ import {
   type JobPage,
   type ListJobsInput,
 } from '../domain/job.js';
+import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
 import { decodeCursor, encodeCursor } from '../lib/cursor.js';
 import { requestFingerprint } from '../lib/fingerprint.js';
 import type { JobRepository, StoredJob } from '../repositories/job.repository.js';
@@ -25,6 +26,8 @@ export interface JobServiceOptions {
   maxPayloadBytes: number;
   /** Clock for the runAt horizon check (tests pin it). */
   now?: () => number;
+  /** Notified after a new job committed (wake-ups, stats invalidation). */
+  signals?: QueueSignals;
 }
 
 /**
@@ -100,6 +103,10 @@ export class JobService {
     if (!inserted && job.requestFingerprint !== fingerprint) {
       throw new IdempotencyKeyReusedError(undefined, { idempotencyKey, jobId: job.id });
     }
+    // After the insert committed (single statement, autocommit), so a woken
+    // worker's lease query sees the row. Delayed jobs signal too: idle
+    // workers re-read the next due time. Replays insert nothing: no signal.
+    if (inserted) (this.options.signals ?? NOOP_QUEUE_SIGNALS).jobsRunnable(input.queue);
 
     // On replay the job is returned in its *current* state (it may already be
     // running or finished); the producer learns the outcome of its first call.
