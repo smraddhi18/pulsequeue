@@ -218,6 +218,48 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       expect(await jobsFor(paused.id)).toHaveLength(0);
     });
 
+    it('reports the queues that got jobs after COMMIT (M5 wake-ups), once per queue', async () => {
+      const a = await createSchedule('wake-a');
+      const b = await createSchedule('wake-b', { queue: 'sched-other' });
+      const c3 = await createSchedule('wake-c');
+      await setNextRun(a.id, `date_trunc('minute', now())`);
+      await setNextRun(b.id, `date_trunc('minute', now())`);
+      const committed: string[][] = [];
+      const result = await withClient((c) =>
+        runTick(
+          c,
+          tickOptions({
+            onCommitted: (queues) => {
+              committed.push(queues);
+            },
+          }),
+        ),
+      );
+      expect(result.fired).toBe(2);
+      expect(committed).toHaveLength(1);
+      expect([...committed[0]!].sort()).toEqual(['sched', 'sched-other']);
+      expect(await jobsFor(a.id)).toHaveLength(1);
+      expect(await jobsFor(b.id)).toHaveLength(1);
+
+      // Nothing fired: the hook is not called; a throwing hook does not fail the tick.
+      const idle: string[][] = [];
+      await withClient((c) => runTick(c, tickOptions({ onCommitted: (q) => idle.push(q) })));
+      expect(idle).toEqual([]);
+      await setNextRun(c3.id, `date_trunc('minute', now())`);
+      await expect(
+        withClient((c) =>
+          runTick(
+            c,
+            tickOptions({
+              onCommitted: () => {
+                throw new Error('hook failed');
+              },
+            }),
+          ),
+        ),
+      ).resolves.toMatchObject({ fired: 1 });
+    });
+
     it('re-evaluating an already fired occurrence is suppressed by the idempotency key', async () => {
       const s = await createSchedule('replayed');
       await setNextRun(s.id, `date_trunc('minute', now())`);
