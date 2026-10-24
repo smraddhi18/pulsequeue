@@ -35,3 +35,4 @@ export {
   type ListSchedulesParams,
   type RecordFireParams,
 } from './schedule.repository.js';
+export { QueueStatsRepository } from './stats.repository.js';
