@@ -17,7 +17,7 @@ describe('health routes', () => {
       DATABASE_URL: 'postgres://pulsequeue:pulsequeue@127.0.0.1:1/pulsequeue',
       PG_CONNECTION_TIMEOUT_MS: '500',
       READINESS_TIMEOUT_MS: '1000',
-      REDIS_URL: 'redis://localhost:6379',
+      // REDIS_URL unset: Redis is optional and disabled here.
     });
     app = await buildApp({ env, logger: false });
     await app.ready();
@@ -46,6 +46,11 @@ describe('health routes', () => {
     };
     expect(body.status).toBe('not_ready');
     expect(body.checks).toEqual({ app: 'ok', postgres: 'fail' });
+  });
+
+  it('omits the redis check when Redis is disabled', async () => {
+    const res = await app.inject({ method: 'GET', url: '/ready' });
+    expect(res.json()).not.toHaveProperty('checks.redis');
   });
 
   it('echoes or assigns x-request-id', async () => {
@@ -93,5 +98,40 @@ describe('health routes', () => {
     });
     expect(res.statusCode).toBe(503);
     expect((res.json() as { error: { code: string } }).error.code).toBe('SERVICE_UNAVAILABLE');
+  });
+});
+
+describe('readiness with Redis configured but unreachable', () => {
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    const env = loadEnv({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      DATABASE_URL: 'postgres://pulsequeue:pulsequeue@127.0.0.1:1/pulsequeue',
+      PG_CONNECTION_TIMEOUT_MS: '500',
+      READINESS_TIMEOUT_MS: '1000',
+      // Nothing listens on port 1: the client keeps reconnecting in the background.
+      REDIS_URL: 'redis://127.0.0.1:1',
+      REDIS_RECONNECT_BASE_MS: '50',
+      REDIS_RECONNECT_MAX_MS: '200',
+    });
+    app = await buildApp({ env, logger: false });
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('reports redis as failing without blocking startup or the probe', async () => {
+    const started = Date.now();
+    const res = await app.inject({ method: 'GET', url: '/ready' });
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(res.statusCode).toBe(503); // Postgres is down too: that alone is not_ready
+    expect(res.json()).toMatchObject({
+      status: 'not_ready',
+      checks: { app: 'ok', postgres: 'fail', redis: 'fail' },
+    });
   });
 });

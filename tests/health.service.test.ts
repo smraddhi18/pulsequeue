@@ -36,4 +36,59 @@ describe('HealthService.getReadiness', () => {
     expect(result.checks.postgres).toBe('fail');
     expect(Date.now() - started).toBeLessThan(1_000);
   });
+
+  describe('optional probes (Milestone 5)', () => {
+    const ok = async () => undefined;
+    const fail = async () => {
+      throw new Error('down');
+    };
+
+    it('is ready when required and optional probes pass', async () => {
+      const service = new HealthService({
+        probes: { postgres: ok },
+        optionalProbes: { redis: ok },
+      });
+      const result = await service.getReadiness();
+      expect(result).toMatchObject({
+        status: 'ready',
+        checks: { app: 'ok', postgres: 'ok', redis: 'ok' },
+      });
+    });
+
+    it('is degraded (not not_ready) when only an optional probe fails', async () => {
+      const onProbeFailure = vi.fn();
+      const service = new HealthService({
+        probes: { postgres: ok },
+        optionalProbes: { redis: fail },
+        onProbeFailure,
+      });
+      const result = await service.getReadiness();
+      expect(result.status).toBe('degraded');
+      expect(result.checks).toEqual({ app: 'ok', postgres: 'ok', redis: 'fail' });
+      expect(onProbeFailure).toHaveBeenCalledWith('redis', expect.any(Error));
+    });
+
+    it('is not_ready when a required probe fails, whatever the optional ones say', async () => {
+      const service = new HealthService({
+        probes: { postgres: fail },
+        optionalProbes: { redis: fail },
+      });
+      expect((await service.getReadiness()).status).toBe('not_ready');
+    });
+
+    it('applies the timeout to optional probes too', async () => {
+      const service = new HealthService({
+        probes: { postgres: ok },
+        optionalProbes: { redis: () => new Promise<void>(() => undefined) },
+        timeoutMs: 20,
+      });
+      expect((await service.getReadiness()).status).toBe('degraded');
+    });
+
+    it('rejects a probe registered as both required and optional', () => {
+      expect(
+        () => new HealthService({ probes: { redis: ok }, optionalProbes: { redis: ok } }),
+      ).toThrow(/registered twice/);
+    });
+  });
 });
