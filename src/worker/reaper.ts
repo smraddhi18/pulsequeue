@@ -1,4 +1,5 @@
 import type { ReclaimedJob } from '../domain/lease.js';
+import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
 import type { Logger } from '../lib/logger.js';
 import type { LeaseRepository } from '../repositories/lease.repository.js';
 import { Sleeper, jitter } from './sleeper.js';
@@ -17,6 +18,8 @@ export interface ReaperOptions {
   /** Dead-letter a job as poison after this many lease expiries (see LeaseRepository.reapExpired). */
   poisonLeaseExpiries?: number;
   onJobFailed?: JobFailedHook;
+  /** Requeued jobs wake workers; dead-lettered ones invalidate stats. */
+  signals?: QueueSignals;
   random?: () => number;
 }
 
@@ -90,10 +93,13 @@ export class Reaper {
       leaseExpiries: job.leaseExpiries,
       status: job.status,
     };
+    const signals = this.options.signals ?? NOOP_QUEUE_SIGNALS;
     if (job.status === 'queued') {
+      signals.jobsRunnable(job.queue);
       this.options.logger.warn(fields, 'Reclaimed expired lease, job requeued');
       return;
     }
+    signals.jobsChanged(job.queue);
     const reason = job.deadLetterReason ?? 'attempts_exhausted';
     this.options.logger.error(
       { ...fields, event: 'dlq.dead_lettered', reason, source: 'reaper' },

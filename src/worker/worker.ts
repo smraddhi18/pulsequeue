@@ -2,6 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import type { DeadLetterReason } from '../domain/dead-letter.js';
 import type { LeasedJob } from '../domain/lease.js';
+import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
 import type { Logger } from '../lib/logger.js';
 import type { LeaseRepository } from '../repositories/lease.repository.js';
 import type { BackoffOptions } from './backoff.js';
@@ -16,11 +17,26 @@ import type { HandlerRegistry, JobContext } from './registry.js';
 import { decideRetry } from './retry-policy.js';
 import { Sleeper, jitter } from './sleeper.js';
 
-/** The slice of LeaseRepository the worker needs; unit tests pass an in-memory fake. */
+/**
+ * The slice of LeaseRepository the worker needs; unit tests pass an in-memory
+ * fake. nextDueInMs is optional: without it a push-mode worker relies on
+ * wake-ups and its fallback poll alone.
+ */
 export type LeaseStore = Pick<
   LeaseRepository,
   'lease' | 'heartbeat' | 'complete' | 'fail' | 'release'
->;
+> &
+  Partial<Pick<LeaseRepository, 'nextDueInMs'>>;
+
+/**
+ * Where the worker learns whether wake-ups can be trusted right now (the
+ * Redis subscriber). The subscriber delivers the wake-ups themselves by
+ * calling Worker.wake().
+ */
+export interface WakeupSource {
+  /** true while subscribed: idle polling can slow down to the fallback interval. */
+  readonly isListening: boolean;
+}
 
 /**
  * A job was dead-lettered. Fired *after* the move committed (the move itself
@@ -48,7 +64,18 @@ export interface WorkerOptions {
   /** Queues to lease from; each must have a handler (see HandlerRegistry.resolveQueues). */
   queues: readonly string[];
   concurrency: number;
+  /** Idle poll interval without wake-ups (no Redis, or Redis down). */
   pollIntervalMs: number;
+  /**
+   * Push mode (Milestone 5): while `wakeups.isListening`, an idle worker
+   * sleeps `fallbackPollIntervalMs` (capped by the next scheduled job's due
+   * time) and relies on wake() for new work. Omit for pure polling.
+   */
+  wakeups?: WakeupSource;
+  /** Idle poll interval in push mode; a safety net for lost wake-ups. Default pollIntervalMs. */
+  fallbackPollIntervalMs?: number;
+  /** Notified after every committed state change (wake-ups, stats invalidation). */
+  signals?: QueueSignals;
   leaseDurationMs: number;
   heartbeatIntervalMs: number;
   jobTimeoutMs: number;
@@ -77,6 +104,12 @@ interface InFlight {
 /** Cap for the lease-error backoff so a database outage is retried at least every 30s. */
 const MAX_ERROR_BACKOFF_MS = 30_000;
 const LIVENESS_TOUCH_INTERVAL_MS = 5_000;
+/**
+ * Floor for a push-mode sleep that ends when a scheduled job is due: a job
+ * that is due but not leasable yet (its row is locked by another worker's
+ * promotion) must not turn the loop into a busy spin.
+ */
+const MIN_DUE_SLEEP_MS = 25;
 
 /**
  * Leases jobs and runs them with bounded concurrency.
@@ -87,6 +120,12 @@ const LIVENESS_TOUCH_INTERVAL_MS = 5_000;
  * the jittered poll interval; with no free slot the loop sleeps until a job
  * finishes. Each running job heartbeats its lease and is bounded by a
  * timeout. Outcomes are written back fenced on the lease token.
+ *
+ * Push mode (Milestone 5): with a listening wake-up source the idle sleep
+ * becomes the long fallback interval, cut short by wake() (a wake-up for one
+ * of our queues) or by the next scheduled job becoming due. Postgres stays
+ * the source of truth: a wake-up only makes the next lease query happen
+ * sooner, and a lost one is caught by the fallback poll.
  *
  * Delivery is at-least-once: a job can run again after a crash, a lost lease
  * or a timeout, so handlers must be idempotent.
@@ -100,7 +139,12 @@ export class Worker {
   private stopPromise: Promise<StopResult> | null = null;
   private stopping = false;
   private waitingForSlot = false;
+  private idleSleeping = false;
+  /** Set by wake(); cleared before each lease, so a wake during the lease query triggers a re-poll. */
+  private wakeRequested = false;
+  private pushMode = false;
   private lastLivenessTouch = 0;
+  private readonly signals: QueueSignals;
 
   constructor(private readonly options: WorkerOptions) {
     if (options.queues.length === 0) throw new Error('Worker needs at least one queue');
@@ -108,8 +152,32 @@ export class Worker {
     if (options.heartbeatIntervalMs * 2 > options.leaseDurationMs) {
       throw new Error('heartbeatIntervalMs must be at most half of leaseDurationMs');
     }
+    if (
+      options.fallbackPollIntervalMs !== undefined &&
+      options.fallbackPollIntervalMs < options.pollIntervalMs
+    ) {
+      throw new Error('fallbackPollIntervalMs must be at least pollIntervalMs');
+    }
     this.random = options.random ?? Math.random;
     this.logger = options.logger.child({ workerId: options.workerId });
+    this.signals = options.signals ?? NOOP_QUEUE_SIGNALS;
+  }
+
+  /**
+   * New work may be available (a wake-up arrived, or the wake-up source
+   * changed state): poll now if idle. A wake while the query is in flight
+   * makes the loop poll again right after it; a wake while all slots are busy
+   * or during an error backoff is ignored (the loop polls when it can anyway).
+   */
+  wake(): void {
+    if (this.stopping) return;
+    this.wakeRequested = true;
+    if (this.idleSleeping) this.sleeper.wake();
+  }
+
+  /** true while idle polling is slowed down because wake-ups are trusted. */
+  get isPushMode(): boolean {
+    return this.pushMode;
   }
 
   get workerId(): string {
@@ -131,6 +199,7 @@ export class Worker {
       {
         queues: this.options.queues,
         concurrency: this.options.concurrency,
+        wakeups: this.options.wakeups !== undefined,
         leaseDurationMs: this.options.leaseDurationMs,
         heartbeatIntervalMs: this.options.heartbeatIntervalMs,
         jobTimeoutMs: this.options.jobTimeoutMs,
@@ -194,6 +263,7 @@ export class Worker {
       }
 
       let jobs: LeasedJob[];
+      this.wakeRequested = false;
       try {
         jobs = await store.lease({ queues, workerId, limit: free, leaseMs: leaseDurationMs });
         consecutiveErrors = 0;
@@ -220,13 +290,67 @@ export class Worker {
 
       if (jobs.length > 0) {
         this.logger.debug({ leased: jobs.length, free }, 'Leased jobs');
+        for (const queue of new Set(jobs.map((j) => j.queue))) this.signals.jobsChanged(queue);
       }
       for (const job of jobs) this.dispatch(job);
 
       // A full batch means there is probably more work: poll again at once.
-      if (jobs.length < free && !this.stopping) {
-        await this.sleeper.sleep(jitter(pollIntervalMs, 0.2, this.random));
+      // So does a wake-up that arrived while the query ran: its job may have
+      // committed after the query's snapshot.
+      if (jobs.length < free && !this.stopping && !this.wakeRequested) {
+        await this.idleSleep(pollIntervalMs);
       }
+    }
+  }
+
+  /**
+   * Sleep between polls when there is no backlog. Poll mode: the jittered
+   * poll interval. Push mode: the jittered fallback interval, but no longer
+   * than until the next scheduled job (delayed enqueue, retry backoff) is
+   * due, because nothing publishes a wake-up when time passes.
+   */
+  private async idleSleep(pollIntervalMs: number): Promise<void> {
+    const listening = this.options.wakeups?.isListening ?? false;
+    if (listening !== this.pushMode) {
+      this.pushMode = listening;
+      this.logger.info(
+        { event: 'wakeup.mode_changed', mode: listening ? 'push' : 'poll' },
+        listening
+          ? 'Wake-ups available: polling only as a fallback'
+          : 'Wake-ups unavailable: polling',
+      );
+    }
+
+    let ms: number;
+    if (listening) {
+      ms = jitter(this.options.fallbackPollIntervalMs ?? pollIntervalMs, 0.2, this.random);
+      const dueInMs = await this.nextDueInMs();
+      if (dueInMs !== null) ms = Math.min(ms, Math.max(MIN_DUE_SLEEP_MS, dueInMs));
+    } else {
+      ms = jitter(pollIntervalMs, 0.2, this.random);
+    }
+    // A wake-up may have arrived during the nextDue query.
+    if (this.wakeRequested || this.stopping) return;
+
+    this.idleSleeping = true;
+    try {
+      await this.sleeper.sleep(ms);
+    } finally {
+      this.idleSleeping = false;
+    }
+  }
+
+  /** null when unknown (no store support, query failed) or nothing is scheduled. */
+  private async nextDueInMs(): Promise<number | null> {
+    const { store, queues } = this.options;
+    if (!store.nextDueInMs) return null;
+    try {
+      return await store.nextDueInMs(queues);
+    } catch (err) {
+      // Fall back to the plain fallback interval; the next lease query
+      // surfaces a real database outage.
+      this.logger.warn({ err }, 'Could not read the next due time');
+      return null;
     }
   }
 
@@ -288,6 +412,7 @@ export class Worker {
     if (succeeded) {
       await this.persist(log, 'complete', async () => {
         if (await this.options.store.complete(job)) {
+          this.signals.jobsChanged(job.queue);
           log.info({ durationMs, outcome: 'succeeded' }, 'Job attempt succeeded');
         } else {
           log.warn({ durationMs }, 'Job finished but its lease was lost; result discarded');
@@ -328,12 +453,16 @@ export class Worker {
         return;
       }
       if (decision.kind === 'retry') {
+        // The retry has a later run_at; idle push-mode workers re-read the
+        // next due time when woken, so it is not left to the fallback poll.
+        this.signals.jobsRunnable(job.queue);
         log.warn(
           { durationMs, err: error, outcome: attemptStatus, retryInMs: decision.delayMs },
           'Job attempt failed, retry scheduled',
         );
         return;
       }
+      this.signals.jobsChanged(job.queue);
       log.error(
         {
           event: 'dlq.dead_lettered',
@@ -401,8 +530,10 @@ export class Worker {
   private async releaseLease(job: LeasedJob, log: Logger, reason: string): Promise<void> {
     await this.persist(log, 'release', async () => {
       const released = await this.options.store.release(job, reason);
-      if (released) log.info({ reason }, 'Lease released, job requeued');
-      else log.warn({ reason }, 'Lease already lost, nothing to release');
+      if (released) {
+        this.signals.jobsRunnable(job.queue);
+        log.info({ reason }, 'Lease released, job requeued');
+      } else log.warn({ reason }, 'Lease already lost, nothing to release');
     });
   }
 
