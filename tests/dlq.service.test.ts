@@ -12,6 +12,7 @@ import type {
   StoredDeadLetterJob,
 } from '../src/repositories/dead-letter.repository.js';
 import { DlqService, type DeadLetterStore } from '../src/services/dlq.service.js';
+import { RecordingSignals } from './support/recording-signals.js';
 import type { QueueStore } from '../src/services/job.service.js';
 
 type Row = StoredDeadLetterJob & { queueId: string };
@@ -330,5 +331,56 @@ describe('DlqService', () => {
         service.purgeOlderThan({ queue: 'missing' as QueueName, olderThan: new Date(), limit: 1 }),
       ).rejects.toBeInstanceOf(NotFoundError);
     });
+  });
+});
+
+describe('DlqService signals (Milestone 5)', () => {
+  let queues: FakeQueues;
+  let store: FakeDeadLetters;
+  let signals: RecordingSignals;
+  let service: DlqService;
+  let q: Queue;
+
+  beforeEach(() => {
+    queues = new FakeQueues();
+    store = new FakeDeadLetters();
+    signals = new RecordingSignals();
+    service = new DlqService(queues, store, { signals });
+    q = queues.add('emails');
+  });
+
+  it('replay and a non-empty bulk replay make jobs runnable', async () => {
+    const row = store.add(q);
+    store.add(q);
+    await service.replay({ queue: q.name, jobId: row.id });
+    await service.replayBatch({ queue: q.name, limit: 10 });
+    expect(signals.runnable()).toEqual(['emails', 'emails']);
+    expect(signals.changed()).toEqual([]);
+  });
+
+  it('an empty bulk replay or a failed replay signals nothing', async () => {
+    await service.replayBatch({ queue: q.name, limit: 10 });
+    await expect(
+      service.replay({ queue: q.name, jobId: randomUUID() as JobId }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    expect(signals.calls).toEqual([]);
+  });
+
+  it('purges only change stats (nothing became runnable)', async () => {
+    const dead = store.add(q);
+    store.add(q);
+    await service.purge(q.name, dead.id);
+    await service.purgeOlderThan({
+      queue: q.name,
+      olderThan: new Date('2100-01-01T00:00:00Z'),
+      limit: 10,
+    });
+    await service.purgeOlderThan({
+      queue: q.name,
+      olderThan: new Date('2100-01-01T00:00:00Z'),
+      limit: 10,
+    });
+    expect(signals.changed()).toEqual(['emails', 'emails']); // the empty purge is silent
+    expect(signals.runnable()).toEqual([]);
   });
 });

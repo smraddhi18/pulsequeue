@@ -16,6 +16,7 @@ import type {
   StoredJob,
 } from '../src/repositories/job.repository.js';
 import { JobService, type JobStore, type QueueStore } from '../src/services/job.service.js';
+import { RecordingSignals } from './support/recording-signals.js';
 
 /** In-memory fakes: exercise business rules without Postgres. */
 class FakeQueues implements QueueStore {
@@ -284,5 +285,43 @@ describe('JobService.getJob / listJobs', () => {
       after: decodeCursor(cursor),
       limit: 6,
     });
+  });
+});
+
+describe('JobService signals (Milestone 5)', () => {
+  it('signals jobsRunnable after an insert, for queued and scheduled jobs alike', async () => {
+    const signals = new RecordingSignals();
+    const service = new JobService(new FakeQueues(), new FakeJobs(), {
+      maxPayloadBytes: 64,
+      signals,
+    });
+    await service.enqueue({ queue, payload: {} });
+    await service.enqueue({ queue, payload: {}, delayMs: 5_000 });
+    // Scheduled jobs signal too: a push-mode worker re-reads the next due
+    // time when woken instead of sleeping through it.
+    expect(signals.runnable()).toEqual(['emails', 'emails']);
+  });
+
+  it('does not signal an idempotent replay (nothing changed)', async () => {
+    const signals = new RecordingSignals();
+    const service = new JobService(new FakeQueues(), new FakeJobs(), {
+      maxPayloadBytes: 64,
+      signals,
+    });
+    await service.enqueue({ queue, payload: {}, idempotencyKey: 'k1' });
+    await service.enqueue({ queue, payload: {}, idempotencyKey: 'k1' });
+    expect(signals.calls).toHaveLength(1);
+  });
+
+  it('does not signal a rejected enqueue', async () => {
+    const signals = new RecordingSignals();
+    const service = new JobService(new FakeQueues(), new FakeJobs(), {
+      maxPayloadBytes: 8,
+      signals,
+    });
+    await expect(
+      service.enqueue({ queue, payload: { big: 'x'.repeat(100) } }),
+    ).rejects.toBeInstanceOf(PayloadTooLargeError);
+    expect(signals.calls).toEqual([]);
   });
 });
