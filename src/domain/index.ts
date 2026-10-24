@@ -66,3 +66,15 @@ export {
   type ScheduleId,
   type SchedulePage,
 } from './schedule.js';
+
+export { NOOP_QUEUE_SIGNALS, type QueueSignals } from './signals.js';
+
+export {
+  STATS_CACHE_STATUSES,
+  STATS_STATUSES,
+  type QueueStats,
+  type QueueStatsResult,
+  type QueueStatusCounts,
+  type StatsCacheStatus,
+  type StatsStatus,
+} from './stats.js';
