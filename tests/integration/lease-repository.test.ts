@@ -411,4 +411,32 @@ describeWithDb('LeaseRepository (Postgres)', () => {
       client.release();
     }
   });
+  describe('nextDueInMs (M5)', () => {
+    it('is null when nothing is scheduled on the queues', async () => {
+      await enqueue('q');
+      expect(await repo.nextDueInMs(['q'])).toBeNull();
+      expect(await repo.nextDueInMs([])).toBeNull();
+      expect(await repo.nextDueInMs(['missing'])).toBeNull();
+    });
+
+    it('returns the time until the earliest scheduled job across the given queues', async () => {
+      await enqueue('q', { delayMs: 60_000 });
+      await enqueue('q', { delayMs: 20_000 });
+      await enqueue('other', { delayMs: 5_000 });
+      const due = await repo.nextDueInMs(['q']);
+      expect(due).toBeGreaterThan(15_000);
+      expect(due).toBeLessThanOrEqual(20_000);
+      const both = await repo.nextDueInMs(['q', 'other']);
+      expect(both).toBeGreaterThan(1_000);
+      expect(both).toBeLessThanOrEqual(5_000);
+    });
+
+    it('clamps overdue jobs to 0', async () => {
+      const id = await enqueue('q', { delayMs: 60_000 });
+      await db.pool.query(`UPDATE jobs SET run_at = now() - interval '1 minute' WHERE id = $1`, [
+        id,
+      ]);
+      expect(await repo.nextDueInMs(['q'])).toBe(0);
+    });
+  });
 });
