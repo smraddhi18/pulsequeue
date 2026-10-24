@@ -207,3 +207,82 @@ describe('loadSchedulerEnv', () => {
     ).toThrow(/SCHEDULER_MISFIRE_GRACE_MS: Must be at least twice/);
   });
 });
+
+describe('Redis settings (Milestone 5)', () => {
+  const db = { DATABASE_URL: validEnv.DATABASE_URL };
+
+  it('makes Redis optional for every process', () => {
+    expect(loadEnv(db).REDIS_URL).toBeUndefined();
+    expect(loadWorkerEnv(db).REDIS_URL).toBeUndefined();
+    expect(loadSchedulerEnv(db).REDIS_URL).toBeUndefined();
+  });
+
+  it('applies Redis, wake-up and stats cache defaults', () => {
+    const env = loadEnv({ ...validEnv });
+    expect(env).toMatchObject({
+      REDIS_KEY_PREFIX: 'pq',
+      REDIS_CONNECT_TIMEOUT_MS: 2_000,
+      REDIS_COMMAND_TIMEOUT_MS: 500,
+      REDIS_RECONNECT_BASE_MS: 100,
+      REDIS_RECONNECT_MAX_MS: 5_000,
+      WAKEUP_ENABLED: true,
+      WAKEUP_COALESCE_MS: 50,
+      STATS_CACHE_ENABLED: true,
+      STATS_CACHE_TTL_MS: 10_000,
+      STATS_INVALIDATION_COALESCE_MS: 100,
+      STATS_CACHE_MIN_REFRESH_MS: 1_000,
+    });
+    expect(loadWorkerEnv(db).WORKER_WAKEUP_FALLBACK_POLL_MS).toBe(30_000);
+  });
+
+  it.each([
+    ['true', true],
+    ['1', true],
+    [' FALSE ', false],
+    ['0', false],
+  ])('parses WAKEUP_ENABLED=%j', (value, expected) => {
+    expect(loadWorkerEnv({ ...db, WAKEUP_ENABLED: value }).WAKEUP_ENABLED).toBe(expected);
+  });
+
+  it.each([
+    ['REDIS_URL', 'http://localhost:6379'],
+    ['REDIS_KEY_PREFIX', 'has space'],
+    ['WAKEUP_ENABLED', 'yes'],
+    ['STATS_CACHE_TTL_MS', '50'],
+    ['REDIS_COMMAND_TIMEOUT_MS', '0'],
+  ])('rejects %s=%j', (key, value) => {
+    expect(() => loadEnv({ ...validEnv, [key]: value })).toThrow(
+      /Invalid environment configuration/,
+    );
+  });
+
+  it('accepts rediss:// (TLS)', () => {
+    expect(loadEnv({ ...validEnv, REDIS_URL: 'rediss://cache:6380/0' }).REDIS_URL).toBe(
+      'rediss://cache:6380/0',
+    );
+  });
+
+  it('rejects a reconnect base above the cap, in every process', () => {
+    const bad = { ...db, REDIS_RECONNECT_BASE_MS: '6000', REDIS_RECONNECT_MAX_MS: '5000' };
+    expect(() => loadEnv(bad)).toThrow(/REDIS_RECONNECT_BASE_MS/);
+    expect(() => loadWorkerEnv(bad)).toThrow(/REDIS_RECONNECT_BASE_MS/);
+    expect(() => loadSchedulerEnv(bad)).toThrow(/REDIS_RECONNECT_BASE_MS/);
+  });
+
+  it('requires the min refresh interval to be below the TTL', () => {
+    expect(() =>
+      loadEnv({ ...db, STATS_CACHE_MIN_REFRESH_MS: '10000', STATS_CACHE_TTL_MS: '10000' }),
+    ).toThrow(/STATS_CACHE_MIN_REFRESH_MS/);
+    expect(loadEnv({ ...db, STATS_CACHE_MIN_REFRESH_MS: '0' }).STATS_CACHE_MIN_REFRESH_MS).toBe(0);
+  });
+
+  it('requires the wake-up fallback poll to be at least the poll interval', () => {
+    expect(() =>
+      loadWorkerEnv({
+        ...db,
+        WORKER_POLL_INTERVAL_MS: '2000',
+        WORKER_WAKEUP_FALLBACK_POLL_MS: '1000',
+      }),
+    ).toThrow(/WORKER_WAKEUP_FALLBACK_POLL_MS/);
+  });
+});
