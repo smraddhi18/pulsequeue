@@ -19,3 +19,16 @@ export function createLogger(env: Pick<Env, 'NODE_ENV' | 'LOG_LEVEL'>): Logger {
 }
 
 export type { Logger };
+
+/**
+ * The logging surface shared components need. Both a pino Logger (worker,
+ * scheduler) and Fastify's request-independent `app.log` (API) satisfy it,
+ * so a component wired into every process does not care which one it gets.
+ */
+export interface StructuredLogger {
+  debug: Logger['debug'];
+  info: Logger['info'];
+  warn: Logger['warn'];
+  error: Logger['error'];
+  child(bindings: Record<string, unknown>): StructuredLogger;
+}
