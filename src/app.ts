@@ -1,17 +1,22 @@
+import { hostname } from 'node:os';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Env } from './config/env.js';
 import { createPool, pingDatabase, type Pool } from './db/pool.js';
 import { registerRequestId } from './plugins/request-id.js';
 import { registerErrorHandler } from './plugins/error-handler.js';
+import { createRedisServices } from './redis/index.js';
 import { DeadLetterRepository } from './repositories/dead-letter.repository.js';
 import { JobRepository } from './repositories/job.repository.js';
 import { QueueRepository } from './repositories/queue.repository.js';
 import { ScheduleRepository } from './repositories/schedule.repository.js';
+import { QueueStatsRepository } from './repositories/stats.repository.js';
 import { registerRoutes } from './routes/index.js';
 import { DlqService } from './services/dlq.service.js';
 import { HealthService } from './services/health.service.js';
 import { JobService } from './services/job.service.js';
 import { ScheduleService } from './services/schedule.service.js';
+import { StatsCache } from './services/stats-cache.js';
+import { StatsService } from './services/stats.service.js';
 
 export interface BuildAppOptions {
   env: Env;
@@ -29,7 +34,10 @@ export interface BuildAppOptions {
 
 /**
  * Build the Fastify application (no listen). Used by server.ts and tests.
- * This is the composition root: config -> pool -> repositories -> services -> routes.
+ * This is the composition root: config -> pool + Redis -> repositories ->
+ * services -> routes. Redis (optional) is always owned by the app and closed
+ * in onClose after in-flight requests finished: pending wake-ups and
+ * invalidations are flushed first, then the connection quits.
  */
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
   const { env } = options;
@@ -61,19 +69,42 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     });
   }
 
+  const redis = createRedisServices(env, {
+    logger: app.log,
+    role: 'api',
+    id: `${hostname()}-${process.pid}`,
+  });
+  app.addHook('onClose', async () => {
+    await redis.close();
+    if (redis.client) app.log.info({ event: 'redis.closed' }, 'Redis connection closed');
+  });
+
   const healthService = new HealthService({
     probes: { postgres: () => pingDatabase(pool) },
+    // Redis is optional: failing it reports degraded, not not_ready.
+    ...(redis.probe ? { optionalProbes: { redis: redis.probe } } : {}),
     timeoutMs: env.READINESS_TIMEOUT_MS,
     onProbeFailure: (name, err) => app.log.warn({ err, check: name }, 'Readiness check failed'),
   });
   const queueRepository = new QueueRepository(pool);
   const jobService = new JobService(queueRepository, new JobRepository(pool), {
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
+    signals: redis.signals,
   });
-  const dlqService = new DlqService(queueRepository, new DeadLetterRepository(pool));
+  const dlqService = new DlqService(queueRepository, new DeadLetterRepository(pool), {
+    signals: redis.signals,
+  });
   const scheduleService = new ScheduleService(queueRepository, new ScheduleRepository(pool), {
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
   });
+  const statsService = new StatsService(
+    new QueueStatsRepository(pool),
+    new StatsCache({
+      store: redis.statsStore,
+      minRefreshMs: env.STATS_CACHE_MIN_REFRESH_MS,
+      logger: app.log,
+    }),
+  );
 
   await registerRequestId(app);
   await registerErrorHandler(app);
@@ -82,6 +113,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     jobService,
     dlqService,
     scheduleService,
+    statsService,
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
   });
 
