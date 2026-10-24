@@ -8,13 +8,15 @@ export async function readinessRoutes(
   const { healthService } = opts;
 
   /**
-   * Readiness probe — safe to receive traffic. 200 only when every dependency
-   * probe (Postgres from M1) passes; 503 otherwise so the load balancer stops
-   * routing here while the process stays alive (liveness is separate).
+   * Readiness probe — safe to receive traffic. 503 when a required dependency
+   * (Postgres) fails, so the load balancer stops routing here while the
+   * process stays alive (liveness is separate). An optional dependency
+   * (Redis) failing reports `degraded` with 200: the instance still serves
+   * every request correctly, only slower (see HealthService).
    */
   app.get('/ready', async (_request, reply) => {
     const body = await healthService.getReadiness();
-    const statusCode = body.status === 'ready' ? 200 : 503;
+    const statusCode = body.status === 'not_ready' ? 503 : 200;
     return reply.status(statusCode).send(body);
   });
 }
