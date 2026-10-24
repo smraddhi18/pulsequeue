@@ -12,7 +12,8 @@ const SHUTDOWN_GRACE_MS = 5_000;
  * them through the handler registry, heartbeats leases and reaps expired
  * ones. SIGTERM/SIGINT: stop leasing, drain in-flight jobs for up to
  * WORKER_SHUTDOWN_TIMEOUT_MS, release leases of anything unfinished, close
- * the pool, exit 0.
+ * the pool, exit 0. Wake-up subscription stops first; pending Redis signals
+ * are flushed after the drain.
  */
 async function main(): Promise<void> {
   const env = loadWorkerEnv();
