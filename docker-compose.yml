@@ -2,7 +2,10 @@ x-app-env: &app-env
   NODE_ENV: production
   LOG_LEVEL: info
   DATABASE_URL: postgres://pulsequeue:pulsequeue@postgres:5432/pulsequeue
+  # Optional accelerator (wake-ups + stats cache). Every process keeps working
+  # if Redis goes away: /ready turns "degraded", workers fall back to polling.
   REDIS_URL: redis://redis:6379
+  REDIS_KEY_PREFIX: pq
 
 services:
   # One-shot schema migration. Runs to completion before the API starts, so
@@ -39,6 +42,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+        required: false
     restart: unless-stopped
 
   # Job workers: same image, different command. Scale horizontally with
@@ -57,6 +61,8 @@ services:
       WORKER_HEARTBEAT_INTERVAL_MS: 10000
       WORKER_SHUTDOWN_TIMEOUT_MS: 25000
       WORKER_LIVENESS_FILE: /tmp/pulsequeue-worker.alive
+      # Subscribed to wake-ups, the idle poll is only a safety net.
+      WORKER_WAKEUP_FALLBACK_POLL_MS: 30000
     # Longer than WORKER_SHUTDOWN_TIMEOUT_MS so in-flight jobs can drain
     # before Docker escalates SIGTERM to SIGKILL (default is only 10s).
     stop_grace_period: 40s
@@ -78,6 +84,11 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      # Started first so the first wake-up is not missed, but not required:
+      # without Redis the process polls and logs redis.error until it is back.
+      redis:
+        condition: service_healthy
+        required: false
     restart: unless-stopped
 
   # Cron scheduler: turns due schedules into jobs. Run 2 replicas for HA:
@@ -122,6 +133,11 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      # Started first so the first wake-up is not missed, but not required:
+      # without Redis the process polls and logs redis.error until it is back.
+      redis:
+        condition: service_healthy
+        required: false
     restart: unless-stopped
 
   postgres:
@@ -141,12 +157,24 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Holds only derived, disposable state (wake-up pub/sub, stats cache, dirty
+  # flags), so no persistence is needed; Postgres is the source of truth.
   redis:
     image: redis:7-alpine
+    command:
+      [
+        'redis-server',
+        '--save',
+        '',
+        '--appendonly',
+        'no',
+        '--maxmemory',
+        '64mb',
+        '--maxmemory-policy',
+        'allkeys-lru',
+      ]
     ports:
       - '6379:6379'
-    volumes:
-      - pulsequeue_redis:/data
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
@@ -156,4 +184,3 @@ services:
 
 volumes:
   pulsequeue_pg:
-  pulsequeue_redis:
