@@ -2,25 +2,26 @@
 
 A production-style distributed job queue for Node.js services, built in TypeScript with Fastify, PostgreSQL and Redis. Producers enqueue jobs over an HTTP API, workers lease and execute them with retries and exponential backoff, failed jobs go to a dead-letter queue, and a dashboard API reports queue health.
 
-This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 4 (delayed jobs, cron schedules and a leader-elected scheduler) is done.**
+This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 5 (Redis pub/sub wake-ups for idle workers and a cached queue stats endpoint) is done.**
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     P[Producer services] -->|"POST /queues/:name/jobs<br/>Idempotency-Key"| API
-    O[Operators / dashboards] -->|"GET /jobs/:id<br/>GET /queues/:name/jobs"| API
+    O[Operators / dashboards] -->|"GET /jobs/:id, GET /queues/:name/jobs<br/>GET /queues/:name/stats"| API
     OP[Operators / runbooks] -->|"GET /queues/:name/dlq, GET /dlq/:jobId<br/>POST .../dlq/:jobId/replay, POST .../dlq/replay<br/>DELETE .../dlq/:jobId, DELETE .../dlq?olderThan="| API
     OPS[Operators / producers] -->|"POST /queues/:name/schedules, GET .../schedules<br/>GET /schedules/:id, POST /schedules/:id/pause, /resume<br/>DELETE /schedules/:id"| API
-    LB[Load balancer / k8s probes] -->|"/health, /ready"| API
+    LB[Load balancer / k8s probes] -->|"/health, /ready<br/>(redis down = degraded, still 200)"| API
 
     subgraph API[Fastify API]
         direction TB
-        RT[Routes<br/>zod validation, thin<br/>jobs + dlq + schedules] --> SV[Services<br/>JobService, DlqService,<br/>ScheduleService, HealthService]
-        SV --> RP[Repositories<br/>Queue, Job, DeadLetter, Schedule<br/>all SQL lives here]
+        RT[Routes<br/>zod validation, thin<br/>jobs + dlq + schedules + stats] --> SV[Services<br/>JobService, DlqService, ScheduleService,<br/>StatsService + StatsCache, HealthService]
+        SV --> RP[Repositories<br/>Queue, Job, DeadLetter, Schedule, QueueStats<br/>all SQL lives here]
+        SV --> SIG[QueueSignals<br/>after COMMIT: jobsRunnable / jobsChanged<br/>coalesced per queue]
     end
 
-    subgraph PG["PostgreSQL 16"]
+    subgraph PG["PostgreSQL 16 - source of truth"]
         direction TB
         JT[jobs<br/>queued / scheduled / running / succeeded<br/>jobs_ready_idx: queued only<br/>jobs_scheduled_due_idx: by run_at]
         ST[schedules<br/>cron, timezone, misfire_policy<br/>next_run_at, partial schedules_due_idx]
@@ -30,8 +31,17 @@ flowchart LR
         DQ -.- AT
     end
 
-    RP -->|"pg Pool<br/>replay / purge: one guarded statement<br/>WHERE status = dead"| PG
+    subgraph RD["Redis 7 - optional accelerator, disposable state"]
+        direction TB
+        CH["pub/sub channels<br/>pq:wakeup:NAME"]
+        SC["stats cache<br/>pq:stats:v1:{NAME} (hash seq + data, TTL)<br/>pq:stats:dirty:{NAME} (flag, TTL)"]
+    end
+
+    RP -->|"pg Pool<br/>stats: ONE aggregate statement (one snapshot)"| PG
     MG[migrate job<br/>schema_migrations + advisory lock] -->|DDL| PG
+    SV -->|"stats read-through:<br/>HIT / STALE / claim + MISS / BYPASS<br/>Lua CAS write on snapshot time"| SC
+    SIG -.->|"PUBLISH wake-up (runnable)"| CH
+    SIG -.->|"SET dirty PX ttl (any change)"| SC
 
     subgraph SP[Scheduler - 2 replicas, one leader]
         direction TB
@@ -42,10 +52,12 @@ flowchart LR
 
     SL -->|"tick = ONE transaction on the lock session:<br/>claim due schedules FOR UPDATE SKIP LOCKED,<br/>INSERT job ON CONFLICT (key schedule:id:fireTime),<br/>advance next_run_at"| PG
     SS -.->|"lock attempt only"| PG
+    SL -.->|"after COMMIT: wake-up per fired queue"| CH
 
     subgraph WP[Worker pool - N processes x WORKER_CONCURRENCY]
         direction TB
-        WL[Worker loop<br/>promote due scheduled jobs, lease free slots,<br/>poll with jitter] --> HR["Handler registry<br/>queue name to handler"]
+        WS[Wake-up subscriber<br/>dedicated connection, SUBSCRIBE own queues,<br/>backoff reconnect, catch-up poll on resubscribe] -->|"wake()"| WL
+        WL[Worker loop<br/>push mode: sleep fallback poll, capped by next run_at<br/>poll mode: WORKER_POLL_INTERVAL_MS<br/>promote due scheduled jobs, lease free slots] --> HR["Handler registry<br/>queue name to handler"]
         WL --> RPOL[Retry policy<br/>retry with backoff, or dead-letter:<br/>non_retryable / invalid_payload / attempts_exhausted]
         WL --> HB[Heartbeats<br/>extend lease while running]
         RE[Reaper<br/>reclaims expired leases<br/>poison: N lease expiries]
@@ -55,12 +67,12 @@ flowchart LR
     end
 
     LR -->|"lease: FOR UPDATE SKIP LOCKED<br/>complete / retry / dead-letter / release<br/>(dead-letter is part of the fenced fail/reap statement)"| PG
+    CH -.->|"message = hint only, never a job"| WS
+    WP -.->|"after COMMIT: retry / release / reclaim = wake-up,<br/>lease / success / dead = dirty flag"| RD
     WP -->|"onJobFailed hook after the move<br/>(alerts, metrics)"| HK[Notifications]
-    API -.->|notify - M5| R[(Redis 7)]
-    R -.->|wake up - M5| WP
 ```
 
-Solid lines exist today; dotted lines are planned milestones.
+Solid lines are the durable path through Postgres. Dotted lines from and to Redis are best-effort hints (wake-ups, dirty flags): losing any of them costs latency or one extra query, never a job. Redis is optional; without `REDIS_URL` the dotted lines simply do not exist and workers poll as in Milestone 4.
 
 ## Features
 
@@ -127,9 +139,24 @@ Solid lines exist today; dotted lines are planned milestones.
 - Zod-validated scheduler config (e.g. the grace window must cover at least two ticks); docker-compose `scheduler` service with 2 replicas, a liveness-file healthcheck and `stop_grace_period`; CI boots the compiled scheduler and requires it to take and release leadership and exit 0
 - Tests: cron parsing / next-run / DST walks, misfire planning, request schemas, config and the scheduler loop (fake lock) as unit tests; real-Postgres tests for promotion and "never leased early", the schedules API, two schedulers (only one leads, failover on stop and on a killed session, concurrent ticks never duplicate), misfire policies after an outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM
 
+**Milestone 5: Redis wake-ups and cached stats**
+
+- Redis is optional and never the source of truth: with `REDIS_URL` unset every Redis feature is off and the system behaves exactly as in M4; with Redis down at runtime the API, workers and scheduler keep working (fallback poll, uncached stats), and nothing is lost
+- Pub/sub **wake-ups**: after an enqueue, replay, bulk replay, retry, lease release, reaper reclaim or scheduler fire **commits**, the process publishes on the per-queue channel `<prefix>:wakeup:<queue>`; publishes are fire-and-forget and coalesced per queue (leading + trailing edge, `WAKEUP_COALESCE_MS`), so a burst of 10k enqueues costs about 2 publishes per window
+- Workers subscribe on a **dedicated connection** to their own queues only; reconnects use jittered exponential backoff, the subscriber re-issues `SUBSCRIBE` itself on every reconnect and the worker polls once right after (pub/sub has no replay)
+- **Push mode**: while subscribed an idle worker sleeps `WORKER_WAKEUP_FALLBACK_POLL_MS` (default 30s, jittered) instead of `WORKER_POLL_INTERVAL_MS`, cut short by a wake-up and capped by the next scheduled `run_at` (new `LeaseRepository.nextDueInMs`), so delayed jobs and retries still run on time; a wake during an in-flight lease query triggers an immediate re-poll. Poll mode returns automatically while Redis is unreachable (`wakeup.mode_changed`)
+- `GET /queues/:name/stats`: counts by status, total, oldest queued job (`oldestQueuedAt`, `oldestQueuedAgeMs`), next scheduled run and longest-running job, from **one** aggregate statement (one MVCC snapshot, database clock), `404` for unknown queues
+- **Stats cache** in Redis with explicit invalidation: every committed change marks the queue dirty (coalesced, `STATS_INVALIDATION_COALESCE_MS`); readers get `HIT`, `STALE` (dirty but younger than `STATS_CACHE_MIN_REFRESH_MS`, or someone else is refreshing), `MISS` (recomputed) or `BYPASS` (Redis off / down) in the `x-cache` header
+- **Stampede protection** at two levels: a cluster-wide refresh claim (atomic `DEL` of the dirty flag, exactly one winner across all API instances) and an in-process single-flight, so N concurrent cold reads on one instance cost one query; writes are a Lua compare-and-set on the snapshot time so a slow reader can never roll the cache back; entries and dirty flags expire after `STATS_CACHE_TTL_MS`
+- `/ready` includes a Redis check: Postgres failing = `not_ready` (503), only Redis failing = **`degraded` (200)**; without `REDIS_URL` there is no Redis check
+- ioredis client tuned to fail fast (`enableOfflineQueue: false`, `maxRetriesPerRequest: 0`, `REDIS_COMMAND_TIMEOUT_MS` = 500ms), so a sick Redis costs at most one short timeout per request, never a hung request
+- Structured log events: `redis.connected`, `redis.disconnected`, `redis.reconnecting`, `redis.error`, `redis.closed`, `redis.disabled`, `wakeup.published`, `wakeup.publish_failed`, `wakeup.subscribed`, `wakeup.unsubscribed`, `wakeup.subscribe_failed`, `wakeup.received`, `wakeup.mode_changed`, `stats.cache.hit`, `stats.cache.stale`, `stats.cache.miss`, `stats.cache.bypass`, `stats.cache.error`, `stats.cache.invalidated`, `stats.cache.invalidate_failed` (errors throttled to one line per 10s with a `suppressed` count)
+- Graceful shutdown flushes pending coalesced signals before closing Redis (API, worker and scheduler)
+- Redis config validated by zod (e.g. the fallback poll must be at least the normal poll interval, the min refresh below the TTL); CI runs a `redis:7-alpine` service and the worker smoke test requires `wakeup.subscribed`; compose runs Redis without persistence (it only holds derived state)
+- Tests: coalescer, single-flight, log throttle, stats cache policy (incl. 20 concurrent cold reads = 1 query), readiness states, the worker wake loop (push / poll switching, lost wake-ups, nextDue cap) and every service's signals as unit tests; real-Redis + real-Postgres tests for channel isolation, dirty-flag TTLs, the claim and CAS, subscriber recovery after an outage (through a TCP proxy that cuts connections), the stats API (HIT / STALE / MISS / BYPASS, 20 concurrent requests = 1 query, two API instances sharing a cache), `/ready` degraded during an outage, pickup latency under 500ms with a 20s fallback poll, push vs poll query counts, delayed jobs and retries on time in push mode, and the real `src/worker.ts` process picking up a job via a wake-up
+
 ### Planned
 
-- Redis pub/sub wake-ups and cached stats (M5)
 - API keys, multi-tenancy, rate limits (M6)
 - Dashboard API, Prometheus, OpenTelemetry (M7)
 - Load / chaos testing and capacity notes (M8)
@@ -294,7 +321,7 @@ sequenceDiagram
     Note over R,PG: attempts left: queued again. Last attempt, or lease_expiries reaching<br/>WORKER_POISON_LEASE_EXPIRIES: dead-lettered. The dead worker's attempt is timed_out.
 ```
 
-On SIGTERM/SIGINT the worker stops leasing (a lease that races the signal is released untouched), waits up to `WORKER_SHUTDOWN_TIMEOUT_MS` for in-flight jobs, then aborts the rest and **releases** their leases: they become `queued` immediately (no wait for the lease to expire), and the attempt is recorded as `released` and refunded so deploys do not eat retry budget. Then the pool closes and the process exits 0.
+On SIGTERM/SIGINT the worker stops leasing (a lease that races the signal is released untouched), waits up to `WORKER_SHUTDOWN_TIMEOUT_MS` for in-flight jobs, then aborts the rest and **releases** their leases: they become `queued` immediately (no wait for the lease to expire), and the attempt is recorded as `released` and refunded so deploys do not eat retry budget. Then pending wake-ups and stats invalidations are flushed, Redis and the pool close, and the process exits 0.
 
 ### Writing a handler
 
@@ -314,6 +341,78 @@ export function registerEmailHandlers(registry: HandlerRegistry): void {
 ```
 
 Register handlers in `src/worker/handlers/index.ts` (it ships `echo` and `demo`). Resolve = success; throw = failed attempt (retried with backoff); `NonRetryableError` (or any error with `retryable: false`, handy for errors from libraries) = dead-letter now with reason `non_retryable`; `InvalidPayloadError` = dead-letter now with reason `invalid_payload`. Pass `signal` to anything that can be cancelled: it fires on timeout, lost lease or shutdown. The `demo` queue exercises the failure paths from the API, e.g. `{"payload":{"durationMs":500,"failUntilAttempt":3},"maxAttempts":5}`.
+
+## Wake-up flow (Milestone 5)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Producer
+    participant API as API (JobService)
+    participant PG as PostgreSQL
+    participant R as Redis
+    participant S as Worker subscriber
+    participant W as Worker loop
+
+    S->>R: SUBSCRIBE pq:wakeup:emails (own queues only, on every 'ready')
+    R-->>S: subscribed (wakeup.subscribed)
+    S->>W: listening = true: push mode + one catch-up poll
+    W->>PG: nextDueInMs(queues): earliest scheduled run_at
+    Note over W: idle sleep = jitter(WORKER_WAKEUP_FALLBACK_POLL_MS),<br/>capped by the next due run_at (nothing publishes when time passes)
+    P->>API: POST /queues/emails/jobs
+    API->>PG: INSERT job (autocommit)
+    PG-->>API: committed
+    API-->>P: 201 Created
+    API->>R: PUBLISH pq:wakeup:emails (after commit, fire-and-forget,<br/>leading + trailing edge per WAKEUP_COALESCE_MS)
+    R-->>S: message
+    S->>W: wake(): cut the idle sleep short
+    W->>PG: promote due + lease (unchanged SKIP LOCKED path)
+    alt message lost (Redis blip, publisher crashed after commit)
+        W->>PG: fallback poll after at most the fallback interval
+    end
+    alt Redis connection drops
+        S->>W: listening = false: poll mode (WORKER_POLL_INTERVAL_MS)
+        S->>R: reconnect with jittered backoff, SUBSCRIBE again
+        S->>W: listening = true + catch-up poll (messages in between are gone)
+    end
+```
+
+A wake-up carries no job, only "queue X may have work"; the lease query against Postgres decides what runs, so a duplicate, late or spurious wake-up is one cheap empty lease call, and a lost one costs latency up to the fallback interval, never a job. Publishes happen only after the change committed, so a woken worker always sees the new row. Retries, released leases and reaper reclaims publish too; a retry's backoff `run_at` is in the future, which is why push-mode workers cap their sleep by the next due `run_at` instead of waiting for the fallback poll.
+
+## Stats read flow (Milestone 5)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as API (StatsCache)
+    participant R as Redis
+    participant PG as PostgreSQL
+    participant Wr as Any writer (API / worker / scheduler)
+
+    Wr->>PG: COMMIT a change to queue emails
+    Wr->>R: SET pq:stats:dirty:{emails} 1 PX ttl (coalesced per queue)
+    C->>A: GET /queues/emails/stats
+    A->>R: pipeline HGET entry data + EXISTS dirty (one round trip)
+    alt entry, not dirty
+        A-->>C: 200 x-cache: HIT
+    else entry, dirty, younger than STATS_CACHE_MIN_REFRESH_MS
+        A-->>C: 200 x-cache: STALE (bounds recompute rate)
+    else entry, dirty, older: claim = DEL dirty (exactly one caller wins cluster-wide)
+        A->>PG: winner: ONE aggregate statement (in-process single-flight)
+        A->>R: Lua CAS: write only if no newer snapshot (seq = computedAt)
+        A-->>C: 200 x-cache: MISS (losers of the claim: STALE)
+    else no entry (cold or expired)
+        A->>PG: one statement per instance (single-flight joins concurrent readers)
+        A->>R: CAS write with PEXPIRE STATS_CACHE_TTL_MS
+        A-->>C: 200 x-cache: MISS
+    else Redis disabled, down or slower than REDIS_COMMAND_TIMEOUT_MS
+        A->>PG: compute directly (still single-flight)
+        A-->>C: 200 x-cache: BYPASS
+    end
+```
+
+Staleness is bounded twice: after a change a reader sees the old numbers for at most `STATS_CACHE_MIN_REFRESH_MS` (default 1s); if the invalidation itself was lost (Redis blip between commit and SET, crashed writer), the entry still expires after `STATS_CACHE_TTL_MS` (default 10s). `computedAt` in the body says when the numbers were true.
 
 ## Data model
 
@@ -415,6 +514,24 @@ The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries
 
 ## Design decisions and trade-offs
 
+### Milestone 5
+
+| Decision                                                                                                                                       | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Trade-off                                                                                                                                                                                                                                                                                                                            |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Redis is an optional accelerator; Postgres stays the only source of truth**                                                                  | Wake-ups and cache entries are hints and derived data. Every path has a Postgres fallback (fallback poll, direct stats query), so a Redis outage, a failover that loses writes, or `FLUSHALL` costs latency and some extra queries, never a job or a wrong lease. That is also why Redis runs without persistence.                                                                                                                                                                                                                                                                    | Two systems to operate. The fallback paths must stay tested (they are: outage tests through a TCP proxy, `BYPASS` and poll-mode tests), or they rot.                                                                                                                                                                                 |
+| **Pub/sub wake-ups, not a Redis list / stream of job ids**                                                                                     | A wake-up says only "queue X may have work"; the worker still leases from Postgres with `SKIP LOCKED`, so ordering, priority, fencing and exactly-one-owner semantics are unchanged and duplicates are harmless. A list or stream would be a second queue that has to agree with Postgres (lost or doubled ids on failover, two-phase hand-off). Postgres `LISTEN/NOTIFY` was the alternative with no new dependency, but it needs a dedicated session per worker (no PgBouncer transaction pooling) and NOTIFY takes a global lock at commit, which serializes busy enqueue traffic. | Pub/sub is at-most-once with no replay: a message published while a worker is disconnected is gone. Covered by the catch-up poll on (re)subscribe and the fallback poll; worst-case pickup latency while Redis misbehaves is `WORKER_WAKEUP_FALLBACK_POLL_MS` (30s default; tune it down if that matters more than idle query load). |
+| **Publish after COMMIT, fire-and-forget**                                                                                                      | A worker woken before the commit would lease nothing and go back to sleep: a lost wake-up by construction. Fire-and-forget keeps Redis off the request's critical path (no added latency, no failure mode for producers).                                                                                                                                                                                                                                                                                                                                                             | A crash between commit and publish loses the wake-up (fallback poll catches it). A transactional outbox would make the signal durable, but the signal is not worth a write.                                                                                                                                                          |
+| **Per-queue channels, coalesced with a leading + trailing edge** (`WAKEUP_COALESCE_MS` = 50ms)                                                 | Workers subscribe only to the queues they consume, so a hot queue does not wake unrelated workers. The leading edge keeps a single enqueue's latency at zero; the trailing edge guarantees the last change in a burst is always followed by a publish; together at most about 2 publishes per queue per window regardless of load.                                                                                                                                                                                                                                                    | Up to one window of extra latency for the jobs inside a burst (the first already woke the worker, which is busy anyway). Many tiny queues = many channels (cheap in Redis).                                                                                                                                                          |
+| **Push mode sleep = jittered fallback, capped by the next due `run_at`**                                                                       | Time passing publishes nothing, so without the cap a delayed job or a retry backoff would wait for the fallback poll. One indexed `min(run_at)` query per idle cycle (only in push mode) replaces ~30 empty lease polls. A minimum sleep (25ms) prevents a spin if a due job is not leasable (e.g. another worker just took it).                                                                                                                                                                                                                                                      | One extra tiny query per idle cycle. Jobs made due by an external `UPDATE` (bypassing the API) wait for the fallback poll.                                                                                                                                                                                                           |
+| **Dedicated subscriber connection with explicit SUBSCRIBE on every reconnect** (`autoResubscribe: false`) and equal-jitter exponential backoff | A connection in subscriber mode cannot run commands, so it must be separate. Re-subscribing ourselves gives an exact "subscribed again" moment for the catch-up poll and flips the worker back to push mode only after Redis confirmed the subscription. Jittered backoff keeps a fleet of workers from reconnecting in lockstep after a Redis restart.                                                                                                                                                                                                                               | Two Redis connections per worker (commands + subscriber).                                                                                                                                                                                                                                                                            |
+| **Stats cache: invalidate by a dirty flag, not by deleting or rewriting the entry**                                                            | "Delete on write" races: a reader that computed before the commit writes its old result back after the delete and the cache stays wrong until TTL. Writers instead set a flag (O(1), idempotent, coalesced); the reader that later clears the flag (atomic `DEL`, one winner cluster-wide) snapshots _after_ clearing, so any change after that point dirties the new entry again. Writes are a Lua compare-and-set on the snapshot time (`computedAt`), so an older snapshot can never replace a newer one.                                                                          | Every committed change in every process costs one coalesced `SET PX` (about 2 per queue per 100ms when hot).                                                                                                                                                                                                                         |
+| **Serve STALE inside `STATS_CACHE_MIN_REFRESH_MS`, hard TTL as the safety net**                                                                | On a busy queue every change dirties the entry; recomputing on each read would turn the cache into a pass-through exactly when the count query is most expensive. The min-refresh window caps recomputes at about 1 per queue per second across all API instances. The TTL bounds staleness even if invalidations are lost.                                                                                                                                                                                                                                                           | Stats can be up to 1s (min refresh) or, if invalidations were lost, 10s (TTL) behind. Fine for dashboards and autoscalers; anything that needs exact numbers reads jobs directly.                                                                                                                                                    |
+| **Two-level stampede protection** (cluster-wide claim + in-process single-flight)                                                              | The claim ensures one instance recomputes a dirty entry; single-flight ensures N concurrent requests on a cold key cost one query per instance (tested: 20 concurrent requests = 1 query; a regression where a leftover dirty flag made every request force its own query was caught by that test).                                                                                                                                                                                                                                                                                   | A cold key hit by K instances at the same instant still costs K queries (one each); a distributed lock would fix that at the price of lock waits and timeouts on the read path.                                                                                                                                                      |
+| **Stats from one aggregate statement** (correlated subqueries, one snapshot)                                                                   | All numbers are mutually consistent and timestamped with the database clock; each aggregate uses an existing index (no migration needed).                                                                                                                                                                                                                                                                                                                                                                                                                                             | The count is O(jobs in the queue) per recompute; that is the cost the cache amortizes. Very large queues will want counter tables or retention (M7/M8).                                                                                                                                                                              |
+| **`/ready`: Redis down = `degraded` with HTTP 200, Postgres down = `not_ready` 503**                                                           | Redis is shared by every replica; failing readiness on it would pull the whole API out of the load balancer during a Redis blip, turning a latency problem into a full outage, even though every request still works. The check stays in the body (and in logs) so monitoring alerts on it.                                                                                                                                                                                                                                                                                           | A load balancer cannot route around a single replica with a broken Redis path; alerting has to look at the body or the `redis.*` logs, not just the status code.                                                                                                                                                                     |
+| **ioredis** (v6) as the client                                                                                                                 | Mature, widely deployed, typed, first-class pub/sub, Lua `defineCommand`, pipelines, Cluster and Sentinel support, and fine-grained failure controls (`enableOfflineQueue`, `commandTimeout`, `maxRetriesPerRequest`, `retryStrategy`, `reconnectOnError`) that make "fail fast, fall back to Postgres" easy to express. `node-redis` v4+ is an equally valid choice (official, RESP3); ioredis' explicit offline-queue and per-command timeout semantics fit this design slightly better.                                                                                            | One more runtime dependency. Fail-fast settings mean commands issued during a reconnect fail immediately (by design: callers fall back).                                                                                                                                                                                             |
+| **Keys and channels namespaced by `REDIS_KEY_PREFIX`, stats keys hash-tagged (`{queue}`) and versioned (`v1`)**                                | Several environments can share one Redis; the entry and its dirty flag share a Cluster slot so the read is one pipeline; a deploy that changes the cached shape starts from fresh keys instead of misreading old ones.                                                                                                                                                                                                                                                                                                                                                                | Key names are an API between versions; the dirty flag is deliberately unversioned so old and new writers invalidate the same entries during a rolling deploy.                                                                                                                                                                        |
+
 ### Milestone 4
 
 | Decision                                                                                                                                                | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Trade-off                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -468,7 +585,7 @@ The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries
 
 | Decision                                                                                                   | Why                                                                                                                                                                                                                                                                                                                                                                                                             | Trade-off                                                                                                                                                                               |
 | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Postgres is the source of truth** for jobs (Redis only for wake-ups later)                               | A job queue's core promise is "never lose or double-run a job". Postgres gives durable, transactional writes, constraints that hold for every writer, and `FOR UPDATE SKIP LOCKED` for contention-free leasing. Enqueue can share a transaction with a producer's own data (transactional outbox) in future.                                                                                                    | Lower peak throughput than an in-memory broker, and the jobs table needs vacuum/retention care. Fine up to thousands of jobs/s per primary; see scaling notes.                          |
+| **Postgres is the source of truth** for jobs (Redis only for wake-ups and caching, M5)                     | A job queue's core promise is "never lose or double-run a job". Postgres gives durable, transactional writes, constraints that hold for every writer, and `FOR UPDATE SKIP LOCKED` for contention-free leasing. Enqueue can share a transaction with a producer's own data (transactional outbox) in future.                                                                                                    | Lower peak throughput than an in-memory broker, and the jobs table needs vacuum/retention care. Fine up to thousands of jobs/s per primary; see scaling notes.                          |
 | **Own ~200-line SQL migration runner** instead of node-pg-migrate / Prisma / Knex                          | Plain `.sql` files are exactly what runs in production and are easy to review. The runner covers the parts that matter: ordered versions, one transaction per file, `schema_migrations` with sha256 checksums (editing an applied file fails), an advisory lock so concurrent replicas serialize, `lock_timeout` for DDL, and an opt-out for `CREATE INDEX CONCURRENTLY`. No extra dependency and fully tested. | No down migrations (deliberate: roll forward with a new migration), no generator CLI. If the team grows, swapping to node-pg-migrate is easy because the files are plain SQL.           |
 | **Separate `migrate` step** (compose service / CI step), not "migrate on app start"                        | Schema changes happen once, before any new API replica takes traffic, and a failed migration blocks the rollout instead of crash-looping every replica.                                                                                                                                                                                                                                                         | One more deploy step. The advisory lock still makes migrate-on-start safe if someone chooses it.                                                                                        |
 | **Idempotency via a partial unique index + `INSERT ... ON CONFLICT DO NOTHING`**                           | Check-then-insert races under concurrency. With `ON CONFLICT`, exactly one concurrent request wins and the rest are told "already exists" by the database itself. The 25-way concurrency test proves exactly one job is created.                                                                                                                                                                                | Under READ COMMITTED a loser cannot see the winner's row in the same statement's snapshot, so the existing row is read with a second statement (one extra round trip, only on replays). |
@@ -489,7 +606,7 @@ The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries
 | Decision                                                               | Why                                                        | Trade-off                                            |
 | ---------------------------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
 | Layered folders (`routes` -> `services` -> `repositories` -> `domain`) | Keeps HTTP concerns out of business logic; easy to test    | Slightly more boilerplate                            |
-| Zod for env config                                                     | Fail fast before listen; typed `Env` everywhere            | Requires REDIS_URL before Redis is used (M5)         |
+| Zod for env config                                                     | Fail fast before listen; typed `Env` everywhere            | Since M5 `REDIS_URL` is optional (unset = Redis off) |
 | pino + `x-request-id`                                                  | Production JSON logs; correlate a request across layers    | Pretty transport only in development                 |
 | Typed `AppError` hierarchy                                             | Consistent `{ error: { code, message, details? } }` bodies | Call sites must throw domain errors, not raw `Error` |
 | Vitest + Fastify `inject`                                              | Fast tests without opening a port                          | -                                                    |
@@ -505,17 +622,23 @@ src/
   scheduler.ts        # scheduler process entry: loadSchedulerEnv -> runtime -> SIGTERM release
   config/             # zod env schema (app, database subset, worker, scheduler)
   db/                 # pg pool, query helper, pg error mapping, migration runner + CLI
-  domain/             # AppError hierarchy, job + schedule models, limits, lease + dead-letter types
-  lib/                # logger, error mapper, keyset cursor, request fingerprint, cron wrapper
+  domain/             # AppError hierarchy, job + schedule + stats models, limits, lease + dead-letter
+                      # types, QueueSignals contract
+  lib/                # logger, error mapper, keyset cursor, request fingerprint, cron wrapper,
+                      # single-flight, log throttle
+  redis/              # ioredis client, keys, coalescer, wake-up publisher + subscriber,
+                      # stats cache store (Lua CAS) + invalidator, QueueSignals (Milestone 5)
   plugins/            # request-id, central error handler
-  repositories/       # Queue, Job, Lease, DeadLetter and Schedule repositories (all SQL)
-  routes/             # /health, /ready, jobs, DLQ and schedules APIs + zod request schemas
-  services/           # HealthService, JobService, DlqService, ScheduleService (business rules)
+  repositories/       # Queue, Job, Lease, DeadLetter, Schedule and QueueStats repositories (all SQL)
+  routes/             # /health, /ready, jobs, DLQ, schedules and stats APIs + zod request schemas
+  services/           # HealthService, JobService, DlqService, ScheduleService, StatsService +
+                      # StatsCache policy (business rules)
   scheduler/          # Scheduler loop, advisory-lock leader election, tick, misfire planner, runtime
   worker/             # Worker loop, Reaper, handler registry, backoff + retry policy,
                       # runtime (composition root), built-in handlers
 tests/                # unit tests (no database needed); tests/worker/, tests/scheduler/
-tests/integration/    # real-Postgres tests (each suite migrates its own schema)
+tests/integration/    # real-Postgres (+ real-Redis) tests (each suite migrates its own schema
+                      # and uses its own Redis key prefix)
 ```
 
 ## Setup
@@ -524,6 +647,7 @@ tests/integration/    # real-Postgres tests (each suite migrates its own schema)
 
 - Node.js 20+
 - PostgreSQL 16 (local install or via Docker Compose)
+- Redis 7+ (optional; local install or via Docker Compose). Without it workers poll and stats are uncached
 - Docker + Docker Compose (optional, for the full stack)
 
 ### Local
@@ -532,8 +656,8 @@ tests/integration/    # real-Postgres tests (each suite migrates its own schema)
 cp .env.example .env
 npm ci
 
-# Start Postgres (or use your own), then apply migrations
-docker compose up -d postgres
+# Start Postgres and Redis (or use your own), then apply migrations
+docker compose up -d postgres redis
 export $(grep -v '^#' .env | xargs)
 npm run migrate:dev
 
@@ -553,6 +677,9 @@ npm run scheduler:dev
 # Echo a job every minute
 curl -s -X POST http://localhost:3000/queues/echo/schedules -H 'content-type: application/json' \
   -d '{"name":"every-minute","cron":"* * * * *","payload":{"hello":"world"}}'
+
+# Queue stats (x-cache: MISS, then HIT until the queue changes)
+curl -si http://localhost:3000/queues/demo/stats
 ```
 
 Required env vars are documented in `.env.example`. Config validation fails the process immediately if anything required is missing or invalid.
@@ -564,7 +691,7 @@ docker compose up --build
 docker compose up -d --scale worker=3   # more workers; SKIP LOCKED shares the queue
 ```
 
-Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The `scheduler` service runs 2 replicas of `node dist/scheduler.js` from the same image: one leads, the other waits on the advisory lock; `stop_grace_period` (20s) exceeds the 10s tick-finish budget so leadership is released cleanly. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory.
+Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. Redis is a soft dependency (`required: false`): it is started first so the first wake-up is not missed, but every service runs without it. It runs with persistence off and an LRU memory cap because it only holds derived, disposable state. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The `scheduler` service runs 2 replicas of `node dist/scheduler.js` from the same image: one leads, the other waits on the advisory lock; `stop_grace_period` (20s) exceeds the 10s tick-finish budget so leadership is released cleanly. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory.
 
 ### Tests
 
@@ -574,29 +701,32 @@ TEST_DATABASE_URL=postgres://pulsequeue:pulsequeue@localhost:5432/pulsequeue npm
                             # unit + integration against real Postgres
 npm run test:unit           # unit only
 npm run test:integration    # integration only (needs TEST_DATABASE_URL or DATABASE_URL)
+TEST_REDIS_URL=redis://localhost:6379 TEST_DATABASE_URL=... npm test
+                            # also runs the Redis suites (wake-ups, stats cache, outages)
 ```
 
 ### Worker configuration
 
-| Variable                       | Default        | Meaning                                                              |
-| ------------------------------ | -------------- | -------------------------------------------------------------------- |
-| `WORKER_ID`                    | host-pid-rand  | identity in logs, `jobs.locked_by`, `job_attempts.worker_id`         |
-| `WORKER_QUEUES`                | all registered | comma-separated queues to consume (each needs a handler)             |
-| `WORKER_CONCURRENCY`           | `10`           | max jobs running at once in this process                             |
-| `WORKER_POLL_INTERVAL_MS`      | `1000`         | idle poll interval (+-20% jitter); a full batch re-polls immediately |
-| `WORKER_LEASE_DURATION_MS`     | `30000`        | visibility timeout without a heartbeat                               |
-| `WORKER_HEARTBEAT_INTERVAL_MS` | `10000`        | lease renewal period; must be at most half the lease                 |
-| `WORKER_JOB_TIMEOUT_MS`        | `300000`       | per-attempt cap; recorded as `timed_out` and retried                 |
-| `WORKER_REAPER_INTERVAL_MS`    | `15000`        | how often each worker reclaims expired leases                        |
-| `WORKER_SHUTDOWN_TIMEOUT_MS`   | `25000`        | drain budget on SIGTERM before leases are released                   |
-| `WORKER_POISON_LEASE_EXPIRIES` | `3`            | dead-letter a job as poison after this many lease expiries (1-100)   |
-| `WORKER_LIVENESS_FILE`         | unset          | file the loop touches; used by the compose healthcheck               |
-| `RETRY_BACKOFF_BASE_MS`        | `1000`         | ceiling of the first retry delay; doubles per attempt                |
-| `RETRY_BACKOFF_MAX_MS`         | `300000`       | cap for any retry delay                                              |
+| Variable                         | Default        | Meaning                                                              |
+| -------------------------------- | -------------- | -------------------------------------------------------------------- |
+| `WORKER_ID`                      | host-pid-rand  | identity in logs, `jobs.locked_by`, `job_attempts.worker_id`         |
+| `WORKER_QUEUES`                  | all registered | comma-separated queues to consume (each needs a handler)             |
+| `WORKER_CONCURRENCY`             | `10`           | max jobs running at once in this process                             |
+| `WORKER_POLL_INTERVAL_MS`        | `1000`         | idle poll interval (+-20% jitter); a full batch re-polls immediately |
+| `WORKER_WAKEUP_FALLBACK_POLL_MS` | `30000`        | idle poll while subscribed to wake-ups (>= poll interval)            |
+| `WORKER_LEASE_DURATION_MS`       | `30000`        | visibility timeout without a heartbeat                               |
+| `WORKER_HEARTBEAT_INTERVAL_MS`   | `10000`        | lease renewal period; must be at most half the lease                 |
+| `WORKER_JOB_TIMEOUT_MS`          | `300000`       | per-attempt cap; recorded as `timed_out` and retried                 |
+| `WORKER_REAPER_INTERVAL_MS`      | `15000`        | how often each worker reclaims expired leases                        |
+| `WORKER_SHUTDOWN_TIMEOUT_MS`     | `25000`        | drain budget on SIGTERM before leases are released                   |
+| `WORKER_POISON_LEASE_EXPIRIES`   | `3`            | dead-letter a job as poison after this many lease expiries (1-100)   |
+| `WORKER_LIVENESS_FILE`           | unset          | file the loop touches; used by the compose healthcheck               |
+| `RETRY_BACKOFF_BASE_MS`          | `1000`         | ceiling of the first retry delay; doubles per attempt                |
+| `RETRY_BACKOFF_MAX_MS`           | `300000`       | cap for any retry delay                                              |
 
-The worker also reads `DATABASE_URL`, the `PG_*` pool settings, `NODE_ENV` and `LOG_LEVEL` (it does not need `PORT` or `REDIS_URL`). Size the worker's `PG_POOL_MAX` between about `WORKER_CONCURRENCY / 2 + 2` and `WORKER_CONCURRENCY + 2` (the 10 / 10 defaults are fine): heartbeats and outcome writes are short and share the pool with the lease and reaper queries. If the pool is too small, outcome writes wait for a connection and fail after `PG_CONNECTION_TIMEOUT_MS`; the job is then re-run after its lease expires (never lost, but wasted work).
+The worker also reads `DATABASE_URL`, the `PG_*` pool settings, the Redis settings below, `NODE_ENV` and `LOG_LEVEL` (it does not need `PORT`). With `REDIS_URL` set and `WAKEUP_ENABLED=true` it holds two Redis connections (commands + subscriber). Size the worker's `PG_POOL_MAX` between about `WORKER_CONCURRENCY / 2 + 2` and `WORKER_CONCURRENCY + 2` (the 10 / 10 defaults are fine): heartbeats and outcome writes are short and share the pool with the lease and reaper queries. If the pool is too small, outcome writes wait for a connection and fail after `PG_CONNECTION_TIMEOUT_MS`; the job is then re-run after its lease expires (never lost, but wasted work).
 
-Integration suites create a uniquely named schema per suite (`pq_test_<random>`), run the real migrations into it, and drop it afterwards, so they run in parallel and never touch existing data. CI runs them against a `postgres:16` service container after running the compiled migration CLI twice (to prove it is idempotent) and a worker smoke test (start the compiled worker, send SIGTERM, require exit code 0). The worker suites include a concurrency test (8 workers with their own pools, 400 jobs: each runs exactly once and never concurrently with itself), lease-expiry reclaim with fencing of the crashed worker, retry-then-succeed, exhaust-to-failed, timeouts, heartbeats outliving the lease, drain and drain-timeout release, and the real `src/worker.ts` process draining a job on SIGTERM. The DLQ suites cover the `0003` invariants and backfill, stale-lease fencing of dead-lettering, poison detection, 10 concurrent replays of one job (exactly one wins), replay-vs-purge races, concurrent bulk replays (`SKIP LOCKED`, no overlap), and the HTTP API end to end with a real worker. The scheduling suites cover promotion and "never leased before `run_at`", the schedules API, two schedulers in one process (exactly one leads, failover on graceful stop and on a terminated session, concurrent ticks never duplicate, a failed tick rolls back), each misfire policy after a simulated 5 h outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM.
+Integration suites create a uniquely named schema per suite (`pq_test_<random>`), run the real migrations into it, and drop it afterwards, so they run in parallel and never touch existing data. CI runs them against a `postgres:16` service container after running the compiled migration CLI twice (to prove it is idempotent) and a worker smoke test (start the compiled worker, send SIGTERM, require exit code 0). The worker suites include a concurrency test (8 workers with their own pools, 400 jobs: each runs exactly once and never concurrently with itself), lease-expiry reclaim with fencing of the crashed worker, retry-then-succeed, exhaust-to-failed, timeouts, heartbeats outliving the lease, drain and drain-timeout release, and the real `src/worker.ts` process draining a job on SIGTERM. The DLQ suites cover the `0003` invariants and backfill, stale-lease fencing of dead-lettering, poison detection, 10 concurrent replays of one job (exactly one wins), replay-vs-purge races, concurrent bulk replays (`SKIP LOCKED`, no overlap), and the HTTP API end to end with a real worker. The scheduling suites cover promotion and "never leased before `run_at`", the schedules API, two schedulers in one process (exactly one leads, failover on graceful stop and on a terminated session, concurrent ticks never duplicate, a failed tick rolls back), each misfire policy after a simulated 5 h outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM. The Redis suites (run when `TEST_REDIS_URL` is set; CI runs a `redis:7-alpine` service) use a unique key prefix per test and cover channel isolation, coalescing, dirty-flag TTLs, the refresh claim and CAS, subscriber recovery through a TCP proxy that cuts and restores connections, the stats API cache states and stampede protection across two API instances, `/ready` degraded during an outage, pickup latency with a 20s fallback poll, push vs poll query counts, delayed jobs and retries on time in push mode, and the real `src/worker.ts` picking up a job via a wake-up.
 
 ### Scheduler configuration
 
@@ -611,7 +741,26 @@ Integration suites create a uniquely named schema per suite (`pq_test_<random>`)
 | `SCHEDULER_SHUTDOWN_TIMEOUT_MS`      | `10000`       | budget to finish the in-flight tick on SIGTERM before releasing leadership      |
 | `SCHEDULER_LIVENESS_FILE`            | unset         | file the loop touches (leader and standby); used by the compose healthcheck     |
 
-The scheduler also reads `DATABASE_URL`, `PG_*`, `NODE_ENV` and `LOG_LEVEL`. It uses one dedicated connection (the lock session; `PG_STATEMENT_TIMEOUT_MS` applies to it) and no pool. Point it at Postgres directly or through PgBouncer in **session** mode: advisory locks are session state.
+The scheduler also reads `DATABASE_URL`, `PG_*`, the Redis settings (it publishes wake-ups for the queues it fired into), `NODE_ENV` and `LOG_LEVEL`. It uses one dedicated connection (the lock session; `PG_STATEMENT_TIMEOUT_MS` applies to it) and no pool. Point it at Postgres directly or through PgBouncer in **session** mode: advisory locks are session state.
+
+### Redis configuration (API, worker and scheduler)
+
+| Variable                         | Default | Meaning                                                                               |
+| -------------------------------- | ------- | ------------------------------------------------------------------------------------- |
+| `REDIS_URL`                      | unset   | unset = every Redis feature off (pure Postgres, as in M4)                             |
+| `REDIS_KEY_PREFIX`               | `pq`    | namespace for keys and channels, so environments can share one Redis                  |
+| `REDIS_CONNECT_TIMEOUT_MS`       | `2000`  | connect + handshake budget per attempt                                                |
+| `REDIS_COMMAND_TIMEOUT_MS`       | `500`   | per-command budget; slower = treated as unavailable (fallback), never a slow request  |
+| `REDIS_RECONNECT_BASE_MS`        | `100`   | reconnect backoff: `random(cap/2, cap)`, `cap = min(MAX, BASE x 2^(n-1))`             |
+| `REDIS_RECONNECT_MAX_MS`         | `5000`  | reconnect backoff cap                                                                 |
+| `WAKEUP_ENABLED`                 | `true`  | publish and subscribe to wake-ups                                                     |
+| `WAKEUP_COALESCE_MS`             | `50`    | per-queue publish window (about 2 publishes per queue per window at most)             |
+| `STATS_CACHE_ENABLED`            | `true`  | cache `GET /queues/:name/stats` (API) and write dirty flags (all processes)           |
+| `STATS_CACHE_TTL_MS`             | `10000` | hard expiry of entries and dirty flags = staleness bound if invalidations are lost    |
+| `STATS_CACHE_MIN_REFRESH_MS`     | `1000`  | API only: a dirty entry younger than this is served as `STALE`; must be below the TTL |
+| `STATS_INVALIDATION_COALESCE_MS` | `100`   | per-queue dirty-flag write window                                                     |
+
+Keep `STATS_CACHE_TTL_MS` and `REDIS_KEY_PREFIX` identical across the API, workers and the scheduler of one environment: they all write the same dirty flags.
 
 ### Scripts
 
@@ -634,7 +783,7 @@ The scheduler also reads `DATABASE_URL`, `PG_*`, `NODE_ENV` and `LOG_LEVEL`. It 
 | `npm run format`           | Prettier write                                 |
 | `npm run format:check`     | Prettier check                                 |
 
-CI runs format check, lint, typecheck, build, migrations, worker and scheduler SIGTERM smoke tests and tests on Node 20 (see `.github/workflows/ci.yml`).
+CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
 
 ## API
 
@@ -732,6 +881,38 @@ curl "http://localhost:3000/queues/emails/jobs?status=queued&limit=2&cursor=$NEX
 ```
 
 `nextCursor` is `null` on the last page. Unknown queue -> `404` (reads never create queues). Malformed cursor, out-of-range limit or unknown parameters -> `400`.
+
+### `GET /queues/:name/stats`
+
+Point-in-time counts and backlog ages for one queue (Milestone 5). `404 NOT_FOUND` for a queue that was never used (not cached). Responses carry `cache-control: no-store` and `x-cache`:
+
+| `x-cache` | Meaning                                                                                                          |
+| --------- | ---------------------------------------------------------------------------------------------------------------- |
+| `HIT`     | cached snapshot, the queue has not changed since it was taken                                                    |
+| `STALE`   | the queue changed, but the snapshot is younger than `STATS_CACHE_MIN_REFRESH_MS` or another request refreshes it |
+| `MISS`    | computed from Postgres now and cached                                                                            |
+| `BYPASS`  | cache disabled, `REDIS_URL` unset or Redis unavailable: computed from Postgres                                   |
+
+```bash
+curl -si http://localhost:3000/queues/emails/stats
+# HTTP/1.1 200 OK
+# x-cache: HIT
+```
+
+```json
+{
+  "queue": "emails",
+  "counts": { "queued": 120, "scheduled": 8, "running": 10, "succeeded": 5230, "dead": 3 },
+  "total": 5371,
+  "oldestQueuedAt": "2026-10-24T04:59:58.120Z",
+  "oldestQueuedAgeMs": 1880,
+  "nextScheduledAt": "2026-10-24T05:00:30.000Z",
+  "oldestRunningSince": "2026-10-24T04:59:41.500Z",
+  "computedAt": "2026-10-24T05:00:00.000Z"
+}
+```
+
+All numbers come from one statement (one snapshot, database clock). `oldestQueuedAgeMs` is relative to `computedAt`, so a cached body stays self-consistent; `computedAt` tells you how old the snapshot is. Staleness is at most `STATS_CACHE_MIN_REFRESH_MS` after a change, or `STATS_CACHE_TTL_MS` if the invalidation was lost.
 
 ### Dead-letter queue
 
@@ -916,15 +1097,23 @@ Liveness probe. Does **not** check Postgres or Redis.
 
 ### `GET /ready`
 
-Readiness probe: `200` when every dependency check passes, `503` otherwise. Each check has a `READINESS_TIMEOUT_MS` budget; failure reasons are logged, not returned.
+Readiness probe. Each check has a `READINESS_TIMEOUT_MS` budget; failure reasons are logged, not returned.
+
+| `status`    | HTTP  | When                                                                               |
+| ----------- | ----- | ---------------------------------------------------------------------------------- |
+| `ready`     | `200` | every check passes                                                                 |
+| `degraded`  | `200` | only optional checks fail (Redis): still serving, workers poll, stats are uncached |
+| `not_ready` | `503` | a required check fails (Postgres)                                                  |
 
 ```json
 {
-  "status": "ready",
-  "checks": { "app": "ok", "postgres": "ok" },
-  "timestamp": "2026-10-20T04:00:00.000Z"
+  "status": "degraded",
+  "checks": { "app": "ok", "postgres": "ok", "redis": "fail" },
+  "timestamp": "2026-10-24T04:00:00.000Z"
 }
 ```
+
+Without `REDIS_URL` there is no `redis` check. Alert on `degraded` (or on `redis.*` log events); do not let the load balancer act on it.
 
 ### Errors
 
@@ -953,7 +1142,9 @@ Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `NOT_FOUND` (404), `CONFLICT` /
 - **DLQ** reads, bulk replays and purges walk the partial `jobs_dlq_idx`, so their cost is proportional to the DLQ, not the table; bulk operations are bounded per call so their row locks and cascades stay short. A mass replay after an outage (say 100k jobs) is best done in `limit=1000` batches with a `delayMs` spread so downstreams are not hit all at once.
 - **Scheduler**: one leader does all firing, so run 2 replicas for availability, not throughput. A tick costs one indexed claim plus one insert and one update per due schedule; at the default batch of 100 with immediate re-ticks a single leader fires thousands of schedules per second, far beyond typical needs (100k schedules at one per minute are about 1.7k fires/s spread over the minute). Each replica holds one connection. Failover time is about `SCHEDULER_LEADER_RETRY_INTERVAL_MS` on graceful exit or a killed process; on a network partition it is bounded by TCP keepalive and Postgres' `tcp_keepalives_*` / `idle_session_timeout` settings. If firing ever outgrows one leader, shard schedules by a hash of the id across several lock keys.
 - **Pagination** cost is O(limit) at any depth thanks to keyset cursors; there are no `OFFSET` scans or total counts.
-- **Redis (M5)** removes idle polling with pub/sub wake-ups; Postgres stays the lease authority, so losing Redis degrades latency, not correctness.
+- **Redis (M5)** removes idle polling: with wake-ups an idle worker issues one lease query per `WORKER_WAKEUP_FALLBACK_POLL_MS` (30s) instead of one per second, so 100 idle workers drop from ~100 to ~3 empty lease queries per second (plus one tiny `min(run_at)` query per idle cycle), while pickup latency falls from up to a poll interval to a few milliseconds. Publishes are coalesced per queue, so Redis load does not grow with enqueue rate. Each worker holds two Redis connections, the API and scheduler one each. Postgres stays the lease authority, so losing Redis degrades latency, not correctness.
+- **Stats** cost one aggregate query per queue per `STATS_CACHE_MIN_REFRESH_MS` at most, cluster-wide, however many dashboards poll; the count is O(jobs in the queue), so very large queues need retention or counter tables (M7/M8). Redis memory is tiny (one small hash and flag per queue) and every key has a TTL.
+- **Redis topology**: a single primary is enough; on Redis Cluster the stats keys are hash-tagged per queue, and pub/sub is broadcast cluster-wide (sharded pub/sub would be the next step at very large scale). A failover that loses writes only loses hints.
 - Capacity numbers and k6 results land in Milestone 8.
 
 ## License
