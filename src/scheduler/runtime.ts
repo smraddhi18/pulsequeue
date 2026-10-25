@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import type { SchedulerEnv } from '../config/env.js';
 import type { Logger } from '../lib/logger.js';
+import { createRedisServices, type RedisServices } from '../redis/index.js';
 import { PgAdvisoryLeaderLock, type LeaderLock } from './leader-lock.js';
 import { Scheduler } from './scheduler.js';
 import { runTick } from './tick.js';
@@ -9,8 +10,13 @@ import { runTick } from './tick.js';
 export interface SchedulerRuntime {
   scheduler: Scheduler;
   schedulerId: string;
+  /** Publishes wake-ups/invalidations for queues a tick fired into. */
+  redis: RedisServices;
   start(): void;
-  /** Finish the in-flight tick (bounded by SCHEDULER_SHUTDOWN_TIMEOUT_MS) and release leadership. */
+  /**
+   * Finish the in-flight tick (bounded by SCHEDULER_SHUTDOWN_TIMEOUT_MS),
+   * release leadership, then flush pending signals and close Redis.
+   */
   stop(): Promise<void>;
 }
 
@@ -29,7 +35,8 @@ export function defaultSchedulerId(): string {
 /**
  * Composition root for the scheduler process: config -> leader lock (one
  * dedicated session) -> tick -> Scheduler loop. The scheduler needs no pool:
- * all of its queries run on the lock-holding session.
+ * all of its queries run on the lock-holding session. Redis (optional) only
+ * carries post-commit signals for the queues each tick fired into.
  */
 export function createSchedulerRuntime(
   env: SchedulerEnv,
@@ -48,6 +55,8 @@ export function createSchedulerRuntime(
       ...(options.pgOptions !== undefined ? { options: options.pgOptions } : {}),
     });
 
+  const redis = createRedisServices(env, { logger, role: 'scheduler', id: schedulerId });
+
   const scheduler = new Scheduler({
     lock,
     logger,
@@ -58,6 +67,9 @@ export function createSchedulerRuntime(
         graceMs: env.SCHEDULER_MISFIRE_GRACE_MS,
         maxCatchUp: env.SCHEDULER_MAX_CATCH_UP,
         logger,
+        onCommitted: (queues) => {
+          for (const queue of queues) redis.signals.jobsRunnable(queue);
+        },
       }),
     tickIntervalMs: env.SCHEDULER_TICK_INTERVAL_MS,
     leaderRetryIntervalMs: env.SCHEDULER_LEADER_RETRY_INTERVAL_MS,
@@ -68,7 +80,14 @@ export function createSchedulerRuntime(
   return {
     scheduler,
     schedulerId,
+    redis,
     start: () => scheduler.start(),
-    stop: () => scheduler.stop({ timeoutMs: env.SCHEDULER_SHUTDOWN_TIMEOUT_MS }),
+    stop: async () => {
+      try {
+        await scheduler.stop({ timeoutMs: env.SCHEDULER_SHUTDOWN_TIMEOUT_MS });
+      } finally {
+        await redis.close();
+      }
+    },
   };
 }
