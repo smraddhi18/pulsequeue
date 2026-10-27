@@ -16,6 +16,7 @@ import {
   describeWithDb,
   type TestDatabase,
 } from './helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 interface Row {
   status: string;
@@ -56,12 +57,17 @@ describeWithDb('dead-letter queue (Postgres)', { timeout: 30_000 }, () => {
   });
 
   async function enqueue(queue: string, maxAttempts = 1): Promise<JobId> {
-    const { job } = await jobs.enqueue({ queue: queue as QueueName, payload: {}, maxAttempts });
+    const { job } = await jobs.enqueue({
+      tenantId: DEFAULT_TENANT_ID,
+      queue: queue as QueueName,
+      payload: {},
+      maxAttempts,
+    });
     return job.id;
   }
 
   async function queueId(name: string): Promise<string> {
-    const queue = await queues.findByName(name as QueueName);
+    const queue = await queues.findByName(DEFAULT_TENANT_ID, name as QueueName);
     if (!queue) throw new Error(`no queue ${name}`);
     return queue.id;
   }

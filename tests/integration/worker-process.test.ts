@@ -17,6 +17,8 @@ import {
   uniqueRedisPrefix,
   type TestDatabase,
 } from './helpers.js';
+import { authedInject, createTestApiKey } from './auth-helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -44,6 +46,7 @@ describeWithDb('worker process (Postgres)', { timeout: 30_000 }, () => {
       maxPayloadBytes: 10_000,
     });
     const { job } = await jobs.enqueue({
+      tenantId: DEFAULT_TENANT_ID,
       queue: 'demo' as QueueName,
       payload: { durationMs: 800 },
     });
@@ -156,7 +159,11 @@ describeWithRedis('worker process with Redis wake-ups', { timeout: 30_000 }, () 
       await sleep(300); // let the catch-up poll after subscribing return
 
       const enqueuedAt = Date.now();
-      const res = await app.inject({
+      const { token } = await createTestApiKey(db.pool);
+      const res = await authedInject(
+        app,
+        token,
+      )({
         method: 'POST',
         url: '/queues/demo/jobs',
         payload: { payload: { durationMs: 1 } },

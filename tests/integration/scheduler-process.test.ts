@@ -6,6 +6,7 @@ import { QueueRepository } from '../../src/repositories/queue.repository.js';
 import { ScheduleRepository } from '../../src/repositories/schedule.repository.js';
 import { ScheduleService } from '../../src/services/schedule.service.js';
 import { createTestDatabase, describeWithDb, type TestDatabase } from './helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -101,6 +102,7 @@ describeWithDb('scheduler process (Postgres)', { timeout: 40_000 }, () => {
     // schedule due by moving next_run_at to the current minute.
     const create = (name: string) =>
       schedules.create({
+        tenantId: DEFAULT_TENANT_ID,
         queue: 'reports' as QueueName,
         name,
         cron: '* * * * *',

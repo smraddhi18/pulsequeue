@@ -9,6 +9,7 @@ import { registerBuiltinHandlers } from '../../src/worker/handlers/index.js';
 import { HandlerRegistry } from '../../src/worker/registry.js';
 import { Worker } from '../../src/worker/worker.js';
 import { createTestDatabase, describeWithDb, testEnv, type TestDatabase } from './helpers.js';
+import { authedInject, createTestApiKey, type Inject } from './auth-helpers.js';
 
 interface DeadLetterBody {
   id: string;
@@ -50,6 +51,7 @@ async function waitFor(
 describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
   let db: TestDatabase;
   let app: FastifyInstance;
+  let api: Inject;
   let leases: LeaseRepository;
   const appLogs: LogLine[] = [];
 
@@ -61,6 +63,7 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
       logStream: { write: (line) => void appLogs.push(JSON.parse(line) as LogLine) },
     });
     await app.ready();
+    api = authedInject(app, (await createTestApiKey(db.pool)).token);
     leases = new LeaseRepository(db.pool);
   });
 
@@ -78,7 +81,7 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     queue: string,
     body: Record<string, unknown> = { payload: {} },
   ): Promise<string> {
-    const res = await app.inject({ method: 'POST', url: `/queues/${queue}/jobs`, payload: body });
+    const res = await api({ method: 'POST', url: `/queues/${queue}/jobs`, payload: body });
     expect(res.statusCode).toBe(201);
     return res.json<{ id: string }>().id;
   }
@@ -110,7 +113,7 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     id: string,
     payload?: Record<string, unknown>,
   ): Promise<LightMyRequestResponse> =>
-    app.inject({
+    api({
       method: 'POST',
       url: `/queues/${queue}/dlq/${id}/replay`,
       ...(payload !== undefined ? { payload } : {}),
@@ -142,10 +145,10 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     try {
       const id = await enqueue('billing', { payload: { invoice: 42 }, maxAttempts: 2 });
       await waitFor(
-        async () => (await app.inject({ method: 'GET', url: `/dlq/${id}` })).statusCode === 200,
+        async () => (await api({ method: 'GET', url: `/dlq/${id}` })).statusCode === 200,
       );
 
-      const list = await app.inject({ method: 'GET', url: '/queues/billing/dlq' });
+      const list = await api({ method: 'GET', url: '/queues/billing/dlq' });
       expect(list.statusCode).toBe(200);
       const page = list.json<{ data: DeadLetterBody[]; nextCursor: string | null }>();
       expect(page.nextCursor).toBeNull();
@@ -163,9 +166,7 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
         },
       });
 
-      const detail = (
-        await app.inject({ method: 'GET', url: `/dlq/${id}` })
-      ).json<DeadLetterBody>();
+      const detail = (await api({ method: 'GET', url: `/dlq/${id}` })).json<DeadLetterBody>();
       expect(detail.attemptHistory?.map((a) => [a.attemptNumber, a.status])).toEqual([
         [1, 'failed'],
         [2, 'failed'],
@@ -197,8 +198,8 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
 
       await waitFor(
         async () =>
-          (await app.inject({ method: 'GET', url: `/jobs/${id}` })).json<{ status: string }>()
-            .status === 'succeeded',
+          (await api({ method: 'GET', url: `/jobs/${id}` })).json<{ status: string }>().status ===
+          'succeeded',
       );
       const { rows } = await db.pool.query<{ attempt_number: number; status: string }>(
         'SELECT attempt_number, status FROM job_attempts WHERE job_id = $1 ORDER BY attempt_number',
@@ -210,7 +211,7 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
         [3, 'succeeded'],
       ]);
       // Out of the DLQ now.
-      expect((await app.inject({ method: 'GET', url: `/dlq/${id}` })).statusCode).toBe(404);
+      expect((await api({ method: 'GET', url: `/dlq/${id}` })).statusCode).toBe(404);
     } finally {
       await worker.stop({ timeoutMs: 2_000 });
     }
@@ -262,7 +263,7 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     let cursor: string | null = null;
     do {
       const url: string = `/queues/pages/dlq?limit=2${cursor ? `&cursor=${cursor}` : ''}`;
-      const res = await app.inject({ method: 'GET', url });
+      const res = await api({ method: 'GET', url });
       expect(res.statusCode).toBe(200);
       const body = res.json<{ data: DeadLetterBody[]; nextCursor: string | null }>();
       seen.push(...body.data.map((d) => d.id));
@@ -270,33 +271,33 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     } while (cursor);
     expect(seen).toEqual([...ids].reverse());
 
-    const filtered = await app.inject({
+    const filtered = await api({
       method: 'GET',
       url: '/queues/pages/dlq?reason=invalid_payload',
     });
     expect(filtered.json<{ data: DeadLetterBody[] }>().data.map((d) => d.id)).toEqual([ids[2]]);
 
-    expect(
-      (await app.inject({ method: 'GET', url: '/queues/pages/dlq?reason=meh' })).statusCode,
-    ).toBe(400);
-    expect(
-      (await app.inject({ method: 'GET', url: '/queues/pages/dlq?cursor=%%%' })).statusCode,
-    ).toBe(400);
-    expect((await app.inject({ method: 'GET', url: '/queues/missing/dlq' })).statusCode).toBe(404);
+    expect((await api({ method: 'GET', url: '/queues/pages/dlq?reason=meh' })).statusCode).toBe(
+      400,
+    );
+    expect((await api({ method: 'GET', url: '/queues/pages/dlq?cursor=%%%' })).statusCode).toBe(
+      400,
+    );
+    expect((await api({ method: 'GET', url: '/queues/missing/dlq' })).statusCode).toBe(404);
   });
 
   it('GET /dlq/:jobId is 404 for live or unknown jobs and 400 for a bad id', async () => {
     const live = await enqueue('x');
-    expect((await app.inject({ method: 'GET', url: `/dlq/${live}` })).statusCode).toBe(404);
-    expect((await app.inject({ method: 'GET', url: `/dlq/${randomUUID()}` })).statusCode).toBe(404);
-    expect((await app.inject({ method: 'GET', url: '/dlq/123' })).statusCode).toBe(400);
+    expect((await api({ method: 'GET', url: `/dlq/${live}` })).statusCode).toBe(404);
+    expect((await api({ method: 'GET', url: `/dlq/${randomUUID()}` })).statusCode).toBe(404);
+    expect((await api({ method: 'GET', url: '/dlq/123' })).statusCode).toBe(400);
   });
 
   it('bulk replay: limit, reason filter, empty body defaults, logged', async () => {
     for (let i = 0; i < 3; i++) await deadJob('bulk', 'non_retryable');
     await deadJob('bulk', 'invalid_payload');
 
-    const first = await app.inject({
+    const first = await api({
       method: 'POST',
       url: '/queues/bulk/dlq/replay',
       payload: { limit: 2, reason: 'non_retryable' },
@@ -304,14 +305,14 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     expect(first.statusCode).toBe(200);
     expect(first.json<{ replayed: number; jobIds: string[] }>()).toMatchObject({ replayed: 2 });
 
-    const rest = await app.inject({ method: 'POST', url: '/queues/bulk/dlq/replay' });
+    const rest = await api({ method: 'POST', url: '/queues/bulk/dlq/replay' });
     expect(rest.json<{ replayed: number }>().replayed).toBe(2);
-    const none = await app.inject({ method: 'POST', url: '/queues/bulk/dlq/replay', payload: {} });
+    const none = await api({ method: 'POST', url: '/queues/bulk/dlq/replay', payload: {} });
     expect(none.json()).toEqual({ replayed: 0, jobIds: [] });
 
     expect(
       (
-        await app.inject({
+        await api({
           method: 'POST',
           url: '/queues/bulk/dlq/replay',
           payload: { limit: 5000 },
@@ -326,16 +327,14 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
   it('purge one: 204 then 404; a live job is 409 and survives', async () => {
     const id = await deadJob('purge');
     const live = await enqueue('purge');
-    const res = await app.inject({ method: 'DELETE', url: `/queues/purge/dlq/${id}` });
+    const res = await api({ method: 'DELETE', url: `/queues/purge/dlq/${id}` });
     expect(res.statusCode).toBe(204);
     expect(res.body).toBe('');
-    expect(
-      (await app.inject({ method: 'DELETE', url: `/queues/purge/dlq/${id}` })).statusCode,
-    ).toBe(404);
-    expect(
-      (await app.inject({ method: 'DELETE', url: `/queues/purge/dlq/${live}` })).statusCode,
-    ).toBe(409);
-    expect((await app.inject({ method: 'GET', url: `/jobs/${live}` })).statusCode).toBe(200);
+    expect((await api({ method: 'DELETE', url: `/queues/purge/dlq/${id}` })).statusCode).toBe(404);
+    expect((await api({ method: 'DELETE', url: `/queues/purge/dlq/${live}` })).statusCode).toBe(
+      409,
+    );
+    expect((await api({ method: 'GET', url: `/jobs/${live}` })).statusCode).toBe(200);
     expect(appLogs).toContainEqual(
       expect.objectContaining({ event: 'dlq.purged', jobId: id, queue: 'purge' }),
     );
@@ -349,19 +348,19 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
     );
     const recent = await deadJob('bp');
 
-    const missing = await app.inject({ method: 'DELETE', url: '/queues/bp/dlq' });
+    const missing = await api({ method: 'DELETE', url: '/queues/bp/dlq' });
     expect(missing.statusCode).toBe(400);
     expect(missing.json<ErrorBody>().error.code).toBe('VALIDATION_ERROR');
 
     const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-    const res = await app.inject({
+    const res = await api({
       method: 'DELETE',
       url: `/queues/bp/dlq?olderThan=${encodeURIComponent(weekAgo)}`,
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ purged: 1 });
-    expect((await app.inject({ method: 'GET', url: `/dlq/${old}` })).statusCode).toBe(404);
-    expect((await app.inject({ method: 'GET', url: `/dlq/${recent}` })).statusCode).toBe(200);
+    expect((await api({ method: 'GET', url: `/dlq/${old}` })).statusCode).toBe(404);
+    expect((await api({ method: 'GET', url: `/dlq/${recent}` })).statusCode).toBe(200);
     expect(appLogs).toContainEqual(
       expect.objectContaining({ event: 'dlq.bulk_purged', queue: 'bp', purged: 1 }),
     );
@@ -387,11 +386,9 @@ describeWithDb('dead-letter queue API (Postgres)', { timeout: 30_000 }, () => {
       try {
         const id = await enqueue('demo', { payload: { durationMs: 'soon' }, maxAttempts: 5 });
         await waitFor(
-          async () => (await app.inject({ method: 'GET', url: `/dlq/${id}` })).statusCode === 200,
+          async () => (await api({ method: 'GET', url: `/dlq/${id}` })).statusCode === 200,
         );
-        const detail = (
-          await app.inject({ method: 'GET', url: `/dlq/${id}` })
-        ).json<DeadLetterBody>();
+        const detail = (await api({ method: 'GET', url: `/dlq/${id}` })).json<DeadLetterBody>();
         expect(detail.deadLetter).toMatchObject({ reason: 'invalid_payload', attempts: 1 });
         expect(detail.lastError).toMatch(/^InvalidPayloadError: Invalid demo payload/);
       } finally {

@@ -12,6 +12,8 @@ import { createSchedulerRuntime, type SchedulerRuntime } from '../../src/schedul
 import { runTick, type TickOptions } from '../../src/scheduler/tick.js';
 import { ScheduleService } from '../../src/services/schedule.service.js';
 import { createTestDatabase, describeWithDb, type TestDatabase } from './helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
+import type { QueueRef } from '../../src/domain/signals.js';
 
 interface LogLine {
   event?: string;
@@ -81,6 +83,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
     opts: { cron?: string; misfirePolicy?: MisfirePolicy; queue?: string } = {},
   ) {
     return service.create({
+      tenantId: DEFAULT_TENANT_ID,
       queue: (opts.queue ?? 'sched') as QueueName,
       name,
       cron: opts.cron ?? '* * * * *',
@@ -193,7 +196,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
         payload: { schedule: 'every-minute' },
       });
 
-      const after = await service.get(s.id);
+      const after = await service.get(DEFAULT_TENANT_ID, s.id);
       expect(after.fireCount).toBe(1);
       expect(after.lastRunAt).toEqual(due);
       expect(after.lastJobId).toBe(jobs[0]?.id);
@@ -210,7 +213,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       const future = await createSchedule('future');
       const paused = await createSchedule('paused');
       await setNextRun(paused.id, `date_trunc('minute', now())`);
-      await service.pause(paused.id);
+      await service.pause(DEFAULT_TENANT_ID, paused.id);
 
       const result = await withClient((c) => runTick(c, tickOptions()));
       expect(result.claimed).toBe(0);
@@ -224,7 +227,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       const c3 = await createSchedule('wake-c');
       await setNextRun(a.id, `date_trunc('minute', now())`);
       await setNextRun(b.id, `date_trunc('minute', now())`);
-      const committed: string[][] = [];
+      const committed: QueueRef[][] = [];
       const result = await withClient((c) =>
         runTick(
           c,
@@ -237,12 +240,15 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       );
       expect(result.fired).toBe(2);
       expect(committed).toHaveLength(1);
-      expect([...committed[0]!].sort()).toEqual(['sched', 'sched-other']);
+      expect(committed[0]!.map((r) => `${r.tenantId}:${r.name}`).sort()).toEqual([
+        'default:sched',
+        'default:sched-other',
+      ]);
       expect(await jobsFor(a.id)).toHaveLength(1);
       expect(await jobsFor(b.id)).toHaveLength(1);
 
       // Nothing fired: the hook is not called; a throwing hook does not fail the tick.
-      const idle: string[][] = [];
+      const idle: QueueRef[][] = [];
       await withClient((c) => runTick(c, tickOptions({ onCommitted: (q) => idle.push(q) })));
       expect(idle).toEqual([]);
       await setNextRun(c3.id, `date_trunc('minute', now())`);
@@ -271,7 +277,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       const result = await withClient((c) => runTick(c, tickOptions({ logger: log.logger })));
       expect(result).toMatchObject({ claimed: 1, fired: 0, duplicates: 1 });
       expect(await jobsFor(s.id)).toHaveLength(1);
-      expect((await service.get(s.id)).fireCount).toBe(1);
+      expect((await service.get(DEFAULT_TENANT_ID, s.id)).fireCount).toBe(1);
       expect(log.count('scheduler.duplicate_suppressed')).toBe(1);
     });
 
@@ -323,7 +329,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       );
       expect(fired).toEqual(expectedTimes);
 
-      const after = await service.get(s.id);
+      const after = await service.get(DEFAULT_TENANT_ID, s.id);
       expect(after.nextRunAt?.getTime()).toBe(top.getTime() + 3_600_000);
       expect(after.fireCount).toBe(expected);
       if (expected < 6) expect(log.count('scheduler.misfire_skipped')).toBe(1);
@@ -346,14 +352,14 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       expect(await jobsFor(good.id)).toHaveLength(1);
       expect(await jobsFor(bad.id)).toHaveLength(0);
 
-      const failed = await service.get(bad.id);
+      const failed = await service.get(DEFAULT_TENANT_ID, bad.id);
       expect(failed.lastError).toMatch(/Invalid cron expression/);
       expect(failed.enabled).toBe(true);
       expect(failed.nextRunAt?.getTime()).toBeGreaterThan(before + 50_000);
       expect(log.count('scheduler.schedule_error')).toBe(1);
 
       // The next successful evaluation clears the error.
-      expect((await service.get(good.id)).lastError).toBeNull();
+      expect((await service.get(DEFAULT_TENANT_ID, good.id)).lastError).toBeNull();
     });
 
     it('a failed tick rolls back everything it did', async () => {
@@ -371,7 +377,7 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
         await expect(runTick(flaky, tickOptions())).rejects.toThrow(/Database unavailable/);
       });
       expect(await jobsFor(s.id)).toHaveLength(0);
-      expect((await service.get(s.id)).fireCount).toBe(0);
+      expect((await service.get(DEFAULT_TENANT_ID, s.id)).fireCount).toBe(0);
     });
   });
 

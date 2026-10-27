@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { cp, mkdtemp, readdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -51,11 +51,13 @@ describeWithDb('migration runner (Postgres)', () => {
        WHERE table_schema = current_schema() ORDER BY table_name`,
     );
     expect(tables.map((t) => t.table_name)).toEqual([
+      'api_keys',
       'job_attempts',
       'jobs',
       'queues',
       'schedules',
       'schema_migrations',
+      'tenants',
     ]);
   });
 
@@ -113,6 +115,29 @@ describeWithDb('migration runner (Postgres)', () => {
 
     const result = await runMigrations(db.pool, { dir });
     expect(result.applied).toEqual([INITIAL, '0002_concurrent_index.sql']);
+  });
+
+  it('upgrades an M5 database: existing queues and jobs move to the default tenant', async () => {
+    const db = await freshDb();
+    const dir = await mkdtemp(path.join(tmpdir(), 'pq-mig-0006-'));
+    tempDirs.push(dir);
+    const files = (await readdir(DEFAULT_MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')).sort();
+    for (const f of files.filter((f) => f < '0006')) {
+      await cp(path.join(DEFAULT_MIGRATIONS_DIR, f), path.join(dir, f));
+    }
+    await runMigrations(db.pool, { dir });
+    const { rows: queues } = await db.pool.query<{ id: string }>(
+      "INSERT INTO queues (name) VALUES ('legacy') RETURNING id",
+    );
+    await db.pool.query("INSERT INTO jobs (queue_id, payload) VALUES ($1, '{}')", [queues[0]!.id]);
+
+    const result = await runMigrations(db.pool);
+    expect(result.applied[0]).toMatch(/^0006_/);
+    const { rows } = await db.pool.query<{ tenant_id: string; jobs: string }>(
+      `SELECT q.tenant_id, (SELECT count(*) FROM jobs j WHERE j.queue_id = q.id)::text AS jobs
+       FROM queues q WHERE q.name = 'legacy'`,
+    );
+    expect(rows).toEqual([{ tenant_id: 'default', jobs: '1' }]);
   });
 });
 
@@ -183,6 +208,96 @@ describeWithDb('schema invariants (Postgres)', () => {
     expect(after[0]!.updated_at.getTime()).toBeGreaterThan(before.updated_at.getTime());
   });
 
+  describe('tenants and API keys (0005)', () => {
+    const hash = Buffer.alloc(32, 7);
+
+    it('seeds the default tenant and validates tenant ids and rate-limit pairs', async () => {
+      const { rows } = await db.pool.query<{ id: string }>(
+        "SELECT id FROM tenants WHERE id = 'default'",
+      );
+      expect(rows).toHaveLength(1);
+      await expect(
+        db.pool.query("INSERT INTO tenants (id, name) VALUES ('Bad:Id', 'x')"),
+      ).rejects.toMatchObject({ code: '23514', constraint: 'tenants_id_format' });
+      await expect(
+        db.pool.query(
+          "INSERT INTO tenants (id, name, rate_limit_per_sec) VALUES ('half-limit', 'x', 10)",
+        ),
+      ).rejects.toMatchObject({ code: '23514', constraint: 'tenants_rate_limit_positive' });
+    });
+
+    it('stores 32-byte hashes under unique, well-formed prefixes', async () => {
+      const insert = (prefix: string, secretHash: Buffer) =>
+        db.pool.query(
+          `INSERT INTO api_keys (tenant_id, name, prefix, secret_hash, role)
+           VALUES ('default', 'k', $1, $2, 'reader')`,
+          [prefix, secretHash],
+        );
+      await insert('abcdefghij01', hash);
+      await expect(insert('abcdefghij01', hash)).rejects.toMatchObject({
+        code: '23505',
+        constraint: 'api_keys_prefix_uq',
+      });
+      await expect(insert('ABCDEFGHIJ02', hash)).rejects.toMatchObject({
+        constraint: 'api_keys_prefix_format',
+      });
+      await expect(insert('abcdefghij03', Buffer.alloc(16))).rejects.toMatchObject({
+        constraint: 'api_keys_secret_hash_sha256',
+      });
+    });
+  });
+
+  describe('queue tenancy (0006)', () => {
+    it('scopes queue names per tenant and defaults to the default tenant', async () => {
+      await db.pool.query("INSERT INTO tenants (id, name) VALUES ('t-0006', 'x')");
+      const { rows } = await db.pool.query<{ tenant_id: string }>(
+        "INSERT INTO queues (name) VALUES ('shared-0006') RETURNING tenant_id",
+      );
+      expect(rows[0]!.tenant_id).toBe('default');
+      await db.pool.query("INSERT INTO queues (tenant_id, name) VALUES ('t-0006', 'shared-0006')");
+      await expect(
+        db.pool.query("INSERT INTO queues (tenant_id, name) VALUES ('t-0006', 'shared-0006')"),
+      ).rejects.toMatchObject({ code: '23505', constraint: 'queues_tenant_name_uq' });
+      await expect(
+        db.pool.query("INSERT INTO queues (tenant_id, name) VALUES ('nobody', 'q')"),
+      ).rejects.toMatchObject({ code: '23503' });
+      // A tenant that still owns queues cannot be deleted.
+      await expect(db.pool.query("DELETE FROM tenants WHERE id = 't-0006'")).rejects.toMatchObject({
+        code: '23503',
+      });
+    });
+  });
+
+  describe('queue limits (0007)', () => {
+    it('defaults to unlimited and rejects non-positive or half-set limits', async () => {
+      const { rows } = await db.pool.query<Record<string, unknown>>(
+        `INSERT INTO queues (name) VALUES ('limits-0007')
+         RETURNING max_concurrency, rate_limit_per_sec, rate_limit_burst`,
+      );
+      expect(rows[0]).toEqual({
+        max_concurrency: null,
+        rate_limit_per_sec: null,
+        rate_limit_burst: null,
+      });
+      const update = (set: string) =>
+        db.pool.query(`UPDATE queues SET ${set} WHERE name = 'limits-0007'`);
+      await update('max_concurrency = 3, rate_limit_per_sec = 5, rate_limit_burst = 10');
+      await expect(update('max_concurrency = 0')).rejects.toMatchObject({
+        code: '23514',
+        constraint: 'queues_max_concurrency_positive',
+      });
+      await expect(update('rate_limit_burst = NULL')).rejects.toMatchObject({
+        code: '23514',
+        constraint: 'queues_rate_limit_positive',
+      });
+      await expect(update('rate_limit_per_sec = -1')).rejects.toMatchObject({
+        code: '23514',
+        constraint: 'queues_rate_limit_positive',
+      });
+      await update('max_concurrency = NULL, rate_limit_per_sec = NULL, rate_limit_burst = NULL');
+    });
+  });
+
   describe('query plans', () => {
     async function plan(sql: string, params: unknown[]): Promise<string> {
       const client = await db.pool.connect();
@@ -196,6 +311,14 @@ describeWithDb('schema invariants (Postgres)', () => {
         client.release();
       }
     }
+
+    it('running count per queue (M6 concurrency cap) uses jobs_running_queue_idx', async () => {
+      const text = await plan(
+        `SELECT count(*) FROM jobs WHERE queue_id = $1 AND status = 'running'`,
+        [1],
+      );
+      expect(text).toContain('jobs_running_queue_idx');
+    });
 
     it('lease query (M2) walks jobs_lease_idx in lease order without a sort', async () => {
       const text = await plan(

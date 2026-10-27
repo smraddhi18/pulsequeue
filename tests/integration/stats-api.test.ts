@@ -17,16 +17,19 @@ import {
   waitUntil,
   type TestDatabase,
 } from './helpers.js';
+import { authedInject, createTestApiKey } from './auth-helpers.js';
 
 describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () => {
   let db: TestDatabase;
   let admin: Redis;
   const prefixes: string[] = [];
   const apps: FastifyInstance[] = [];
+  let token: string;
 
   beforeAll(async () => {
     db = await createTestDatabase();
     admin = createAdminRedis();
+    token = (await createTestApiKey(db.pool)).token;
   });
 
   afterAll(async () => {
@@ -72,12 +75,15 @@ describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () 
   }
 
   const stats = (app: FastifyInstance, queue = 'emails') =>
-    app.inject({ method: 'GET', url: `/queues/${queue}/stats` });
+    authedInject(app, token)({ method: 'GET', url: `/queues/${queue}/stats` });
 
   const body = (res: LightMyRequestResponse) => res.json<QueueStatsResponse>();
 
   async function enqueue(app: FastifyInstance, queue = 'emails', payload: unknown = {}) {
-    const res = await app.inject({
+    const res = await authedInject(
+      app,
+      token,
+    )({
       method: 'POST',
       url: `/queues/${queue}/jobs`,
       payload: { payload },
@@ -101,7 +107,7 @@ describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () 
     await enqueue(app);
     await enqueue(app);
     await waitUntil(
-      async () => (await admin.exists(redisKeys(prefixes[0]!).statsDirty('emails'))) === 1,
+      async () => (await admin.exists(redisKeys(prefixes[0]!).statsDirty('default:emails'))) === 1,
     );
 
     const first = await stats(app);
@@ -130,7 +136,7 @@ describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () 
     expect((await stats(app)).headers['x-cache']).toBe('HIT');
 
     await enqueue(app);
-    await waitUntil(async () => (await admin.exists(keys.statsDirty('emails'))) === 1);
+    await waitUntil(async () => (await admin.exists(keys.statsDirty('default:emails'))) === 1);
     const res = await stats(app);
     expect(res.headers['x-cache']).toBe('MISS');
     expect(body(res).counts.queued).toBe(2);
@@ -143,7 +149,7 @@ describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () 
     await enqueue(app);
     await stats(app); // MISS: entry with queued 1
     await enqueue(app);
-    await waitUntil(async () => (await admin.exists(keys.statsDirty('emails'))) === 1);
+    await waitUntil(async () => (await admin.exists(keys.statsDirty('default:emails'))) === 1);
 
     const stale = await stats(app);
     expect(stale.headers['x-cache']).toBe('STALE');
@@ -159,6 +165,12 @@ describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () 
   it('stampede: 20 concurrent cold reads cost one Postgres query', async () => {
     const app = await startApp();
     await enqueue(app);
+    // Let the enqueue's (asynchronous, coalesced) invalidation land first: if it
+    // arrived mid-stampede it would legitimately mark the fresh entry dirty and
+    // cause a second compute (MIN_REFRESH is 0 here), which is not a stampede.
+    await waitUntil(
+      async () => (await admin.exists(redisKeys(prefixes[0]!).statsDirty('default:emails'))) === 1,
+    );
     const compute = vi.spyOn(QueueStatsRepository.prototype, 'compute');
     const responses = await Promise.all(Array.from({ length: 20 }, () => stats(app)));
     expect(responses.every((r) => r.statusCode === 200)).toBe(true);
@@ -175,7 +187,9 @@ describeWithRedis('queue stats API (Postgres + Redis)', { timeout: 30_000 }, () 
     expect((await stats(b)).headers['x-cache']).toBe('HIT');
 
     await enqueue(b);
-    await waitUntil(async () => (await admin.exists(redisKeys(prefix).statsDirty('emails'))) === 1);
+    await waitUntil(
+      async () => (await admin.exists(redisKeys(prefix).statsDirty('default:emails'))) === 1,
+    );
     const [ra, rb] = await Promise.all([stats(a), stats(b)]);
     expect([ra.headers['x-cache'], rb.headers['x-cache']].sort()).toEqual(
       expect.arrayContaining(['MISS']),

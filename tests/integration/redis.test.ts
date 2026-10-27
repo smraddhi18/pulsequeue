@@ -2,6 +2,7 @@ import pino from 'pino';
 import type { Redis } from 'ioredis';
 import { afterAll, afterEach, beforeAll, expect, it } from 'vitest';
 import { loadWorkerEnv, type RedisEnv } from '../../src/config/env.js';
+import type { TenantId } from '../../src/domain/tenant.js';
 import {
   closeRedisClient,
   createRedisClient,
@@ -105,8 +106,9 @@ describeWithRedis('Redis building blocks (real Redis)', { timeout: 20_000 }, () 
     await waitUntil(() => services.client!.status === 'ready');
 
     // 50 signals inside one window: leading + trailing publish only.
-    for (let i = 0; i < 50; i++) services.signals.jobsRunnable('emails');
-    services.signals.jobsRunnable('reports'); // not subscribed
+    for (let i = 0; i < 50; i++)
+      services.signals.jobsRunnable({ tenantId: 'default', name: 'emails' });
+    services.signals.jobsRunnable({ tenantId: 'default', name: 'reports' }); // not subscribed
     await services.close();
     await waitUntil(() => received.length >= 2);
     await sleep(50);
@@ -120,11 +122,40 @@ describeWithRedis('Redis building blocks (real Redis)', { timeout: 20_000 }, () 
     );
     cleanups.push(() => services.close());
     await waitUntil(() => services.client!.status === 'ready');
-    services.signals.jobsChanged('emails');
+    services.signals.jobsChanged({ tenantId: 'default', name: 'emails' });
     await services.close();
-    const ttl = await admin.pttl(keys.statsDirty('emails'));
+    // Stats keys are per tenant + queue (M6); wake-ups stay per queue name.
+    const ttl = await admin.pttl(keys.statsDirty('default:emails'));
     expect(ttl).toBeGreaterThan(0);
     expect(ttl).toBeLessThanOrEqual(5_000);
+  });
+
+  it('rate limit store: API role only, and enough on its own to keep Redis on', async () => {
+    const off = { WAKEUP_ENABLED: 'false', STATS_CACHE_ENABLED: 'false' };
+    const api = createRedisServices(redisEnv(requireRedisUrl(), off), {
+      logger,
+      role: 'api',
+      id: 'test',
+      rateLimit: true,
+    });
+    cleanups.push(() => api.close());
+    expect(api.client).not.toBeNull();
+    expect(api.rateLimitStore).not.toBeNull();
+    await waitUntil(() => api.rateLimitStore!.isAvailable());
+    const taken = await api.rateLimitStore!.take('default' as TenantId, 'emails', [
+      { scope: 'tenant', limit: { perSec: 1, burst: 2 } },
+    ]);
+    expect(taken).toMatchObject({ allowed: true });
+
+    const worker = createRedisServices(redisEnv(requireRedisUrl(), off), {
+      logger,
+      role: 'worker',
+      id: 'test',
+      rateLimit: true,
+    });
+    cleanups.push(() => worker.close());
+    expect(worker.client).toBeNull();
+    expect(worker.rateLimitStore).toBeNull();
   });
 
   it('stats store: read, claim once, CAS write rejects an older snapshot, TTL set', async () => {

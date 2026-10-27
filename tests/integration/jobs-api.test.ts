@@ -3,6 +3,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../../src/app.js';
 import { createTestDatabase, describeWithDb, testEnv, type TestDatabase } from './helpers.js';
+import { authedInject, createTestApiKey, type Inject } from './auth-helpers.js';
 
 interface JobBody {
   id: string;
@@ -34,6 +35,7 @@ const MAX_PAYLOAD_BYTES = 1024;
 describeWithDb('jobs API (Postgres)', () => {
   let db: TestDatabase;
   let app: FastifyInstance;
+  let api: Inject;
 
   beforeAll(async () => {
     db = await createTestDatabase();
@@ -43,6 +45,7 @@ describeWithDb('jobs API (Postgres)', () => {
       pool: db.pool,
     });
     await app.ready();
+    api = authedInject(app, (await createTestApiKey(db.pool)).token);
   });
 
   afterAll(async () => {
@@ -55,7 +58,7 @@ describeWithDb('jobs API (Postgres)', () => {
     body: unknown,
     idempotencyKey?: string,
   ): Promise<LightMyRequestResponse> {
-    return app.inject({
+    return api({
       method: 'POST',
       url: `/queues/${queue}/jobs`,
       payload: body as Record<string, unknown>,
@@ -108,7 +111,7 @@ describeWithDb('jobs API (Postgres)', () => {
       for (const payload of [[1, 2, 3], 'just a string', null, { nested: [{ a: 1 }] }]) {
         const res = await enqueue('payload-shapes', { payload });
         expect(res.statusCode).toBe(201);
-        const fetched = await app.inject({ method: 'GET', url: `/jobs/${res.json<JobBody>().id}` });
+        const fetched = await api({ method: 'GET', url: `/jobs/${res.json<JobBody>().id}` });
         expect(fetched.json<JobBody>().payload).toEqual(payload);
       }
     });
@@ -208,7 +211,7 @@ describeWithDb('jobs API (Postgres)', () => {
     });
 
     it('returns 413 when the raw body exceeds the transport cap', async () => {
-      const res = await app.inject({
+      const res = await api({
         method: 'POST',
         url: '/queues/big/jobs',
         headers: { 'content-type': 'application/json' },
@@ -291,17 +294,17 @@ describeWithDb('jobs API (Postgres)', () => {
   describe('GET /jobs/:id', () => {
     it('returns the job', async () => {
       const created = (await enqueue('lookup', { payload: { x: 1 } })).json<JobBody>();
-      const res = await app.inject({ method: 'GET', url: `/jobs/${created.id}` });
+      const res = await api({ method: 'GET', url: `/jobs/${created.id}` });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual(created);
     });
 
     it('returns 404 for an unknown id and 400 for a non-UUID', async () => {
-      const missing = await app.inject({ method: 'GET', url: `/jobs/${randomUUID()}` });
+      const missing = await api({ method: 'GET', url: `/jobs/${randomUUID()}` });
       expect(missing.statusCode).toBe(404);
       expect(missing.json<ErrorBody>().error.code).toBe('NOT_FOUND');
 
-      const bad = await app.inject({ method: 'GET', url: '/jobs/not-a-uuid' });
+      const bad = await api({ method: 'GET', url: '/jobs/not-a-uuid' });
       expect(bad.statusCode).toBe(400);
     });
   });
@@ -321,7 +324,7 @@ describeWithDb('jobs API (Postgres)', () => {
     });
 
     async function page(query: string): Promise<LightMyRequestResponse> {
-      return app.inject({ method: 'GET', url: `/queues/${queue}/jobs${query}` });
+      return api({ method: 'GET', url: `/queues/${queue}/jobs${query}` });
     }
 
     async function collectAll(baseQuery: string): Promise<{ ids: string[]; pages: number[] }> {
@@ -372,7 +375,7 @@ describeWithDb('jobs API (Postgres)', () => {
     });
 
     it('returns 404 for an unknown queue without creating it', async () => {
-      const res = await app.inject({ method: 'GET', url: '/queues/never-created/jobs' });
+      const res = await api({ method: 'GET', url: '/queues/never-created/jobs' });
       expect(res.statusCode).toBe(404);
       const { rows } = await db.pool.query("SELECT 1 FROM queues WHERE name = 'never-created'");
       expect(rows).toHaveLength(0);
@@ -420,7 +423,7 @@ describeWithDb('jobs API (Postgres)', () => {
       let cursor: string | null = null;
       do {
         const suffix: string = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
-        const res = await app.inject({
+        const res = await api({
           method: 'GET',
           url: `/queues/${queue}/jobs?limit=1${suffix}`,
         });

@@ -25,6 +25,8 @@ import {
   waitUntil,
   type TestDatabase,
 } from './helpers.js';
+import { authedInject, createTestApiKey, type Inject } from './auth-helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -37,6 +39,7 @@ describeWithRedis('wake-ups (Postgres + Redis)', { timeout: 30_000 }, () => {
   let admin: Redis;
   let prefix: string;
   let app: FastifyInstance;
+  let api: Inject;
   /** Enqueues without Redis: a "lost" wake-up. */
   let silentJobs: JobService;
   const cleanups: (() => Promise<unknown>)[] = [];
@@ -63,6 +66,7 @@ describeWithRedis('wake-ups (Postgres + Redis)', { timeout: 30_000 }, () => {
       pool: db.pool,
     });
     await app.ready();
+    api = authedInject(app, (await createTestApiKey(db.pool)).token);
     await waitUntil(async () => {
       const res = await app.inject({ method: 'GET', url: '/ready' });
       return res.json<{ status: string }>().status === 'ready';
@@ -113,7 +117,7 @@ describeWithRedis('wake-ups (Postgres + Redis)', { timeout: 30_000 }, () => {
   }
 
   async function enqueue(payload: unknown = {}, extra: Record<string, unknown> = {}) {
-    const res = await app.inject({
+    const res = await api({
       method: 'POST',
       url: '/queues/emails/jobs',
       payload: { payload, ...extra },
@@ -173,7 +177,11 @@ describeWithRedis('wake-ups (Postgres + Redis)', { timeout: 30_000 }, () => {
       WORKER_WAKEUP_FALLBACK_POLL_MS: '1500',
     });
     await untilPushModeIdle(runtime);
-    const { job } = await silentJobs.enqueue({ queue: 'emails' as QueueName, payload: {} });
+    const { job } = await silentJobs.enqueue({
+      tenantId: DEFAULT_TENANT_ID,
+      queue: 'emails' as QueueName,
+      payload: {},
+    });
     await sleep(500);
     expect(await status(job.id)).toBe('queued'); // no wake-up, not polled yet
     await waitUntil(async () => (await status(job.id)) === 'succeeded', { timeoutMs: 5_000 });
@@ -215,7 +223,11 @@ describeWithRedis('wake-ups (Postgres + Redis)', { timeout: 30_000 }, () => {
     await proxy.cut();
     await waitUntil(() => !runtime.worker.isPushMode, { timeoutMs: 3_000 });
     // Enqueued while Redis is unreachable for the worker: found by polling.
-    const { job } = await silentJobs.enqueue({ queue: 'emails' as QueueName, payload: {} });
+    const { job } = await silentJobs.enqueue({
+      tenantId: DEFAULT_TENANT_ID,
+      queue: 'emails' as QueueName,
+      payload: {},
+    });
     await waitUntil(async () => (await status(job.id)) === 'succeeded', { timeoutMs: 2_000 });
 
     await proxy.restore();
@@ -232,7 +244,7 @@ describeWithRedis('wake-ups (Postgres + Redis)', { timeout: 30_000 }, () => {
     await untilPushModeIdle(runtime);
     lease.mockClear();
     for (let i = 0; i < 5; i++) {
-      const res = await app.inject({
+      const res = await api({
         method: 'POST',
         url: '/queues/reports/jobs',
         payload: { payload: { i } },

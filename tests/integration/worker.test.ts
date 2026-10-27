@@ -18,6 +18,7 @@ import {
   describeWithDb,
   type TestDatabase,
 } from './helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -90,6 +91,7 @@ describeWithDb('worker (Postgres)', { timeout: 30_000 }, () => {
     maxAttempts?: number,
   ): Promise<string> {
     const { job } = await jobs.enqueue({
+      tenantId: DEFAULT_TENANT_ID,
       queue: queue as QueueName,
       payload,
       ...(maxAttempts !== undefined ? { maxAttempts } : {}),

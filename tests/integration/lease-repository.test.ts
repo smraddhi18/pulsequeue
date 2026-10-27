@@ -11,6 +11,7 @@ import {
   describeWithDb,
   type TestDatabase,
 } from './helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 interface JobRow {
   status: string;
@@ -60,6 +61,7 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     opts: { priority?: number; delayMs?: number; maxAttempts?: number; payload?: unknown } = {},
   ): Promise<string> {
     const { job } = await jobs.enqueue({
+      tenantId: DEFAULT_TENANT_ID,
       queue: queue as QueueName,
       payload: opts.payload ?? {},
       ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
@@ -142,6 +144,7 @@ describeWithDb('LeaseRepository (Postgres)', () => {
     it('never leases a runAt or delayMs job early; leases it once due, by priority', async () => {
       const viaRunAt = (
         await jobs.enqueue({
+          tenantId: DEFAULT_TENANT_ID,
           queue: 'q' as QueueName,
           payload: { kind: 'runAt' },
           runAt: new Date(Date.now() + 3_600_000),

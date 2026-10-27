@@ -6,6 +6,7 @@ import { QueueRepository } from '../../src/repositories/queue.repository.js';
 import { QueueStatsRepository } from '../../src/repositories/stats.repository.js';
 import { JobService } from '../../src/services/job.service.js';
 import { createTestDatabase, describeWithDb, type TestDatabase } from './helpers.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 describeWithDb('QueueStatsRepository (Postgres)', () => {
   let db: TestDatabase;
@@ -33,6 +34,7 @@ describeWithDb('QueueStatsRepository (Postgres)', () => {
   const enqueue = async (queue: string, delayMs?: number) =>
     (
       await jobs.enqueue({
+        tenantId: DEFAULT_TENANT_ID,
         queue: queue as QueueName,
         payload: {},
         ...(delayMs !== undefined ? { delayMs } : {}),
@@ -40,7 +42,7 @@ describeWithDb('QueueStatsRepository (Postgres)', () => {
     ).job.id;
 
   it('returns null for an unknown queue', async () => {
-    expect(await stats.compute('nope' as QueueName)).toBeNull();
+    expect(await stats.compute(DEFAULT_TENANT_ID, 'nope' as QueueName)).toBeNull();
   });
 
   it('counts every status (zeros included) and only the requested queue', async () => {
@@ -65,18 +67,18 @@ describeWithDb('QueueStatsRepository (Postgres)', () => {
     });
     expect(running).toBeDefined();
 
-    const result = await stats.compute('q' as QueueName);
+    const result = await stats.compute(DEFAULT_TENANT_ID, 'q' as QueueName);
     expect(result).not.toBeNull();
     expect(result!.queue).toBe('q');
     expect(result!.counts).toEqual({ queued: 1, scheduled: 1, running: 1, succeeded: 1, dead: 1 });
     expect(result!.total).toBe(5);
     expect(ids).toHaveLength(4);
-    expect((await stats.compute('other' as QueueName))!.counts.queued).toBe(1);
+    expect((await stats.compute(DEFAULT_TENANT_ID, 'other' as QueueName))!.counts.queued).toBe(1);
   });
 
   it('reports the oldest queued, next scheduled and oldest running times on the DB clock', async () => {
     await enqueue('empty', 60_000);
-    const empty = await stats.compute('empty' as QueueName);
+    const empty = await stats.compute(DEFAULT_TENANT_ID, 'empty' as QueueName);
     expect(empty!.oldestQueuedAt).toBeNull();
     expect(empty!.oldestRunningSince).toBeNull();
 
@@ -91,7 +93,7 @@ describeWithDb('QueueStatsRepository (Postgres)', () => {
       `UPDATE jobs SET run_at = now() - interval '10 seconds' WHERE status = 'queued'`,
     );
 
-    const result = (await stats.compute('q' as QueueName))!;
+    const result = (await stats.compute(DEFAULT_TENANT_ID, 'q' as QueueName))!;
     const at = result.computedAt.getTime();
     expect(at - result.oldestQueuedAt!.getTime()).toBeGreaterThanOrEqual(10_000);
     expect(at - result.oldestQueuedAt!.getTime()).toBeLessThan(15_000);

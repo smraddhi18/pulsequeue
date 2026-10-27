@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildApp } from '../../src/app.js';
 import { ScheduleRepository } from '../../src/repositories/schedule.repository.js';
 import { createTestDatabase, describeWithDb, testEnv, type TestDatabase } from './helpers.js';
+import { authedInject, createTestApiKey, type Inject } from './auth-helpers.js';
 
 interface ScheduleBody {
   id: string;
@@ -34,6 +35,7 @@ const MAX_PAYLOAD_BYTES = 1024;
 describeWithDb('schedules API (Postgres)', () => {
   let db: TestDatabase;
   let app: FastifyInstance;
+  let api: Inject;
 
   beforeAll(async () => {
     db = await createTestDatabase();
@@ -43,6 +45,7 @@ describeWithDb('schedules API (Postgres)', () => {
       pool: db.pool,
     });
     await app.ready();
+    api = authedInject(app, (await createTestApiKey(db.pool)).token);
   });
 
   afterAll(async () => {
@@ -51,7 +54,7 @@ describeWithDb('schedules API (Postgres)', () => {
   });
 
   async function create(queue: string, body: Record<string, unknown>) {
-    return app.inject({ method: 'POST', url: `/queues/${queue}/schedules`, payload: body });
+    return api({ method: 'POST', url: `/queues/${queue}/schedules`, payload: body });
   }
 
   describe('POST /queues/:name/schedules', () => {
@@ -169,7 +172,7 @@ describeWithDb('schedules API (Postgres)', () => {
       let cursor: string | null = null;
       do {
         const url: string = `/queues/${queue}/schedules?limit=2${cursor ? `&cursor=${cursor}` : ''}`;
-        const res = await app.inject({ method: 'GET', url });
+        const res = await api({ method: 'GET', url });
         expect(res.statusCode).toBe(200);
         const page = res.json<{ data: ScheduleBody[]; nextCursor: string | null }>();
         seen.push(...page.data.map((s) => s.id));
@@ -177,7 +180,7 @@ describeWithDb('schedules API (Postgres)', () => {
       } while (cursor);
       expect(seen).toEqual([...ids].reverse());
 
-      const paused = await app.inject({
+      const paused = await api({
         method: 'GET',
         url: `/queues/${queue}/schedules?enabled=false`,
       });
@@ -185,9 +188,9 @@ describeWithDb('schedules API (Postgres)', () => {
     });
 
     it('404s for an unknown queue and 400s for a bad cursor', async () => {
-      const missing = await app.inject({ method: 'GET', url: '/queues/nope-q/schedules' });
+      const missing = await api({ method: 'GET', url: '/queues/nope-q/schedules' });
       expect(missing.statusCode).toBe(404);
-      const badCursor = await app.inject({
+      const badCursor = await api({
         method: 'GET',
         url: '/queues/reports/schedules?cursor=garbage',
       });
@@ -203,33 +206,29 @@ describeWithDb('schedules API (Postgres)', () => {
       await db.pool.query(`UPDATE schedules SET last_error = 'boom' WHERE id = $1`, [id]);
 
       for (let i = 0; i < 2; i++) {
-        const res = await app.inject({ method: 'POST', url: `/schedules/${id}/pause` });
+        const res = await api({ method: 'POST', url: `/schedules/${id}/pause` });
         expect(res.statusCode).toBe(200);
         expect(res.json<ScheduleBody>()).toMatchObject({ enabled: false, nextRunAt: null });
       }
       for (let i = 0; i < 2; i++) {
-        const res = await app.inject({ method: 'POST', url: `/schedules/${id}/resume` });
+        const res = await api({ method: 'POST', url: `/schedules/${id}/resume` });
         expect(res.statusCode).toBe(200);
         const body = res.json<ScheduleBody>();
         expect(body).toMatchObject({ enabled: true, lastError: null });
         expect(new Date(body.nextRunAt ?? '').getUTCMinutes() % 5).toBe(0);
       }
 
-      const got = await app.inject({ method: 'GET', url: `/schedules/${id}` });
+      const got = await api({ method: 'GET', url: `/schedules/${id}` });
       expect(got.json<ScheduleBody>().id).toBe(id);
 
-      expect((await app.inject({ method: 'DELETE', url: `/schedules/${id}` })).statusCode).toBe(
-        204,
-      );
-      expect((await app.inject({ method: 'DELETE', url: `/schedules/${id}` })).statusCode).toBe(
-        404,
-      );
-      expect((await app.inject({ method: 'GET', url: `/schedules/${id}` })).statusCode).toBe(404);
+      expect((await api({ method: 'DELETE', url: `/schedules/${id}` })).statusCode).toBe(204);
+      expect((await api({ method: 'DELETE', url: `/schedules/${id}` })).statusCode).toBe(404);
+      expect((await api({ method: 'GET', url: `/schedules/${id}` })).statusCode).toBe(404);
     });
 
     it('400s for a non-UUID id and 404s for an unknown one', async () => {
-      expect((await app.inject({ method: 'GET', url: '/schedules/x' })).statusCode).toBe(400);
-      const res = await app.inject({ method: 'POST', url: `/schedules/${randomUUID()}/pause` });
+      expect((await api({ method: 'GET', url: '/schedules/x' })).statusCode).toBe(400);
+      const res = await api({ method: 'POST', url: `/schedules/${randomUUID()}/pause` });
       expect(res.statusCode).toBe(404);
     });
   });
