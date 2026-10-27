@@ -31,6 +31,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       # Milestone 5: wake-ups and the stats cache are tested against a real Redis.
+      # Milestone 6: so are the enqueue rate limiter's token buckets.
       redis:
         image: redis:7-alpine
         ports:
@@ -108,6 +109,35 @@ jobs:
           cat scheduler.log
           grep -q '"event":"scheduler.leader_acquired"' scheduler.log
           grep -q '"event":"scheduler.leader_released"' scheduler.log
+
+      # Milestone 6: the API requires keys. Bootstraps the first admin key with
+      # the compiled CLI (as an operator would), boots the compiled API, and
+      # checks public probes, 401 without a key, and the enqueue rate limit
+      # (burst 2: two 201s with RateLimit-* headers, then 429 + Retry-After).
+      - name: API smoke test (CLI key bootstrap, auth, rate limit)
+        env:
+          NODE_ENV: production
+          REDIS_URL: redis://localhost:6379
+          PORT: 3100
+          RATE_LIMIT_TENANT_PER_SEC: 1
+          RATE_LIMIT_TENANT_BURST: 2
+        run: |
+          token=$(npm run --silent api-key -- create --tenant ci --role admin --name ci-smoke --create-tenant | jq -r .token)
+          node dist/server.js > api.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 30); do curl -sf localhost:3100/health > /dev/null && break; sleep 0.5; done
+          curl -sf localhost:3100/ready
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3100/queues/smoke/jobs)" = 401
+          enqueue() {
+            curl -s -o /dev/null -D - -w '%{http_code}\n' -X POST localhost:3100/queues/smoke/jobs \
+              -H "authorization: Bearer $token" -H 'content-type: application/json' -d '{"payload":{}}'
+          }
+          enqueue | tee r1.txt; grep -qi '^ratelimit-remaining: 1' r1.txt; tail -n1 r1.txt | grep -q 201
+          enqueue | tee r2.txt; tail -n1 r2.txt | grep -q 201
+          enqueue | tee r3.txt; grep -qi '^retry-after: 1' r3.txt; tail -n1 r3.txt | grep -q 429
+          kill -TERM "$pid"
+          wait "$pid"
+          cat api.log
 
       # Unit tests plus integration tests (each suite migrates its own schema).
       - name: Test
