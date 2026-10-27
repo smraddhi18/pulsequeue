@@ -1,10 +1,11 @@
-import type { QueueSignals } from '../domain/signals.js';
+import { queueRefKey, type QueueRef, type QueueSignals } from '../domain/signals.js';
 import type { StatsInvalidator } from './stats-invalidator.js';
 import type { WakeupPublisher } from './wakeup-publisher.js';
 
 /**
- * QueueSignals backed by Redis: jobsRunnable publishes a wake-up and
- * invalidates stats, jobsChanged only invalidates. Either half may be absent
+ * QueueSignals backed by Redis: jobsRunnable publishes a wake-up (by queue
+ * name: the worker fleet is shared by all tenants) and invalidates the
+ * tenant's cached stats, jobsChanged only invalidates. Either half may be absent
  * (WAKEUP_ENABLED / STATS_CACHE_ENABLED). Never throws.
  */
 export class RedisQueueSignals implements QueueSignals {
@@ -13,13 +14,13 @@ export class RedisQueueSignals implements QueueSignals {
     private readonly invalidator: StatsInvalidator | null,
   ) {}
 
-  jobsRunnable(queue: string): void {
-    this.publisher?.notify(queue);
-    this.invalidator?.invalidate(queue);
+  jobsRunnable(queue: QueueRef): void {
+    this.publisher?.notify(queue.name);
+    this.invalidator?.invalidate(queueRefKey(queue));
   }
 
-  jobsChanged(queue: string): void {
-    this.invalidator?.invalidate(queue);
+  jobsChanged(queue: QueueRef): void {
+    this.invalidator?.invalidate(queueRefKey(queue));
   }
 
   /** Deliver coalesced, not-yet-sent signals (graceful shutdown). */

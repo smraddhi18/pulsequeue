@@ -1,6 +1,7 @@
 import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
 import type { RedisEnv } from '../config/env.js';
 import type { StructuredLogger } from '../lib/logger.js';
+import type { RateLimitStore } from '../services/rate-limiter.js';
 import type { StatsCacheStore } from '../services/stats-cache.js';
 import {
   closeRedisClient,
@@ -11,6 +12,7 @@ import {
 } from './client.js';
 import { redisKeys, type RedisKeys } from './keys.js';
 import { RedisQueueSignals } from './queue-signals.js';
+import { RedisRateLimitStore } from './rate-limit-store.js';
 import { RedisStatsCacheStore } from './stats-cache-store.js';
 import { StatsInvalidator } from './stats-invalidator.js';
 import { WakeupPublisher } from './wakeup-publisher.js';
@@ -20,6 +22,7 @@ export * from './client.js';
 export * from './coalescer.js';
 export * from './keys.js';
 export * from './queue-signals.js';
+export * from './rate-limit-store.js';
 export * from './stats-cache-store.js';
 export * from './stats-invalidator.js';
 export * from './wakeup-publisher.js';
@@ -32,6 +35,8 @@ export interface CreateRedisServicesOptions {
   role: RedisRole;
   /** Process identity (worker / scheduler id); used in connection names and wake-up sources. */
   id: string;
+  /** API with RATE_LIMIT_ENABLED (M6): create the token-bucket store. */
+  rateLimit?: boolean;
 }
 
 /**
@@ -46,6 +51,8 @@ export interface RedisServices {
   signals: QueueSignals;
   /** API with STATS_CACHE_ENABLED: the Redis stats cache store. */
   statsStore: StatsCacheStore | null;
+  /** API with rate limiting on: the Redis token-bucket store. */
+  rateLimitStore: RateLimitStore | null;
   /** Readiness probe (null when disabled). */
   probe: (() => Promise<void>) | null;
   /** Flush pending signals, then close the connection. Idempotent. */
@@ -58,13 +65,17 @@ export function createRedisServices(
   options: CreateRedisServicesOptions,
 ): RedisServices {
   const keys = redisKeys(env.REDIS_KEY_PREFIX);
-  if (env.REDIS_URL === undefined || (!env.WAKEUP_ENABLED && !env.STATS_CACHE_ENABLED)) {
+  const rateLimit = options.rateLimit === true && options.role === 'api';
+  if (
+    env.REDIS_URL === undefined ||
+    (!env.WAKEUP_ENABLED && !env.STATS_CACHE_ENABLED && !rateLimit)
+  ) {
     options.logger.info(
       {
         event: 'redis.disabled',
         reason: env.REDIS_URL === undefined ? 'no_url' : 'all_features_off',
       },
-      'Redis disabled: workers poll, stats are computed from Postgres',
+      'Redis disabled: workers poll, stats are computed from Postgres, enqueues are not rate limited',
     );
     return {
       client: null,
@@ -72,6 +83,7 @@ export function createRedisServices(
       settings: null,
       signals: NOOP_QUEUE_SIGNALS,
       statsStore: null,
+      rateLimitStore: null,
       probe: null,
       close: async () => undefined,
     };
@@ -108,6 +120,7 @@ export function createRedisServices(
     env.STATS_CACHE_ENABLED && options.role === 'api'
       ? new RedisStatsCacheStore({ client, keys, ttlMs })
       : null;
+  const rateLimitStore = rateLimit ? new RedisRateLimitStore({ client, keys }) : null;
 
   let closing: Promise<void> | undefined;
   return {
@@ -116,6 +129,7 @@ export function createRedisServices(
     settings,
     signals,
     statsStore,
+    rateLimitStore,
     probe: () => pingRedis(client),
     close: () => {
       closing ??= (async () => {
