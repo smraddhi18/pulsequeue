@@ -1,4 +1,5 @@
 import type { Job, JobId, QueueName } from './job.js';
+import type { TenantId } from './tenant.js';
 
 /**
  * Dead-letter queue model (Milestone 3).
@@ -69,6 +70,7 @@ export interface DeadLetteredJobWithAttempts extends DeadLetteredJob {
 }
 
 export interface ListDeadLettersInput {
+  tenantId: TenantId;
   queue: QueueName;
   reason?: DeadLetterReason;
   limit: number;
@@ -81,6 +83,7 @@ export interface DeadLetterPage {
 }
 
 export interface ReplayJobInput {
+  tenantId: TenantId;
   queue: QueueName;
   jobId: JobId;
   /** Run after this delay instead of immediately. */
@@ -88,6 +91,7 @@ export interface ReplayJobInput {
 }
 
 export interface BulkReplayInput {
+  tenantId: TenantId;
   queue: QueueName;
   limit: number;
   reason?: DeadLetterReason;
@@ -100,6 +104,7 @@ export interface BulkReplayResult {
 }
 
 export interface PurgeDeadLettersInput {
+  tenantId: TenantId;
   queue: QueueName;
   /** Only jobs dead-lettered strictly before this instant. */
   olderThan: Date;

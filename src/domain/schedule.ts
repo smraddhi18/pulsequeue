@@ -4,6 +4,7 @@
  * ordinary job, so everything downstream (leasing, retries, DLQ) is unchanged.
  */
 import type { JobId, QueueName } from './job.js';
+import type { TenantId } from './tenant.js';
 
 export const MISFIRE_POLICIES = ['skip', 'fire_once', 'catch_up'] as const;
 
@@ -45,6 +46,7 @@ export interface Schedule {
 
 /** Validated create request (HTTP shape already checked by the route). */
 export interface CreateScheduleInput {
+  tenantId: TenantId;
   queue: QueueName;
   name: string;
   cron: string;
@@ -58,6 +60,7 @@ export interface CreateScheduleInput {
 }
 
 export interface ListSchedulesInput {
+  tenantId: TenantId;
   queue: QueueName;
   enabled?: boolean;
   limit: number;

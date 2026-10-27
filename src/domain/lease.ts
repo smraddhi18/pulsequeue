@@ -1,5 +1,7 @@
 import type { DeadLetterReason } from './dead-letter.js';
 import type { JobId, QueueName } from './job.js';
+import type { QueueRef } from './signals.js';
+import type { TenantId } from './tenant.js';
 
 /**
  * Leasing model (Milestone 2).
@@ -20,7 +22,15 @@ export interface LeaseRef {
 
 /** A job as handed to a worker: what the handler needs plus the lease. */
 export interface LeasedJob extends LeaseRef {
+  /** Owner of the job's queue (M6): workers serve every tenant's queue of a name. */
+  tenantId: TenantId;
   queue: QueueName;
+  /**
+   * The queue has a max_concurrency (M6). Finishing such a job frees a slot
+   * other workers may be waiting for, so it is announced like new work.
+   * Optional: absent means uncapped.
+   */
+  queueCapped?: boolean;
   payload: unknown;
   priority: number;
   /** Counted attempts including this one (1-based); drives retry decisions. */
@@ -45,6 +55,7 @@ export type FailureDisposition =
 /** A job whose expired lease the reaper reclaimed. */
 export interface ReclaimedJob {
   jobId: JobId;
+  tenantId: TenantId;
   queue: QueueName;
   /** The worker that held the expired lease. */
   previousWorkerId: string;
@@ -56,4 +67,9 @@ export interface ReclaimedJob {
   deadLetterReason: DeadLetterReason | null;
   /** Lease expiries so far, including this one (poison-message counter). */
   leaseExpiries: number;
+}
+
+/** The queue a leased or reclaimed job belongs to, for signals. */
+export function jobQueueRef(job: { tenantId: TenantId; queue: QueueName }): QueueRef {
+  return { tenantId: job.tenantId, name: job.queue };
 }

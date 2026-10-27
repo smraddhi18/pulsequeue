@@ -78,3 +78,29 @@ export {
   type StatsCacheStatus,
   type StatsStatus,
 } from './stats.js';
+
+export {
+  API_KEY_LIMITS,
+  API_KEY_ROLES,
+  DEFAULT_TENANT_ID,
+  TENANT_ID_PATTERN,
+  roleAllows,
+  type ApiKey,
+  type ApiKeyPage,
+  type ApiKeyRole,
+  type CreateApiKeyInput,
+  type IssuedApiKey,
+  type ListApiKeysInput,
+  type Permission,
+  type Principal,
+  type RateLimit,
+  type RotateApiKeyInput,
+  type Tenant,
+  type TenantId,
+} from './tenant.js';
+
+export {
+  QUEUE_SETTINGS_LIMITS,
+  type QueueSettings,
+  type UpdateQueueSettingsInput,
+} from './queue.js';

@@ -4,6 +4,8 @@
  * product policy the API applies on top (they may be tighter than the DB).
  */
 
+import type { TenantId } from './tenant.js';
+
 export const JOB_STATUSES = [
   'queued',
   'scheduled',
@@ -58,6 +60,8 @@ export type QueueName = string & { readonly __brand: 'QueueName' };
 
 export interface Queue {
   id: string;
+  /** Owner (M6). Queue names are unique per tenant, not globally. */
+  tenantId: TenantId;
   name: QueueName;
   createdAt: Date;
 }
@@ -80,6 +84,8 @@ export interface Job {
 
 /** Validated enqueue request (HTTP shape already checked by the route). */
 export interface EnqueueJobInput {
+  /** The authenticated caller's tenant; the queue is resolved inside it. */
+  tenantId: TenantId;
   queue: QueueName;
   payload: unknown;
   priority?: number;
@@ -101,6 +107,7 @@ export interface EnqueueJobResult {
 }
 
 export interface ListJobsInput {
+  tenantId: TenantId;
   queue: QueueName;
   status?: JobStatus;
   limit: number;

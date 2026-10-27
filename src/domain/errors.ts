@@ -15,12 +15,15 @@ export type ErrorCode =
   | 'JOB_NOT_DEAD_LETTERED'
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
+  | 'RATE_LIMITED'
   | 'SERVICE_UNAVAILABLE';
 
 export class AppError extends Error {
   readonly statusCode: number;
   readonly code: ErrorCode;
   readonly details?: unknown;
+  /** Response headers the error requires (WWW-Authenticate, Retry-After, ...). */
+  readonly headers?: Readonly<Record<string, string>>;
   readonly isOperational: boolean;
 
   constructor(
@@ -29,6 +32,7 @@ export class AppError extends Error {
       statusCode?: number;
       code?: ErrorCode;
       details?: unknown;
+      headers?: Record<string, string>;
       cause?: unknown;
       isOperational?: boolean;
     } = {},
@@ -39,6 +43,9 @@ export class AppError extends Error {
     this.code = options.code ?? 'INTERNAL_ERROR';
     if (options.details !== undefined) {
       this.details = options.details;
+    }
+    if (options.headers !== undefined) {
+      this.headers = options.headers;
     }
     this.isOperational = options.isOperational ?? true;
     Object.setPrototypeOf(this, new.target.prototype);
@@ -132,24 +139,49 @@ export class JobNotDeadLetteredError extends AppError {
   }
 }
 
+/** 401: no usable credentials. Carries the RFC 6750 challenge header. */
 export class UnauthorizedError extends AppError {
   constructor(message = 'Unauthorized') {
-    super(message, { statusCode: 401, code: 'UNAUTHORIZED' });
+    super(message, {
+      statusCode: 401,
+      code: 'UNAUTHORIZED',
+      headers: { 'www-authenticate': 'Bearer realm="pulsequeue"' },
+    });
   }
 }
 
+/** 403: authenticated, but the key's role does not allow the operation. */
 export class ForbiddenError extends AppError {
-  constructor(message = 'Forbidden') {
-    super(message, { statusCode: 403, code: 'FORBIDDEN' });
+  constructor(message = 'Forbidden', details?: unknown) {
+    super(message, {
+      statusCode: 403,
+      code: 'FORBIDDEN',
+      ...(details !== undefined ? { details } : {}),
+    });
+  }
+}
+
+/**
+ * 429: the tenant or queue spent its enqueue budget (M6). `headers` carries
+ * Retry-After (whole seconds, at least 1) plus the RateLimit-* fields.
+ */
+export class RateLimitedError extends AppError {
+  constructor(message: string, details: unknown, headers: Record<string, string>) {
+    super(message, { statusCode: 429, code: 'RATE_LIMITED', details, headers });
   }
 }
 
 export class ServiceUnavailableError extends AppError {
-  constructor(message = 'Service unavailable', details?: unknown) {
+  constructor(
+    message = 'Service unavailable',
+    details?: unknown,
+    headers?: Record<string, string>,
+  ) {
     super(message, {
       statusCode: 503,
       code: 'SERVICE_UNAVAILABLE',
       ...(details !== undefined ? { details } : {}),
+      ...(headers !== undefined ? { headers } : {}),
     });
   }
 }
