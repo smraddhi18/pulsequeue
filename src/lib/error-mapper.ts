@@ -12,6 +12,7 @@ export interface ErrorResponseBody {
 export interface MappedError {
   statusCode: number;
   body: ErrorResponseBody;
+  headers?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -30,7 +31,11 @@ export function mapErrorToResponse(err: unknown): MappedError {
     if (err.details !== undefined) {
       body.error.details = err.details;
     }
-    return { statusCode: err.statusCode, body };
+    return {
+      statusCode: err.statusCode,
+      body,
+      ...(err.headers !== undefined ? { headers: err.headers } : {}),
+    };
   }
 
   if (err instanceof ZodError) {
