@@ -7,6 +7,7 @@ import { NonRetryableError } from '../../src/worker/errors.js';
 import { Worker, type WorkerOptions } from '../../src/worker/worker.js';
 import { RecordingSignals } from '../support/recording-signals.js';
 import { FakeLeaseStore, silentLogger, waitFor } from './fake-store.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 /** FakeLeaseStore plus the optional nextDueInMs a push-mode worker uses. */
 class DueAwareStore extends FakeLeaseStore {
@@ -238,12 +239,30 @@ describe('Worker signals (Milestone 5)', () => {
   });
 });
 
+describe('Worker signals for capped queues (Milestone 6)', () => {
+  it('announces a finished capped job as runnable: a concurrency slot just freed', async () => {
+    const store = new FakeLeaseStore();
+    store.cappedQueues.add('q');
+    const signals = new RecordingSignals();
+    const ok = store.add('q');
+    const dead = store.add('q', { kind: 'dead' });
+    makeWorker(store, { signals, concurrency: 1 }, async (ctx) => {
+      if ((ctx.job.payload as { kind?: string }).kind === 'dead') throw new NonRetryableError('x');
+    }).start();
+    await waitFor(() => ok.status === 'succeeded' && dead.status === 'dead');
+    await waitFor(() => signals.runnable().length >= 2);
+    // completed + dead-lettered; the leases themselves are only changes.
+    expect(signals.runnable()).toEqual(['q', 'q']);
+  });
+});
+
 describe('Reaper signals (Milestone 5)', () => {
   it('requeued jobs are runnable, dead-lettered ones only change stats', async () => {
     const signals = new RecordingSignals();
     const reclaimed: ReclaimedJob[] = [
       {
         jobId: 'a' as JobId,
+        tenantId: DEFAULT_TENANT_ID,
         queue: 'emails' as QueueName,
         previousWorkerId: 'w1',
         attempt: 1,
@@ -254,6 +273,7 @@ describe('Reaper signals (Milestone 5)', () => {
       },
       {
         jobId: 'b' as JobId,
+        tenantId: DEFAULT_TENANT_ID,
         queue: 'reports' as QueueName,
         previousWorkerId: 'w1',
         attempt: 3,

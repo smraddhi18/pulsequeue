@@ -11,6 +11,7 @@ import {
 } from '../../src/worker/worker.js';
 import { Reaper } from '../../src/worker/reaper.js';
 import { FakeLeaseStore, silentLogger, waitFor } from './fake-store.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 const workers: Worker[] = [];
 
@@ -458,6 +459,7 @@ describe('Reaper', () => {
           return [
             {
               jobId: 'p' as JobId,
+              tenantId: DEFAULT_TENANT_ID,
               queue: 'q' as QueueName,
               previousWorkerId: 'w1',
               attempt: 2,

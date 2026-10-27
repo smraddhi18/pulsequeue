@@ -6,6 +6,7 @@ import type {
   LeaseJobsParams,
 } from '../../src/repositories/lease.repository.js';
 import type { LeaseStore } from '../../src/worker/worker.js';
+import { DEFAULT_TENANT_ID } from '../../src/domain/tenant.js';
 
 export const silentLogger = pino({ level: 'silent' });
 
@@ -37,6 +38,8 @@ export class FakeLeaseStore implements LeaseStore {
   loseLeases = false;
   /** Called at the start of every lease() call (e.g. to trigger stop mid-lease). */
   onLease: (() => void) | null = null;
+  /** Queues reported as having a max_concurrency (M6). */
+  readonly cappedQueues = new Set<string>();
   maxConcurrentRunning = 0;
   private seq = 0;
 
@@ -84,7 +87,9 @@ export class FakeLeaseStore implements LeaseStore {
       job.attemptStatuses.push('running');
       out.push({
         jobId: job.id as JobId,
+        tenantId: DEFAULT_TENANT_ID,
         queue: job.queue as QueueName,
+        ...(this.cappedQueues.has(job.queue) ? { queueCapped: true } : {}),
         payload: job.payload,
         priority: 0,
         attempt: job.attempts,

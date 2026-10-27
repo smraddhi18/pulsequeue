@@ -8,6 +8,7 @@ function ctx(payload: unknown, attempt = 1, signal = new AbortController().signa
   return {
     job: {
       id: 'j',
+      tenantId: 'default',
       queue: 'demo',
       payload,
       priority: 0,
