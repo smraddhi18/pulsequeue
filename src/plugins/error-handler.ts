@@ -20,6 +20,7 @@ export async function registerErrorHandler(app: FastifyInstance): Promise<void> 
       );
     }
 
+    if (mapped.headers) reply.headers(mapped.headers);
     return reply.status(mapped.statusCode).send(mapped.body);
   });
 
