@@ -1,5 +1,6 @@
 import type { DeadLetterReason, JobAttempt } from '../domain/dead-letter.js';
 import type { JobId } from '../domain/job.js';
+import type { TenantId } from '../domain/tenant.js';
 import { runQuery } from '../db/query.js';
 import type { Queryable } from '../db/pool.js';
 import { JOB_COLUMNS, toStoredJob, type JobRow, type StoredJob } from './job.repository.js';
@@ -110,15 +111,15 @@ function toStoredDeadLetter(row: DeadLetterRow): StoredDeadLetterJob {
 export class DeadLetterRepository {
   constructor(private readonly db: Queryable) {}
 
-  /** Any job by id with its DLQ columns (callers check status). */
-  async findById(id: string): Promise<StoredDeadLetterJob | null> {
+  /** Any job of `tenantId` by id with its DLQ columns (callers check status). */
+  async findById(tenantId: TenantId, id: string): Promise<StoredDeadLetterJob | null> {
     const rows = await runQuery<DeadLetterRow>(
       this.db,
       `SELECT ${DLQ_COLUMNS}
        FROM jobs j
        JOIN queues q ON q.id = j.queue_id
-       WHERE j.id = $1`,
-      [id],
+       WHERE j.id = $1 AND q.tenant_id = $2`,
+      [id, tenantId],
     );
     return rows[0] ? toStoredDeadLetter(rows[0]) : null;
   }

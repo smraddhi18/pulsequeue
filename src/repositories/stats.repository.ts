@@ -1,6 +1,7 @@
 import type { QueueName } from '../domain/job.js';
 import { STATS_STATUSES, type QueueStats, type QueueStatusCounts } from '../domain/stats.js';
 import { runQuery } from '../db/query.js';
+import type { TenantId } from '../domain/tenant.js';
 import type { Queryable } from '../db/pool.js';
 
 interface StatsRow {
@@ -33,7 +34,7 @@ export class QueueStatsRepository {
   constructor(private readonly db: Queryable) {}
 
   /** Snapshot for one queue, or null when the queue does not exist. */
-  async compute(name: QueueName): Promise<QueueStats | null> {
+  async compute(tenantId: TenantId, name: QueueName): Promise<QueueStats | null> {
     const rows = await runQuery<StatsRow>(
       this.db,
       `SELECT q.name,
@@ -50,8 +51,8 @@ export class QueueStatsRepository {
                WHERE queue_id = q.id AND status = 'running') AS oldest_running_since,
               now() AS computed_at
        FROM queues q
-       WHERE q.name = $1`,
-      [name],
+       WHERE q.tenant_id = $1 AND q.name = $2`,
+      [tenantId, name],
     );
     const row = rows[0];
     if (!row) return null;

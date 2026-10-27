@@ -1,8 +1,9 @@
 import type { DeadLetterReason } from '../domain/dead-letter.js';
 import type { JobId, QueueName } from '../domain/job.js';
 import type { FailureDisposition, LeaseRef, LeasedJob, ReclaimedJob } from '../domain/lease.js';
+import type { TenantId } from '../domain/tenant.js';
 import { runQuery } from '../db/query.js';
-import type { Queryable } from '../db/pool.js';
+import type { Pool } from '../db/pool.js';
 
 export interface LeaseJobsParams {
   /** Queues this worker has handlers for. */
@@ -34,7 +35,9 @@ export interface ReapExpiredOptions {
 
 interface LeasedRow {
   id: string;
+  tenant_id: string;
   queue_name: string;
+  max_concurrency: number | null;
   payload: unknown;
   priority: number;
   attempts: number;
@@ -49,6 +52,7 @@ interface LeasedRow {
 
 interface ReclaimedRow {
   id: string;
+  tenant_id: string;
   queue_name: string;
   previous_worker_id: string;
   attempts: number;
@@ -73,54 +77,20 @@ export function truncateError(message: string): string {
 }
 
 /**
- * All SQL for the worker side of the queue: lease, heartbeat, complete, fail,
- * release and reap. Every statement is a single round-trip; multi-table
- * changes use data-modifying CTEs, so each is atomic in its own implicit
- * transaction and no row lock is held across a network round-trip or while a
- * handler runs.
- *
- * Every write after the lease is fenced on (id, status = 'running',
- * lease_token): it affects zero rows if the lease was lost, and the caller is
- * told so instead of silently clobbering the current owner.
+ * A queued row that may start now. Defensive: queued rows are due by
+ * construction (promotion and immediate enqueues set run_at <= now()), but a
+ * skewed producer clock must never let a job start early. And a runnable row
+ * must have budget left, otherwise the increment in the lease would violate
+ * jobs_attempts_within_max and fail the whole batch on every poll.
  */
-export class LeaseRepository {
-  constructor(private readonly db: Queryable) {}
+const READY = `j.status = 'queued' AND j.run_at <= now() AND j.attempts < j.max_attempts`;
 
-  /**
-   * Lease up to `limit` runnable jobs from `queues`.
-   *
-   * Two statements. First, due `scheduled` jobs (delayed enqueues, retry
-   * backoffs, delayed replays) of these queues are promoted to `queued`
-   * (see promoteDue). Then the lease itself: FOR UPDATE SKIP LOCKED makes
-   * concurrent workers partition the ready set instead of queueing on each
-   * other's row locks: a row another transaction is leasing right now is
-   * skipped, not waited for. The candidate scan walks jobs_ready_idx (queued
-   * rows only) in (priority DESC, run_at, id) order, so it never reads a job
-   * that is not due yet. Each leased job gets a fresh lease token, attempts + 1
-   * and a `running` job_attempts row, all in the same statement.
-   */
-  async lease(params: LeaseJobsParams): Promise<LeasedJob[]> {
-    if (params.limit <= 0 || params.queues.length === 0) return [];
-    await this.promoteDue(params.queues, Math.max(params.limit, PROMOTE_BATCH_SIZE));
-    const rows = await runQuery<LeasedRow>(
-      this.db,
-      `WITH candidates AS (
-         SELECT j.id
-         FROM jobs j
-         WHERE j.queue_id IN (SELECT q.id FROM queues q WHERE q.name = ANY($1::text[]))
-           AND j.status = 'queued'
-           -- Defensive: queued rows are due by construction (promotion and
-           -- immediate enqueues set run_at <= now()), but a skewed producer
-           -- clock must never let a job start early.
-           AND j.run_at <= now()
-           -- Defensive: a runnable row must have budget left, otherwise the
-           -- increment below would violate jobs_attempts_within_max and fail
-           -- the whole batch on every poll.
-           AND j.attempts < j.max_attempts
-         ORDER BY j.priority DESC, j.run_at, j.id
-         LIMIT $2
-         FOR UPDATE SKIP LOCKED
-       ),
+/**
+ * The lease statement around a `candidates` CTE (ids of rows already locked
+ * FOR UPDATE SKIP LOCKED). $3 = worker id, $4 = lease ms.
+ */
+function leaseStatement(candidateCtes: string): string {
+  return `WITH ${candidateCtes.trim()},
        leased AS (
          UPDATE jobs j
          SET status           = 'running',
@@ -147,30 +117,195 @@ export class LeaseRepository {
          FROM leased l
          RETURNING id, job_id, attempt_number
        )
-       SELECT l.id, q.name AS queue_name, l.payload, l.priority, l.attempts, l.max_attempts,
-              l.lease_token, l.locked_by, l.lease_expires_at, l.created_at,
-              a.id AS attempt_id, a.attempt_number
+       SELECT l.id, q.tenant_id, q.name AS queue_name, q.max_concurrency, l.payload, l.priority,
+              l.attempts, l.max_attempts, l.lease_token, l.locked_by, l.lease_expires_at,
+              l.created_at, a.id AS attempt_id, a.attempt_number
        FROM leased l
        JOIN attempt a ON a.job_id = l.id
        JOIN queues q ON q.id = l.queue_id
-       ORDER BY l.priority DESC, l.run_at, l.id`,
+       ORDER BY l.priority DESC, l.run_at, l.id`;
+}
+
+function toLeasedJob(row: LeasedRow): LeasedJob {
+  return {
+    jobId: row.id as JobId,
+    tenantId: row.tenant_id as TenantId,
+    queue: row.queue_name as QueueName,
+    queueCapped: row.max_concurrency !== null,
+    payload: row.payload,
+    priority: row.priority,
+    attempt: row.attempts,
+    maxAttempts: row.max_attempts,
+    attemptId: row.attempt_id,
+    attemptNumber: row.attempt_number,
+    leaseToken: row.lease_token,
+    workerId: row.locked_by,
+    leaseExpiresAt: row.lease_expires_at,
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * All SQL for the worker side of the queue: lease, heartbeat, complete, fail,
+ * release and reap. Every statement is a single round-trip; multi-table
+ * changes use data-modifying CTEs, so each is atomic in its own implicit
+ * transaction and no row lock is held across a network round-trip or while a
+ * handler runs.
+ *
+ * Every write after the lease is fenced on (id, status = 'running',
+ * lease_token): it affects zero rows if the lease was lost, and the caller is
+ * told so instead of silently clobbering the current owner.
+ */
+export class LeaseRepository {
+  constructor(private readonly db: Pool) {}
+
+  /**
+   * Lease up to `limit` runnable jobs from `queues`.
+   *
+   * First, due `scheduled` jobs (delayed enqueues, retry backoffs, delayed
+   * replays) of these queues are promoted to `queued` (see promoteDue). Then
+   * the lease itself: FOR UPDATE SKIP LOCKED makes concurrent workers
+   * partition the ready set instead of queueing on each other's row locks: a
+   * row another transaction is leasing right now is skipped, not waited for.
+   * The candidate scan walks jobs_ready_idx (queued rows only) in
+   * (priority DESC, run_at, id) order, so it never reads a job that is not
+   * due yet. Each leased job gets a fresh lease token, attempts + 1 and a
+   * `running` job_attempts row, all in the same statement.
+   *
+   * Queues with a max_concurrency (M6) take the capped path (leaseCapped);
+   * when none of `queues` is capped this is the single-statement M5 lease.
+   */
+  async lease(params: LeaseJobsParams): Promise<LeasedJob[]> {
+    if (params.limit <= 0 || params.queues.length === 0) return [];
+    await this.promoteDue(params.queues, Math.max(params.limit, PROMOTE_BATCH_SIZE));
+    // One probe on queues_name_idx; almost always empty.
+    const capped = await runQuery<{ id: string }>(
+      this.db,
+      `SELECT id FROM queues WHERE name = ANY($1::text[]) AND max_concurrency IS NOT NULL LIMIT 1`,
+      [params.queues],
+    );
+    if (capped.length > 0) return this.leaseCapped(params);
+    const rows = await runQuery<LeasedRow>(
+      this.db,
+      leaseStatement(`
+       candidates AS (
+         SELECT j.id
+         FROM jobs j
+         -- max_concurrency IS NULL: a queue capped since the probe above is
+         -- skipped for this poll rather than leased past its cap.
+         WHERE j.queue_id IN (
+                 SELECT q.id FROM queues q
+                 WHERE q.name = ANY($1::text[]) AND q.max_concurrency IS NULL)
+           AND ${READY}
+         ORDER BY j.priority DESC, j.run_at, j.id
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED
+       )`),
       [params.queues, params.limit, params.workerId, params.leaseMs],
     );
-    return rows.map((row) => ({
-      jobId: row.id as JobId,
-      queue: row.queue_name as QueueName,
-      payload: row.payload,
-      priority: row.priority,
-      attempt: row.attempts,
-      maxAttempts: row.max_attempts,
-      attemptId: row.attempt_id,
-      attemptNumber: row.attempt_number,
-      leaseToken: row.lease_token,
-      workerId: row.locked_by,
-      leaseExpiresAt: row.lease_expires_at,
-      createdAt: row.created_at,
-    }));
+    return rows.map(toLeasedJob);
   }
+
+  /**
+   * Lease with per-queue concurrency caps (M6), race-safe across any number
+   * of workers. In one transaction:
+   *
+   * 1. Lock the capped queue rows (FOR NO KEY UPDATE, in id order so two
+   *    workers can never deadlock). Every lease of a capped queue goes
+   *    through this lock, so "count running, then lease up to the rest" is
+   *    serialized per queue. NO KEY UPDATE does not conflict with the KEY
+   *    SHARE lock an enqueue's foreign key check takes: producers are never
+   *    blocked. It does serialize with a concurrent settings change.
+   * 2. Count running jobs per capped queue in a new statement, whose
+   *    snapshot (READ COMMITTED) includes whatever the previous lock holder
+   *    committed. A budget of max - running is what may start now.
+   * 3. Lease: uncapped queues as usual plus, per capped queue with budget
+   *    left, at most `budget` rows (LATERAL ... LIMIT budget), then the best
+   *    `limit` of those in priority order.
+   *
+   * Only leasing raises the running count; completions, failures, releases
+   * and the reaper only lower it, so they need no lock. The cost is that
+   * leases of one capped queue run one at a time (a few ms each); uncapped
+   * queues are untouched. Rows locked by step 3 but cut by the final LIMIT
+   * are unlocked at COMMIT, a moment later.
+   */
+  private async leaseCapped(params: LeaseJobsParams): Promise<LeasedJob[]> {
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+      const caps = await runQuery<{ id: string; max_concurrency: number }>(
+        client,
+        `SELECT id, max_concurrency FROM queues
+         WHERE name = ANY($1::text[]) AND max_concurrency IS NOT NULL
+         ORDER BY id
+         FOR NO KEY UPDATE`,
+        [params.queues],
+      );
+      const capIds = caps.map((c) => c.id);
+      const running = await runQuery<{ queue_id: string; running: number }>(
+        client,
+        `SELECT queue_id, count(*)::int AS running
+         FROM jobs
+         WHERE queue_id = ANY($1::bigint[]) AND status = 'running'
+         GROUP BY queue_id`,
+        [capIds],
+      );
+      const runningBy = new Map(running.map((r) => [r.queue_id, r.running]));
+      const budgets = caps
+        .map((c) => ({ id: c.id, budget: c.max_concurrency - (runningBy.get(c.id) ?? 0) }))
+        .filter((c) => c.budget > 0);
+
+      const rows = await runQuery<LeasedRow>(
+        client,
+        leaseStatement(`
+         uncapped AS (
+           SELECT j.id, j.priority, j.run_at
+           FROM jobs j
+           WHERE j.queue_id IN (
+                   SELECT q.id FROM queues q
+                   WHERE q.name = ANY($1::text[]) AND q.max_concurrency IS NULL)
+             AND ${READY}
+           ORDER BY j.priority DESC, j.run_at, j.id
+           LIMIT $2
+           FOR UPDATE SKIP LOCKED
+         ),
+         capped AS (
+           SELECT x.id, x.priority, x.run_at
+           FROM unnest($5::bigint[], $6::int[]) AS c(queue_id, budget)
+           CROSS JOIN LATERAL (
+             SELECT j.id, j.priority, j.run_at
+             FROM jobs j
+             WHERE j.queue_id = c.queue_id AND ${READY}
+             ORDER BY j.priority DESC, j.run_at, j.id
+             LIMIT least(c.budget, $2)
+             FOR UPDATE SKIP LOCKED
+           ) x
+         ),
+         candidates AS (
+           SELECT u.id
+           FROM (SELECT * FROM uncapped UNION ALL SELECT * FROM capped) u
+           ORDER BY u.priority DESC, u.run_at, u.id
+           LIMIT $2
+         )`),
+        [
+          params.queues,
+          params.limit,
+          params.workerId,
+          params.leaseMs,
+          budgets.map((b) => b.id),
+          budgets.map((b) => b.budget),
+        ],
+      );
+      await client.query('COMMIT');
+      return rows.map(toLeasedJob);
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Move up to `limit` due `scheduled` jobs of `queues` to `queued`, oldest
    * due first; returns how many moved.
@@ -410,7 +545,7 @@ export class LeaseRepository {
          FROM reclaimed r
          WHERE a.job_id = r.id AND a.status = 'running'
        )
-       SELECT r.id, q.name AS queue_name, r.previous_worker_id, r.attempts, r.max_attempts,
+       SELECT r.id, q.tenant_id, q.name AS queue_name, r.previous_worker_id, r.attempts, r.max_attempts,
               r.status::text AS status, r.dead_reason::text AS dead_reason, r.lease_expiries
        FROM reclaimed r
        JOIN queues q ON q.id = r.queue_id`,
@@ -418,6 +553,7 @@ export class LeaseRepository {
     );
     return rows.map((row) => ({
       jobId: row.id as JobId,
+      tenantId: row.tenant_id as TenantId,
       queue: row.queue_name as QueueName,
       previousWorkerId: row.previous_worker_id,
       attempt: row.attempts,

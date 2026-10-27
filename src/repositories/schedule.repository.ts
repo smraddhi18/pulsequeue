@@ -1,11 +1,14 @@
 import type { JobId, QueueName } from '../domain/job.js';
 import type { MisfirePolicy, Schedule, ScheduleId } from '../domain/schedule.js';
+import type { TenantId } from '../domain/tenant.js';
 import { runQuery } from '../db/query.js';
 import type { Queryable } from '../db/pool.js';
 
 /** Schedule as stored, including internal columns that never leave the service layer. */
 export interface StoredSchedule extends Schedule {
   queueId: string;
+  /** Owner of the schedule's queue (for signals; never in API responses). */
+  tenantId: TenantId;
   /** Exact created_at text (UTC, microseconds) for keyset cursors. */
   createdAtCursor: string;
 }
@@ -48,6 +51,7 @@ export interface RecordFireParams {
 interface ScheduleRow {
   id: string;
   queue_id: string;
+  tenant_id: string;
   queue_name: string;
   name: string;
   cron_expression: string;
@@ -69,16 +73,20 @@ interface ScheduleRow {
 
 /** Columns selected for every schedule read; `s` = schedules, `q` = queues. */
 const SCHEDULE_COLUMNS = `
-  s.id, s.queue_id::text AS queue_id, q.name AS queue_name, s.name, s.cron_expression,
+  s.id, s.queue_id::text AS queue_id, q.tenant_id, q.name AS queue_name, s.name, s.cron_expression,
   s.timezone, s.payload, s.priority, s.max_attempts, s.misfire_policy, s.enabled,
   s.next_run_at, s.last_run_at, s.last_job_id, s.fire_count::text AS fire_count,
   s.last_error, s.created_at, s.updated_at,
   to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_cursor`;
 
+/** Tenant scoping for statements on `schedules` keyed by id, with the tenant as $2. */
+const OWNED_BY_TENANT_2 = 'queue_id IN (SELECT id FROM queues WHERE tenant_id = $2)';
+
 function toStoredSchedule(row: ScheduleRow): StoredSchedule {
   return {
     id: row.id as ScheduleId,
     queueId: row.queue_id,
+    tenantId: row.tenant_id as TenantId,
     queue: row.queue_name as QueueName,
     name: row.name,
     cron: row.cron_expression,
@@ -155,14 +163,15 @@ export class ScheduleRepository {
     return toStoredSchedule(requireRow(rows));
   }
 
-  async findById(id: string): Promise<StoredSchedule | null> {
+  /** A schedule of `tenantId` by id; another tenant's schedule is null. */
+  async findById(tenantId: TenantId, id: string): Promise<StoredSchedule | null> {
     const rows = await runQuery<ScheduleRow>(
       this.db,
       `SELECT ${SCHEDULE_COLUMNS}
        FROM schedules s
        JOIN queues q ON q.id = s.queue_id
-       WHERE s.id = $1`,
-      [id],
+       WHERE s.id = $1 AND q.tenant_id = $2`,
+      [id, tenantId],
     );
     return rows[0] ? toStoredSchedule(rows[0]) : null;
   }
@@ -197,12 +206,12 @@ export class ScheduleRepository {
   }
 
   /** Disable an enabled schedule; null if it does not exist or is already paused. */
-  async pause(id: string): Promise<StoredSchedule | null> {
+  async pause(tenantId: TenantId, id: string): Promise<StoredSchedule | null> {
     return this.updateReturning(
       `UPDATE schedules SET enabled = false, next_run_at = NULL
-       WHERE id = $1 AND enabled
+       WHERE id = $1 AND enabled AND ${OWNED_BY_TENANT_2}
        RETURNING *`,
-      [id],
+      [id, tenantId],
     );
   }
 
@@ -211,21 +220,21 @@ export class ScheduleRepository {
    * paused period is not replayed) and clear its last error; null if it does
    * not exist or is already enabled.
    */
-  async resume(id: string, nextRunAt: Date): Promise<StoredSchedule | null> {
+  async resume(tenantId: TenantId, id: string, nextRunAt: Date): Promise<StoredSchedule | null> {
     return this.updateReturning(
-      `UPDATE schedules SET enabled = true, next_run_at = $2, last_error = NULL
-       WHERE id = $1 AND NOT enabled
+      `UPDATE schedules SET enabled = true, next_run_at = $3, last_error = NULL
+       WHERE id = $1 AND NOT enabled AND ${OWNED_BY_TENANT_2}
        RETURNING *`,
-      [id, nextRunAt],
+      [id, tenantId, nextRunAt],
     );
   }
 
   /** Delete a schedule (jobs it already enqueued are kept); false if unknown. */
-  async delete(id: string): Promise<boolean> {
+  async delete(tenantId: TenantId, id: string): Promise<boolean> {
     const rows = await runQuery<{ id: string }>(
       this.db,
-      'DELETE FROM schedules WHERE id = $1 RETURNING id',
-      [id],
+      `DELETE FROM schedules WHERE id = $1 AND ${OWNED_BY_TENANT_2} RETURNING id`,
+      [id, tenantId],
     );
     return rows.length > 0;
   }

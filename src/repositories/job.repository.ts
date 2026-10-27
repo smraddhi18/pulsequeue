@@ -1,4 +1,5 @@
 import type { Job, JobId, JobStatus, QueueName } from '../domain/job.js';
+import type { TenantId } from '../domain/tenant.js';
 import { runQuery } from '../db/query.js';
 import type { Queryable } from '../db/pool.js';
 
@@ -158,14 +159,15 @@ export class JobRepository {
     throw new Error('Idempotent job insert did not converge');
   }
 
-  async findById(id: string): Promise<StoredJob | null> {
+  /** A job of `tenantId` by id; another tenant's job is null (callers answer 404). */
+  async findById(tenantId: TenantId, id: string): Promise<StoredJob | null> {
     const rows = await runQuery<JobRow>(
       this.db,
       `SELECT ${JOB_COLUMNS}
        FROM jobs j
        JOIN queues q ON q.id = j.queue_id
-       WHERE j.id = $1`,
-      [id],
+       WHERE j.id = $1 AND q.tenant_id = $2`,
+      [id, tenantId],
     );
     return rows[0] ? toStoredJob(rows[0]) : null;
   }

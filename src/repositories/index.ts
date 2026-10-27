@@ -3,7 +3,7 @@
  * Queryable (pool or transaction client) and returns domain objects; driver
  * errors are translated to typed domain errors in db/query.ts.
  */
-export { QueueRepository } from './queue.repository.js';
+export { QueueRepository, type UpdateQueueSettingsParams } from './queue.repository.js';
 export {
   JobRepository,
   type StoredJob,
@@ -36,3 +36,12 @@ export {
   type RecordFireParams,
 } from './schedule.repository.js';
 export { QueueStatsRepository } from './stats.repository.js';
+export { TenantRepository } from './tenant.repository.js';
+export {
+  ApiKeyRepository,
+  type ApiKeyCredential,
+  type InsertApiKeyParams,
+  type ListApiKeysParams,
+  type RotateApiKeyParams,
+  type StoredApiKey,
+} from './api-key.repository.js';
