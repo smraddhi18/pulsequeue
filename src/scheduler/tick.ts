@@ -8,6 +8,7 @@ import { JobRepository } from '../repositories/job.repository.js';
 import { truncateError } from '../repositories/lease.repository.js';
 import { ScheduleRepository, type StoredSchedule } from '../repositories/schedule.repository.js';
 import { planFires } from './misfire.js';
+import { uniqueQueueRefs, type QueueRef } from '../domain/signals.js';
 
 /** A schedule whose expression cannot be evaluated is retried this much later. */
 export const BROKEN_SCHEDULE_RETRY_MS = 60_000;
@@ -22,7 +23,7 @@ export interface TickOptions {
    * (Milestone 5: wake workers, invalidate stats). Never called for a
    * rolled-back tick; a throwing hook is logged and does not fail the tick.
    */
-  onCommitted?: (queues: string[]) => void;
+  onCommitted?: (queues: QueueRef[]) => void;
 }
 
 export interface TickResult {
@@ -115,9 +116,11 @@ export async function runTick(db: Queryable, options: TickOptions): Promise<Tick
     throw err;
   }
 
-  const queues = [
-    ...new Set(events.filter((e) => e.kind === 'fired').map((e) => e.schedule.queue)),
-  ];
+  const queues = uniqueQueueRefs(
+    events
+      .filter((e) => e.kind === 'fired')
+      .map((e) => ({ tenantId: e.schedule.tenantId, name: e.schedule.queue })),
+  );
   if (queues.length > 0 && options.onCommitted) {
     try {
       options.onCommitted(queues);
@@ -212,7 +215,12 @@ function retryTime(schedule: StoredSchedule, now: Date): Date {
 function report(events: TickEvent[], claimed: number, logger: Logger): TickResult {
   const result: TickResult = { claimed, fired: 0, duplicates: 0, skipped: 0, errors: 0 };
   for (const e of events) {
-    const base = { scheduleId: e.schedule.id, name: e.schedule.name, queue: e.schedule.queue };
+    const base = {
+      scheduleId: e.schedule.id,
+      name: e.schedule.name,
+      tenantId: e.schedule.tenantId,
+      queue: e.schedule.queue,
+    };
     switch (e.kind) {
       case 'fired':
       case 'duplicate': {
