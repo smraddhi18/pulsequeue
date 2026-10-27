@@ -13,6 +13,7 @@ import {
   type ListJobsInput,
 } from '../domain/job.js';
 import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
+import type { TenantId } from '../domain/tenant.js';
 import { decodeCursor, encodeCursor } from '../lib/cursor.js';
 import { requestFingerprint } from '../lib/fingerprint.js';
 import type { JobRepository, StoredJob } from '../repositories/job.repository.js';
@@ -82,7 +83,7 @@ export class JobService {
     // not derived state like run_at, so an honest retry always matches.
     const fingerprint = idempotencyKey !== null ? requestFingerprint(normalized) : null;
 
-    const queue = await this.queues.ensure(input.queue);
+    const queue = await this.queues.ensure(input.tenantId, input.queue);
     const { job, inserted } = await this.jobs.insertIdempotent({
       queueId: queue.id,
       // Advisory only: workers promote due scheduled rows, and the lease query
@@ -106,15 +107,21 @@ export class JobService {
     // After the insert committed (single statement, autocommit), so a woken
     // worker's lease query sees the row. Delayed jobs signal too: idle
     // workers re-read the next due time. Replays insert nothing: no signal.
-    if (inserted) (this.options.signals ?? NOOP_QUEUE_SIGNALS).jobsRunnable(input.queue);
+    if (inserted) {
+      (this.options.signals ?? NOOP_QUEUE_SIGNALS).jobsRunnable({
+        tenantId: input.tenantId,
+        name: input.queue,
+      });
+    }
 
     // On replay the job is returned in its *current* state (it may already be
     // running or finished); the producer learns the outcome of its first call.
     return { job: toJob(job), created: inserted };
   }
 
-  async getJob(id: string): Promise<Job> {
-    const job = await this.jobs.findById(id);
+  /** Another tenant's job is indistinguishable from a missing one (404). */
+  async getJob(tenantId: TenantId, id: string): Promise<Job> {
+    const job = await this.jobs.findById(tenantId, id);
     if (!job) throw new NotFoundError('Job not found', { id });
     return toJob(job);
   }
@@ -124,7 +131,7 @@ export class JobService {
     const after = input.cursor !== undefined ? decodeCursor(input.cursor) : undefined;
 
     // Reads never create queues; an unknown queue is a 404, not an empty page.
-    const queue = await this.queues.findByName(input.queue);
+    const queue = await this.queues.findByName(input.tenantId, input.queue);
     if (!queue) throw new NotFoundError('Queue not found', { queue: input.queue });
 
     // Fetch one extra row to know whether another page exists, so the last

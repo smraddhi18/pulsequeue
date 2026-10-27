@@ -12,6 +12,7 @@ import type {
 } from '../domain/dead-letter.js';
 import type { Job, JobId, Queue, QueueName } from '../domain/job.js';
 import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
+import type { TenantId } from '../domain/tenant.js';
 import { decodeCursor, encodeCursor } from '../lib/cursor.js';
 import type {
   DeadLetterRepository,
@@ -65,7 +66,7 @@ export class DlqService {
   async list(input: ListDeadLettersInput): Promise<DeadLetterPage> {
     // Decode first: a malformed cursor is a 400 regardless of the queue.
     const after = input.cursor !== undefined ? decodeCursor(input.cursor) : undefined;
-    const queue = await this.requireQueue(input.queue);
+    const queue = await this.requireQueue(input.tenantId, input.queue);
 
     const rows = await this.deadLetters.listByQueue({
       queueId: queue.id,
@@ -85,8 +86,8 @@ export class DlqService {
   }
 
   /** A dead-lettered job with its full attempt history; 404 if it is not in the DLQ. */
-  async get(jobId: string): Promise<DeadLetteredJobWithAttempts> {
-    const stored = await this.deadLetters.findById(jobId);
+  async get(tenantId: TenantId, jobId: string): Promise<DeadLetteredJobWithAttempts> {
+    const stored = await this.deadLetters.findById(tenantId, jobId);
     if (!stored || stored.status !== 'dead') {
       throw new NotFoundError('Dead-lettered job not found', {
         id: jobId,
@@ -104,11 +105,11 @@ export class DlqService {
    * already left the DLQ.
    */
   async replay(input: ReplayJobInput): Promise<ReplayJobResult> {
-    const queue = await this.requireQueue(input.queue);
+    const queue = await this.requireQueue(input.tenantId, input.queue);
     // The read is a cheap fast path for clear 404/409s and gives the reason
     // for the audit log; the guarded UPDATE below is what actually decides,
     // so a race between the two is harmless.
-    const before = await this.deadLetters.findById(input.jobId);
+    const before = await this.deadLetters.findById(input.tenantId, input.jobId);
     if (!before || before.queue !== input.queue) {
       throw new NotFoundError('Job not found in this queue', {
         id: input.jobId,
@@ -127,35 +128,35 @@ export class DlqService {
     });
     if (!replayed) {
       // Lost a race: another replay (or a purge) got there first.
-      const current = await this.deadLetters.findById(input.jobId);
+      const current = await this.deadLetters.findById(input.tenantId, input.jobId);
       if (!current) throw new NotFoundError('Job not found', { id: input.jobId });
       throw new JobNotDeadLetteredError(undefined, { id: input.jobId, status: current.status });
     }
-    this.signals.jobsRunnable(input.queue);
+    this.signals.jobsRunnable(queue);
     return { job: toJob(replayed), replayCount: replayed.replayCount, previousReason };
   }
 
   async replayBatch(input: BulkReplayInput): Promise<BulkReplayResult> {
-    const queue = await this.requireQueue(input.queue);
+    const queue = await this.requireQueue(input.tenantId, input.queue);
     const jobIds = await this.deadLetters.replayBatch({
       queueId: queue.id,
       limit: input.limit,
       delayMs: input.delayMs ?? 0,
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
     });
-    if (jobIds.length > 0) this.signals.jobsRunnable(input.queue);
+    if (jobIds.length > 0) this.signals.jobsRunnable(queue);
     return { replayed: jobIds.length, jobIds };
   }
 
   /** Permanently delete one dead-lettered job and its attempt history. */
-  async purge(queueName: QueueName, jobId: JobId): Promise<void> {
-    const queue = await this.requireQueue(queueName);
+  async purge(tenantId: TenantId, queueName: QueueName, jobId: JobId): Promise<void> {
+    const queue = await this.requireQueue(tenantId, queueName);
     if (await this.deadLetters.purge(jobId, queue.id)) {
-      this.signals.jobsChanged(queueName);
+      this.signals.jobsChanged(queue);
       return;
     }
 
-    const current = await this.deadLetters.findById(jobId);
+    const current = await this.deadLetters.findById(tenantId, jobId);
     if (!current || current.queue !== queueName) {
       throw new NotFoundError('Job not found in this queue', { id: jobId, queue: queueName });
     }
@@ -163,19 +164,19 @@ export class DlqService {
   }
 
   async purgeOlderThan(input: PurgeDeadLettersInput): Promise<PurgeResult> {
-    const queue = await this.requireQueue(input.queue);
+    const queue = await this.requireQueue(input.tenantId, input.queue);
     const purged = await this.deadLetters.purgeOlderThan({
       queueId: queue.id,
       olderThan: input.olderThan,
       limit: input.limit,
     });
-    if (purged > 0) this.signals.jobsChanged(input.queue);
+    if (purged > 0) this.signals.jobsChanged(queue);
     return { purged };
   }
 
-  /** DLQ operations never create queues; an unknown queue is a 404. */
-  private async requireQueue(name: QueueName): Promise<Queue> {
-    const queue = await this.queues.findByName(name);
+  /** DLQ operations never create queues; an unknown (or another tenant's) queue is a 404. */
+  private async requireQueue(tenantId: TenantId, name: QueueName): Promise<Queue> {
+    const queue = await this.queues.findByName(tenantId, name);
     if (!queue) throw new NotFoundError('Queue not found', { queue: name });
     return queue;
   }

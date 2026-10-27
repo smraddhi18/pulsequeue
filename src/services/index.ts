@@ -30,3 +30,20 @@ export {
   type StatsCacheStore,
 } from './stats-cache.js';
 export { StatsService, type QueueStatsStore } from './stats.service.js';
+export { ApiKeyService, type ApiKeyServiceOptions, type ApiKeyStore } from './api-key.service.js';
+export {
+  QueueService,
+  type QueueServiceOptions,
+  type QueueSettingsStore,
+} from './queue.service.js';
+export {
+  RateLimiter,
+  type BucketRequest,
+  type BucketState,
+  type RateLimitDecision,
+  type RateLimiterOptions,
+  type RateLimitInfo,
+  type RateLimitScope,
+  type RateLimitStore,
+  type TakeResult,
+} from './rate-limiter.js';

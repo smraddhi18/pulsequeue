@@ -16,6 +16,7 @@ import { compileCron, CRON_LIMITS, InvalidCronError, type CompiledCron } from '.
 import { decodeCursor, encodeCursor } from '../lib/cursor.js';
 import type { ScheduleRepository, StoredSchedule } from '../repositories/schedule.repository.js';
 import type { QueueStore } from './job.service.js';
+import type { TenantId } from '../domain/tenant.js';
 
 /** The slice of ScheduleRepository the service needs; lets tests pass in-memory fakes. */
 export type ScheduleStore = Pick<
@@ -51,7 +52,7 @@ export class ScheduleService {
       });
     }
 
-    const queue = await this.queues.ensure(input.queue);
+    const queue = await this.queues.ensure(input.tenantId, input.queue);
     const enabled = input.enabled ?? true;
     const nextRunAt = enabled ? cron.next(await this.schedules.now()) : null;
     try {
@@ -78,15 +79,16 @@ export class ScheduleService {
     }
   }
 
-  async get(id: string): Promise<Schedule> {
-    return toSchedule(await this.require(id));
+  /** Another tenant's schedule is indistinguishable from a missing one (404). */
+  async get(tenantId: TenantId, id: string): Promise<Schedule> {
+    return toSchedule(await this.require(tenantId, id));
   }
 
   async list(input: ListSchedulesInput): Promise<SchedulePage> {
     // Decode first: a malformed cursor is a 400 regardless of the queue.
     const after = input.cursor !== undefined ? decodeCursor(input.cursor) : undefined;
     // Reads never create queues; an unknown queue is a 404, not an empty page.
-    const queue = await this.queues.findByName(input.queue);
+    const queue = await this.queues.findByName(input.tenantId, input.queue);
     if (!queue) throw new NotFoundError('Queue not found', { queue: input.queue });
 
     const rows = await this.schedules.listByQueue({
@@ -105,9 +107,9 @@ export class ScheduleService {
   }
 
   /** Stop firing. Idempotent: pausing a paused schedule returns it unchanged. */
-  async pause(id: string): Promise<Schedule> {
-    const paused = await this.schedules.pause(id);
-    return toSchedule(paused ?? (await this.require(id)));
+  async pause(tenantId: TenantId, id: string): Promise<Schedule> {
+    const paused = await this.schedules.pause(tenantId, id);
+    return toSchedule(paused ?? (await this.require(tenantId, id)));
   }
 
   /**
@@ -115,24 +117,28 @@ export class ScheduleService {
    * the paused period are not replayed (pausing is a deliberate act, not a
    * misfire). Idempotent: resuming an enabled schedule returns it unchanged.
    */
-  async resume(id: string): Promise<Schedule> {
-    const current = await this.require(id);
+  async resume(tenantId: TenantId, id: string): Promise<Schedule> {
+    const current = await this.require(tenantId, id);
     if (current.enabled) return toSchedule(current);
     const cron = compile(current.cron, current.timezone);
-    const resumed = await this.schedules.resume(id, cron.next(await this.schedules.now()));
+    const resumed = await this.schedules.resume(
+      tenantId,
+      id,
+      cron.next(await this.schedules.now()),
+    );
     // null: a concurrent resume won (or a delete); report the current state.
-    return toSchedule(resumed ?? (await this.require(id)));
+    return toSchedule(resumed ?? (await this.require(tenantId, id)));
   }
 
   /** Remove a schedule; jobs it already enqueued are unaffected. */
-  async delete(id: string): Promise<void> {
-    if (!(await this.schedules.delete(id))) {
+  async delete(tenantId: TenantId, id: string): Promise<void> {
+    if (!(await this.schedules.delete(tenantId, id))) {
       throw new NotFoundError('Schedule not found', { scheduleId: id });
     }
   }
 
-  private async require(id: string): Promise<StoredSchedule> {
-    const stored = await this.schedules.findById(id);
+  private async require(tenantId: TenantId, id: string): Promise<StoredSchedule> {
+    const stored = await this.schedules.findById(tenantId, id);
     if (!stored) throw new NotFoundError('Schedule not found', { scheduleId: id });
     return stored;
   }
@@ -160,6 +166,6 @@ function isConstraintConflict(err: unknown, constraint: string): boolean {
 
 /** Strip storage-only fields before a schedule leaves the service layer. */
 function toSchedule(stored: StoredSchedule): Schedule {
-  const { queueId: _queueId, createdAtCursor: _cursor, ...schedule } = stored;
+  const { queueId: _queueId, tenantId: _tenantId, createdAtCursor: _cursor, ...schedule } = stored;
   return schedule;
 }
