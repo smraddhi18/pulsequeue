@@ -34,6 +34,8 @@ EXPOSE 3000
 # One image, three roles. API (default CMD), worker or scheduler:
 #   docker run pulsequeue:local node dist/worker.js
 #   docker run pulsequeue:local node dist/scheduler.js
+# plus the operator CLI for tenants and API keys (Milestone 6):
+#   docker run --rm -e DATABASE_URL=... pulsequeue:local node dist/cli/api-key.js list --tenant acme
 # Workers and schedulers have no HTTP port, so their containers override this
 # HEALTHCHECK with a liveness-file check (see docker-compose.yml). Node runs as PID 1
 # without npm in between, so SIGTERM reaches the process and triggers the

@@ -2,8 +2,10 @@ x-app-env: &app-env
   NODE_ENV: production
   LOG_LEVEL: info
   DATABASE_URL: postgres://pulsequeue:pulsequeue@postgres:5432/pulsequeue
-  # Optional accelerator (wake-ups + stats cache). Every process keeps working
-  # if Redis goes away: /ready turns "degraded", workers fall back to polling.
+  # Optional accelerator (wake-ups + stats cache) and, since Milestone 6, the
+  # home of the enqueue rate limiter's token buckets. Every process keeps
+  # working if Redis goes away: /ready turns "degraded", workers fall back to
+  # polling, and enqueues skip rate limiting (RATE_LIMIT_FAIL_MODE=open).
   REDIS_URL: redis://redis:6379
   REDIS_KEY_PREFIX: pq
 
@@ -35,6 +37,17 @@ services:
       <<: *app-env
       HOST: 0.0.0.0
       PORT: 3000
+      # Milestone 6: every request except /health and /ready needs an API key.
+      # Bootstrap the first admin key with the CLI (the token is shown once):
+      #   docker compose run --rm app node dist/cli/api-key.js create \
+      #     --tenant acme --role admin --name bootstrap --create-tenant
+      AUTH_CACHE_TTL_MS: 5000
+      # Default per-tenant enqueue budget; per-tenant overrides via the CLI
+      # (tenant-rate-limit), per-queue limits via PUT /queues/:name/settings.
+      RATE_LIMIT_ENABLED: 'true'
+      RATE_LIMIT_TENANT_PER_SEC: 100
+      RATE_LIMIT_TENANT_BURST: 200
+      RATE_LIMIT_FAIL_MODE: open
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -158,7 +171,8 @@ services:
     restart: unless-stopped
 
   # Holds only derived, disposable state (wake-up pub/sub, stats cache, dirty
-  # flags), so no persistence is needed; Postgres is the source of truth.
+  # flags, rate-limit buckets), so no persistence is needed; Postgres is the
+  # source of truth. Losing a bucket (restart or LRU eviction) just refills it.
   redis:
     image: redis:7-alpine
     command:

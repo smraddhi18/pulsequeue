@@ -1,7 +1,7 @@
 {
   "name": "pulsequeue",
   "version": "0.1.0",
-  "description": "Production-style distributed job queue for Node.js — TypeScript, Fastify, PostgreSQL, Redis",
+  "description": "Production-style distributed job queue for Node.js \u2014 TypeScript, Fastify, PostgreSQL, Redis",
   "private": true,
   "type": "module",
   "engines": {
@@ -16,6 +16,8 @@
     "scheduler:dev": "tsx watch src/scheduler.ts",
     "migrate": "node dist/db/migrate-cli.js",
     "migrate:dev": "tsx src/db/migrate-cli.ts",
+    "api-key": "node dist/cli/api-key.js",
+    "api-key:dev": "tsx src/cli/api-key.ts",
     "dev": "tsx watch src/server.ts",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
