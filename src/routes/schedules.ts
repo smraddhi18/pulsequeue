@@ -8,6 +8,7 @@ import {
   listSchedulesQuerySchema,
   scheduleParamsSchema,
 } from './schedules.schemas.js';
+import { principalOf } from '../plugins/auth.js';
 
 export interface ScheduleRoutesOptions {
   scheduleService: ScheduleService;
@@ -69,12 +70,13 @@ export async function scheduleRoutes(
 
   app.post(
     '/queues/:name/schedules',
-    { bodyLimit: opts.maxPayloadBytes * 2 + 64 * 1024 },
+    { config: { access: 'manage' }, bodyLimit: opts.maxPayloadBytes * 2 + 64 * 1024 },
     async (request, reply) => {
       const { name } = queueParamsSchema.parse(request.params);
       const body = createScheduleBodySchema.parse(request.body);
 
       const schedule = await scheduleService.create({
+        tenantId: principalOf(request).tenantId,
         queue: name as QueueName,
         name: body.name,
         cron: body.cron,
@@ -103,10 +105,11 @@ export async function scheduleRoutes(
     },
   );
 
-  app.get('/queues/:name/schedules', async (request, reply) => {
+  app.get('/queues/:name/schedules', { config: { access: 'read' } }, async (request, reply) => {
     const { name } = queueParamsSchema.parse(request.params);
     const query = listSchedulesQuerySchema.parse(request.query);
     const page = await scheduleService.list({
+      tenantId: principalOf(request).tenantId,
       queue: name as QueueName,
       limit: query.limit,
       ...(query.enabled !== undefined ? { enabled: query.enabled } : {}),
@@ -118,14 +121,16 @@ export async function scheduleRoutes(
     });
   });
 
-  app.get('/schedules/:id', async (request, reply) => {
+  app.get('/schedules/:id', { config: { access: 'read' } }, async (request, reply) => {
     const { id } = scheduleParamsSchema.parse(request.params);
-    return reply.status(200).send(toScheduleResponse(await scheduleService.get(id)));
+    return reply
+      .status(200)
+      .send(toScheduleResponse(await scheduleService.get(principalOf(request).tenantId, id)));
   });
 
-  app.post('/schedules/:id/pause', async (request, reply) => {
+  app.post('/schedules/:id/pause', { config: { access: 'manage' } }, async (request, reply) => {
     const { id } = scheduleParamsSchema.parse(request.params);
-    const schedule = await scheduleService.pause(id);
+    const schedule = await scheduleService.pause(principalOf(request).tenantId, id);
     request.log.info(
       { event: 'schedule.paused', scheduleId: id, queue: schedule.queue, name: schedule.name },
       'Schedule paused',
@@ -133,9 +138,9 @@ export async function scheduleRoutes(
     return reply.status(200).send(toScheduleResponse(schedule));
   });
 
-  app.post('/schedules/:id/resume', async (request, reply) => {
+  app.post('/schedules/:id/resume', { config: { access: 'manage' } }, async (request, reply) => {
     const { id } = scheduleParamsSchema.parse(request.params);
-    const schedule = await scheduleService.resume(id);
+    const schedule = await scheduleService.resume(principalOf(request).tenantId, id);
     request.log.info(
       {
         event: 'schedule.resumed',
@@ -149,9 +154,9 @@ export async function scheduleRoutes(
     return reply.status(200).send(toScheduleResponse(schedule));
   });
 
-  app.delete('/schedules/:id', async (request, reply) => {
+  app.delete('/schedules/:id', { config: { access: 'manage' } }, async (request, reply) => {
     const { id } = scheduleParamsSchema.parse(request.params);
-    await scheduleService.delete(id);
+    await scheduleService.delete(principalOf(request).tenantId, id);
     request.log.info({ event: 'schedule.deleted', scheduleId: id }, 'Schedule deleted');
     return reply.status(204).send();
   });

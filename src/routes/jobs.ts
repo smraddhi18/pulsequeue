@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import type { Job, QueueName } from '../domain/job.js';
 import type { JobService } from '../services/job.service.js';
+import type { RateLimiter } from '../services/rate-limiter.js';
 import {
   enqueueJobBodySchema,
   enqueueJobHeadersSchema,
@@ -8,9 +9,12 @@ import {
   listJobsQuerySchema,
   queueParamsSchema,
 } from './jobs.schemas.js';
+import { principalOf } from '../plugins/auth.js';
+import { enforceRateLimit } from './rate-limit.js';
 
 export interface JobRoutesOptions {
   jobService: JobService;
+  rateLimiter: RateLimiter;
   maxPayloadBytes: number;
 }
 
@@ -56,11 +60,12 @@ export const IDEMPOTENT_REPLAY_HEADER = 'idempotent-replayed';
  * central handler), call JobService, shape the response.
  */
 export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): Promise<void> {
-  const { jobService } = opts;
+  const { jobService, rateLimiter } = opts;
 
   app.post(
     '/queues/:name/jobs',
     {
+      config: { access: 'enqueue' },
       // Coarse transport cap; the precise limit applies to the parsed payload
       // in JobService. Headroom covers JSON escaping and the envelope fields.
       bodyLimit: opts.maxPayloadBytes * 2 + 64 * 1024,
@@ -69,8 +74,31 @@ export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): P
       const { name } = queueParamsSchema.parse(request.params);
       const headers = enqueueJobHeadersSchema.parse(request.headers);
       const body = enqueueJobBodySchema.parse(request.body);
+      const principal = principalOf(request);
+
+      // After validation (a malformed request costs no quota), before any
+      // database write. Idempotent replays are counted like new enqueues.
+      const decision = await rateLimiter.consume(
+        principal.tenantId,
+        name,
+        principal.tenantRateLimit,
+      );
+      if (decision.outcome === 'limited') {
+        request.log.info(
+          {
+            event: 'ratelimit.limited',
+            keyId: principal.keyId,
+            queue: name,
+            scope: decision.info.scope,
+            retryAfterMs: decision.retryAfterMs,
+          },
+          'Enqueue rate limited',
+        );
+      }
+      enforceRateLimit(reply, decision);
 
       const { job, created } = await jobService.enqueue({
+        tenantId: principal.tenantId,
         queue: name as QueueName,
         payload: body.payload,
         ...(body.priority !== undefined ? { priority: body.priority } : {}),
@@ -103,17 +131,18 @@ export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): P
     },
   );
 
-  app.get('/jobs/:id', async (request, reply) => {
+  app.get('/jobs/:id', { config: { access: 'read' } }, async (request, reply) => {
     const { id } = jobParamsSchema.parse(request.params);
-    const job = await jobService.getJob(id);
+    const job = await jobService.getJob(principalOf(request).tenantId, id);
     return reply.status(200).send(toJobResponse(job));
   });
 
-  app.get('/queues/:name/jobs', async (request, reply) => {
+  app.get('/queues/:name/jobs', { config: { access: 'read' } }, async (request, reply) => {
     const { name } = queueParamsSchema.parse(request.params);
     const query = listJobsQuerySchema.parse(request.query);
 
     const page = await jobService.listJobs({
+      tenantId: principalOf(request).tenantId,
       queue: name as QueueName,
       limit: query.limit,
       ...(query.status !== undefined ? { status: query.status } : {}),

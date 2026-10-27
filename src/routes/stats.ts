@@ -3,6 +3,7 @@ import type { QueueName } from '../domain/job.js';
 import type { QueueStats, QueueStatusCounts } from '../domain/stats.js';
 import type { StatsService } from '../services/stats.service.js';
 import { queueParamsSchema } from './jobs.schemas.js';
+import { principalOf } from '../plugins/auth.js';
 
 export interface StatsRoutesOptions {
   statsService: StatsService;
@@ -48,9 +49,12 @@ export async function statsRoutes(app: FastifyInstance, opts: StatsRoutesOptions
    * cache when possible (bounded staleness, see StatsCache); `computedAt`
    * is when the numbers were true.
    */
-  app.get('/queues/:name/stats', async (request, reply) => {
+  app.get('/queues/:name/stats', { config: { access: 'read' } }, async (request, reply) => {
     const { name } = queueParamsSchema.parse(request.params);
-    const { stats, cache } = await statsService.getQueueStats(name as QueueName);
+    const { stats, cache } = await statsService.getQueueStats(
+      principalOf(request).tenantId,
+      name as QueueName,
+    );
     reply.header(CACHE_STATUS_HEADER, cache.toUpperCase());
     reply.header('cache-control', 'no-store');
     return reply.status(200).send(toQueueStatsResponse(stats));

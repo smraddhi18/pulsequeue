@@ -11,7 +11,7 @@ export async function healthRoutes(
    * Liveness probe — process is up. Kubernetes / load balancers use this;
    * it must not depend on Postgres or Redis.
    */
-  app.get('/health', async (_request, reply) => {
+  app.get('/health', { config: { access: 'public' } }, async (_request, reply) => {
     const body = healthService.getLiveness();
     return reply.status(200).send(body);
   });

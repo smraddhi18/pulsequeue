@@ -14,7 +14,7 @@ export async function readinessRoutes(
    * (Redis) failing reports `degraded` with 200: the instance still serves
    * every request correctly, only slower (see HealthService).
    */
-  app.get('/ready', async (_request, reply) => {
+  app.get('/ready', { config: { access: 'public' } }, async (_request, reply) => {
     const body = await healthService.getReadiness();
     const statusCode = body.status === 'not_ready' ? 503 : 200;
     return reply.status(statusCode).send(body);

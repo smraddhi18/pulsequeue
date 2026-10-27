@@ -15,6 +15,7 @@ import {
 } from './dlq.schemas.js';
 import { queueParamsSchema } from './jobs.schemas.js';
 import { toJobResponse, type JobResponse } from './jobs.js';
+import { principalOf } from '../plugins/auth.js';
 
 export interface DlqRoutesOptions {
   dlqService: DlqService;
@@ -87,10 +88,11 @@ function toDeadLetterDetailResponse(
 export async function dlqRoutes(app: FastifyInstance, opts: DlqRoutesOptions): Promise<void> {
   const { dlqService } = opts;
 
-  app.get('/queues/:name/dlq', async (request, reply) => {
+  app.get('/queues/:name/dlq', { config: { access: 'read' } }, async (request, reply) => {
     const { name } = queueParamsSchema.parse(request.params);
     const query = listDeadLettersQuerySchema.parse(request.query);
     const page = await dlqService.list({
+      tenantId: principalOf(request).tenantId,
       queue: name as QueueName,
       limit: query.limit,
       ...(query.reason !== undefined ? { reason: query.reason } : {}),
@@ -102,43 +104,49 @@ export async function dlqRoutes(app: FastifyInstance, opts: DlqRoutesOptions): P
     });
   });
 
-  app.get('/dlq/:jobId', async (request, reply) => {
+  app.get('/dlq/:jobId', { config: { access: 'read' } }, async (request, reply) => {
     const { jobId } = dlqJobParamsSchema.parse(request.params);
-    const job = await dlqService.get(jobId);
+    const job = await dlqService.get(principalOf(request).tenantId, jobId);
     return reply.status(200).send(toDeadLetterDetailResponse(job));
   });
 
-  app.post('/queues/:name/dlq/:jobId/replay', async (request, reply) => {
-    const { name } = queueParamsSchema.parse(request.params);
-    const { jobId } = dlqJobParamsSchema.parse(request.params);
-    const body = replayJobBodySchema.parse(request.body);
+  app.post(
+    '/queues/:name/dlq/:jobId/replay',
+    { config: { access: 'manage' } },
+    async (request, reply) => {
+      const { name } = queueParamsSchema.parse(request.params);
+      const { jobId } = dlqJobParamsSchema.parse(request.params);
+      const body = replayJobBodySchema.parse(request.body);
 
-    const result = await dlqService.replay({
-      queue: name as QueueName,
-      jobId: jobId as JobId,
-      ...(body.delayMs !== undefined ? { delayMs: body.delayMs } : {}),
-    });
-    request.log.info(
-      {
-        event: 'dlq.replayed',
-        jobId: result.job.id,
-        queue: result.job.queue,
-        previousReason: result.previousReason,
-        replayCount: result.replayCount,
-        status: result.job.status,
-        runAt: result.job.runAt.toISOString(),
-      },
-      'Job replayed from the dead-letter queue',
-    );
-    reply.header('location', `/jobs/${result.job.id}`);
-    return reply.status(200).send(toJobResponse(result.job));
-  });
+      const result = await dlqService.replay({
+        tenantId: principalOf(request).tenantId,
+        queue: name as QueueName,
+        jobId: jobId as JobId,
+        ...(body.delayMs !== undefined ? { delayMs: body.delayMs } : {}),
+      });
+      request.log.info(
+        {
+          event: 'dlq.replayed',
+          jobId: result.job.id,
+          queue: result.job.queue,
+          previousReason: result.previousReason,
+          replayCount: result.replayCount,
+          status: result.job.status,
+          runAt: result.job.runAt.toISOString(),
+        },
+        'Job replayed from the dead-letter queue',
+      );
+      reply.header('location', `/jobs/${result.job.id}`);
+      return reply.status(200).send(toJobResponse(result.job));
+    },
+  );
 
-  app.post('/queues/:name/dlq/replay', async (request, reply) => {
+  app.post('/queues/:name/dlq/replay', { config: { access: 'manage' } }, async (request, reply) => {
     const { name } = queueParamsSchema.parse(request.params);
     const body = bulkReplayBodySchema.parse(request.body);
 
     const result = await dlqService.replayBatch({
+      tenantId: principalOf(request).tenantId,
       queue: name as QueueName,
       limit: body.limit,
       ...(body.reason !== undefined ? { reason: body.reason } : {}),
@@ -157,18 +165,23 @@ export async function dlqRoutes(app: FastifyInstance, opts: DlqRoutesOptions): P
     return reply.status(200).send(result);
   });
 
-  app.delete('/queues/:name/dlq/:jobId', async (request, reply) => {
-    const { name } = queueParamsSchema.parse(request.params);
-    const { jobId } = dlqJobParamsSchema.parse(request.params);
-    await dlqService.purge(name as QueueName, jobId as JobId);
-    request.log.info({ event: 'dlq.purged', jobId, queue: name }, 'Dead-lettered job purged');
-    return reply.status(204).send();
-  });
+  app.delete(
+    '/queues/:name/dlq/:jobId',
+    { config: { access: 'manage' } },
+    async (request, reply) => {
+      const { name } = queueParamsSchema.parse(request.params);
+      const { jobId } = dlqJobParamsSchema.parse(request.params);
+      await dlqService.purge(principalOf(request).tenantId, name as QueueName, jobId as JobId);
+      request.log.info({ event: 'dlq.purged', jobId, queue: name }, 'Dead-lettered job purged');
+      return reply.status(204).send();
+    },
+  );
 
-  app.delete('/queues/:name/dlq', async (request, reply) => {
+  app.delete('/queues/:name/dlq', { config: { access: 'manage' } }, async (request, reply) => {
     const { name } = queueParamsSchema.parse(request.params);
     const query = purgeDeadLettersQuerySchema.parse(request.query);
     const result = await dlqService.purgeOlderThan({
+      tenantId: principalOf(request).tenantId,
       queue: name as QueueName,
       olderThan: query.olderThan,
       limit: query.limit,
