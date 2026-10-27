@@ -1,8 +1,8 @@
 import { writeFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import type { DeadLetterReason } from '../domain/dead-letter.js';
-import type { LeasedJob } from '../domain/lease.js';
-import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
+import { jobQueueRef, type LeasedJob } from '../domain/lease.js';
+import { NOOP_QUEUE_SIGNALS, uniqueQueueRefs, type QueueSignals } from '../domain/signals.js';
 import type { Logger } from '../lib/logger.js';
 import type { LeaseRepository } from '../repositories/lease.repository.js';
 import type { BackoffOptions } from './backoff.js';
@@ -290,7 +290,7 @@ export class Worker {
 
       if (jobs.length > 0) {
         this.logger.debug({ leased: jobs.length, free }, 'Leased jobs');
-        for (const queue of new Set(jobs.map((j) => j.queue))) this.signals.jobsChanged(queue);
+        for (const queue of uniqueQueueRefs(jobs.map(jobQueueRef))) this.signals.jobsChanged(queue);
       }
       for (const job of jobs) this.dispatch(job);
 
@@ -387,6 +387,7 @@ export class Worker {
       const ctx: JobContext = {
         job: {
           id: job.jobId,
+          tenantId: job.tenantId,
           queue: job.queue,
           payload: job.payload,
           priority: job.priority,
@@ -412,7 +413,7 @@ export class Worker {
     if (succeeded) {
       await this.persist(log, 'complete', async () => {
         if (await this.options.store.complete(job)) {
-          this.signals.jobsChanged(job.queue);
+          this.slotFreed(job);
           log.info({ durationMs, outcome: 'succeeded' }, 'Job attempt succeeded');
         } else {
           log.warn({ durationMs }, 'Job finished but its lease was lost; result discarded');
@@ -455,14 +456,14 @@ export class Worker {
       if (decision.kind === 'retry') {
         // The retry has a later run_at; idle push-mode workers re-read the
         // next due time when woken, so it is not left to the fallback poll.
-        this.signals.jobsRunnable(job.queue);
+        this.signals.jobsRunnable(jobQueueRef(job));
         log.warn(
           { durationMs, err: error, outcome: attemptStatus, retryInMs: decision.delayMs },
           'Job attempt failed, retry scheduled',
         );
         return;
       }
-      this.signals.jobsChanged(job.queue);
+      this.slotFreed(job);
       log.error(
         {
           event: 'dlq.dead_lettered',
@@ -527,11 +528,21 @@ export class Worker {
     return { stop: () => clearInterval(timer) };
   }
 
+  /**
+   * A job reached a terminal state. For a capped queue (M6) that frees a
+   * concurrency slot: workers sitting idle because the queue was at its cap
+   * are woken like for new work. Otherwise only the stats change.
+   */
+  private slotFreed(job: LeasedJob): void {
+    if (job.queueCapped) this.signals.jobsRunnable(jobQueueRef(job));
+    else this.signals.jobsChanged(jobQueueRef(job));
+  }
+
   private async releaseLease(job: LeasedJob, log: Logger, reason: string): Promise<void> {
     await this.persist(log, 'release', async () => {
       const released = await this.options.store.release(job, reason);
       if (released) {
-        this.signals.jobsRunnable(job.queue);
+        this.signals.jobsRunnable(jobQueueRef(job));
         log.info({ reason }, 'Lease released, job requeued');
       } else log.warn({ reason }, 'Lease already lost, nothing to release');
     });
@@ -565,6 +576,7 @@ export class Worker {
   private jobLogger(job: LeasedJob): Logger {
     return this.logger.child({
       jobId: job.jobId,
+      tenantId: job.tenantId,
       queue: job.queue,
       attempt: job.attempt,
       maxAttempts: job.maxAttempts,

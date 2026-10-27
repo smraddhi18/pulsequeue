@@ -5,6 +5,11 @@ import { QUEUE_NAME_PATTERN } from '../domain/job.js';
 export interface JobContext<P = unknown> {
   job: {
     id: string;
+    /**
+     * Owner of the job's queue (M6). Workers are a shared fleet: one handler
+     * for a queue name serves that name in every tenant.
+     */
+    tenantId: string;
     queue: string;
     payload: P;
     priority: number;

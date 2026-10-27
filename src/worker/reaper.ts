@@ -1,4 +1,4 @@
-import type { ReclaimedJob } from '../domain/lease.js';
+import { jobQueueRef, type ReclaimedJob } from '../domain/lease.js';
 import { NOOP_QUEUE_SIGNALS, type QueueSignals } from '../domain/signals.js';
 import type { Logger } from '../lib/logger.js';
 import type { LeaseRepository } from '../repositories/lease.repository.js';
@@ -86,6 +86,7 @@ export class Reaper {
   private async report(job: ReclaimedJob): Promise<void> {
     const fields = {
       jobId: job.jobId,
+      tenantId: job.tenantId,
       queue: job.queue,
       attempt: job.attempt,
       maxAttempts: job.maxAttempts,
@@ -95,11 +96,11 @@ export class Reaper {
     };
     const signals = this.options.signals ?? NOOP_QUEUE_SIGNALS;
     if (job.status === 'queued') {
-      signals.jobsRunnable(job.queue);
+      signals.jobsRunnable(jobQueueRef(job));
       this.options.logger.warn(fields, 'Reclaimed expired lease, job requeued');
       return;
     }
-    signals.jobsChanged(job.queue);
+    signals.jobsChanged(jobQueueRef(job));
     const reason = job.deadLetterReason ?? 'attempts_exhausted';
     this.options.logger.error(
       { ...fields, event: 'dlq.dead_lettered', reason, source: 'reaper' },
