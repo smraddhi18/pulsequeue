@@ -97,6 +97,50 @@ function refineRedis(
   }
 }
 
+/**
+ * API authentication (Milestone 6). Every route except /health and /ready
+ * requires `Authorization: Bearer pq_<prefix>_<secret>`; there is deliberately
+ * no switch to turn auth off. Bootstrap the first key with the CLI
+ * (`npm run api-key -- create ...`).
+ */
+const authEnvShape = {
+  /**
+   * How long an API instance trusts a verified key before looking it up
+   * again. Bounds how long a revoked key keeps working on *other* instances
+   * (the instance that revoked it forgets it at once). 0 = verify every
+   * request against Postgres.
+   */
+  AUTH_CACHE_TTL_MS: z.coerce.number().int().min(0).max(60_000).default(5_000),
+  /** Max verified keys cached per instance (LRU). */
+  AUTH_CACHE_MAX_ENTRIES: positiveInt.max(1_000_000).default(10_000),
+} as const;
+
+/**
+ * Enqueue rate limiting (Milestone 6): Redis token buckets per tenant and per
+ * queue. Defaults apply to every tenant; a tenant or queue row can override
+ * them (PUT /queues/:name/settings, `api-key tenant` CLI). Without REDIS_URL
+ * there is nowhere to keep shared buckets, so limiting is off (fail-open).
+ */
+const rateLimitEnvShape = {
+  RATE_LIMIT_ENABLED: booleanFlag(true),
+  /** Default sustained enqueue rate per tenant (tokens per second). */
+  RATE_LIMIT_TENANT_PER_SEC: positiveInt.max(1_000_000).default(100),
+  /** Default bucket capacity per tenant: how big a burst may be. */
+  RATE_LIMIT_TENANT_BURST: positiveInt.max(10_000_000).default(200),
+  /**
+   * What an enqueue does when Redis cannot answer: open = allow it (and log
+   * ratelimit.unavailable), closed = reject with 503. Open matches the M5
+   * stance that Redis is an accelerator; closed suits hard quotas.
+   */
+  RATE_LIMIT_FAIL_MODE: z.enum(['open', 'closed']).default('open'),
+  /**
+   * How long an API instance caches a queue's own rate limit (read from
+   * Postgres on enqueue). A PUT /queues/:name/settings applies at once on the
+   * instance that served it and within this TTL on the others. 0 = no cache.
+   */
+  RATE_LIMIT_SETTINGS_CACHE_TTL_MS: z.coerce.number().int().min(0).max(60_000).default(5_000),
+} as const;
+
 const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -117,6 +161,8 @@ const envSchema = z
      * no matter how hot the queue is.
      */
     STATS_CACHE_MIN_REFRESH_MS: z.coerce.number().int().min(0).max(3_600_000).default(1_000),
+    ...authEnvShape,
+    ...rateLimitEnvShape,
   })
   .superRefine((env, ctx) => {
     refineRedis(env, ctx);
@@ -125,6 +171,14 @@ const envSchema = z
         code: z.ZodIssueCode.custom,
         path: ['STATS_CACHE_MIN_REFRESH_MS'],
         message: 'Must be lower than STATS_CACHE_TTL_MS',
+      });
+    }
+    if (env.RATE_LIMIT_ENABLED && env.RATE_LIMIT_FAIL_MODE === 'closed' && !env.REDIS_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['RATE_LIMIT_FAIL_MODE'],
+        message:
+          'closed requires REDIS_URL (without Redis every enqueue would be rejected); set REDIS_URL, use open, or set RATE_LIMIT_ENABLED=false',
       });
     }
   });
