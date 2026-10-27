@@ -3,12 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { NotFoundError } from '../src/domain/errors.js';
 import type { QueueName } from '../src/domain/job.js';
 import type { QueueStats } from '../src/domain/stats.js';
+import type { TenantId } from '../src/domain/tenant.js';
 import { toQueueStatsResponse } from '../src/routes/stats.js';
 import { StatsCache } from '../src/services/stats-cache.js';
 import { StatsService } from '../src/services/stats.service.js';
 import { makeStats } from './support/stats.js';
 
 const logger = pino({ level: 'silent' });
+const acme = 'acme' as TenantId;
 
 describe('StatsService', () => {
   const uncached = new StatsCache({ store: null, minRefreshMs: 0, logger });
@@ -16,7 +18,10 @@ describe('StatsService', () => {
   it('returns stats for a known queue', async () => {
     const stats = makeStats();
     const service = new StatsService({ compute: async () => stats }, uncached);
-    expect(await service.getQueueStats('emails' as QueueName)).toEqual({ stats, cache: 'bypass' });
+    expect(await service.getQueueStats(acme, 'emails' as QueueName)).toEqual({
+      stats,
+      cache: 'bypass',
+    });
   });
 
   it('404s an unknown queue (reads never create queues)', async () => {
@@ -24,7 +29,9 @@ describe('StatsService', () => {
       { compute: async (): Promise<QueueStats | null> => null },
       uncached,
     );
-    await expect(service.getQueueStats('nope' as QueueName)).rejects.toBeInstanceOf(NotFoundError);
+    await expect(service.getQueueStats(acme, 'nope' as QueueName)).rejects.toBeInstanceOf(
+      NotFoundError,
+    );
   });
 });
 

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { DeadLetterReason, JobAttempt } from '../src/domain/dead-letter.js';
 import { JobNotDeadLetteredError, NotFoundError, ValidationError } from '../src/domain/errors.js';
 import type { JobId, Queue, QueueName } from '../src/domain/job.js';
+import type { TenantId } from '../src/domain/tenant.js';
 import { decodeCursor } from '../src/lib/cursor.js';
 import type {
   ListDeadLettersParams,
@@ -17,22 +18,26 @@ import type { QueueStore } from '../src/services/job.service.js';
 
 type Row = StoredDeadLetterJob & { queueId: string };
 
+const tenant = 'acme' as TenantId;
+
 class FakeQueues implements QueueStore {
   readonly queues = new Map<string, Queue>();
-  add(name: string): Queue {
+  add(name: string, tenantId: TenantId = tenant): Queue {
     const queue: Queue = {
-      id: String(this.queues.size + 1),
+      // The id encodes the owner so FakeDeadLetters can scope lookups like the SQL does.
+      id: `${tenantId}/${this.queues.size + 1}`,
+      tenantId,
       name: name as QueueName,
       createdAt: new Date(),
     };
-    this.queues.set(name, queue);
+    this.queues.set(`${tenantId}:${name}`, queue);
     return queue;
   }
   async ensure(): Promise<Queue> {
     throw new Error('DLQ must never create queues');
   }
-  async findByName(name: QueueName): Promise<Queue | null> {
-    return this.queues.get(name) ?? null;
+  async findByName(tenantId: TenantId, name: QueueName): Promise<Queue | null> {
+    return this.queues.get(`${tenantId}:${name}`) ?? null;
   }
 }
 
@@ -78,8 +83,9 @@ class FakeDeadLetters implements DeadLetterStore {
     return row;
   }
 
-  async findById(id: string): Promise<StoredDeadLetterJob | null> {
-    return this.rows.get(id) ?? null;
+  async findById(tenantId: TenantId, id: string): Promise<StoredDeadLetterJob | null> {
+    const row = this.rows.get(id);
+    return row?.queueId.startsWith(`${tenantId}/`) ? row : null;
   }
 
   async listByQueue(params: ListDeadLettersParams): Promise<StoredDeadLetterJob[]> {
@@ -183,7 +189,7 @@ describe('DlqService', () => {
   describe('list', () => {
     it('pages newest-first with an opaque cursor over (dead_lettered_at, id)', async () => {
       const rows = Array.from({ length: 5 }, () => store.add(q));
-      const first = await service.list({ queue: q.name, limit: 2 });
+      const first = await service.list({ tenantId: tenant, queue: q.name, limit: 2 });
       expect(first.jobs.map((j) => j.id)).toEqual([rows[4]!.id, rows[3]!.id]);
       expect(store.lastList?.limit).toBe(3); // one extra row to detect another page
       expect(first.nextCursor).not.toBeNull();
@@ -192,16 +198,31 @@ describe('DlqService', () => {
         id: rows[3]!.id,
       });
 
-      const second = await service.list({ queue: q.name, limit: 2, cursor: first.nextCursor! });
+      const second = await service.list({
+        tenantId: tenant,
+        queue: q.name,
+        limit: 2,
+        cursor: first.nextCursor!,
+      });
       expect(second.jobs.map((j) => j.id)).toEqual([rows[2]!.id, rows[1]!.id]);
-      const third = await service.list({ queue: q.name, limit: 2, cursor: second.nextCursor! });
+      const third = await service.list({
+        tenantId: tenant,
+        queue: q.name,
+        limit: 2,
+        cursor: second.nextCursor!,
+      });
       expect(third.jobs.map((j) => j.id)).toEqual([rows[0]!.id]);
       expect(third.nextCursor).toBeNull();
     });
 
     it('shapes entries with DLQ metadata and passes the reason filter through', async () => {
       store.add(q, { deadReason: 'invalid_payload', attempts: 1, replayCount: 2 });
-      const page = await service.list({ queue: q.name, limit: 10, reason: 'invalid_payload' });
+      const page = await service.list({
+        tenantId: tenant,
+        queue: q.name,
+        limit: 10,
+        reason: 'invalid_payload',
+      });
       expect(store.lastList?.reason).toBe('invalid_payload');
       expect(page.jobs[0]).toMatchObject({
         status: 'dead',
@@ -212,10 +233,10 @@ describe('DlqService', () => {
 
     it('rejects a malformed cursor before touching the store, and 404s unknown queues', async () => {
       await expect(
-        service.list({ queue: q.name, limit: 1, cursor: 'nope!' }),
+        service.list({ tenantId: tenant, queue: q.name, limit: 1, cursor: 'nope!' }),
       ).rejects.toBeInstanceOf(ValidationError);
       await expect(
-        service.list({ queue: 'missing' as QueueName, limit: 1 }),
+        service.list({ tenantId: tenant, queue: 'missing' as QueueName, limit: 1 }),
       ).rejects.toBeInstanceOf(NotFoundError);
     });
   });
@@ -223,24 +244,29 @@ describe('DlqService', () => {
   describe('get', () => {
     it('returns a dead job with its attempt history', async () => {
       const row = store.add(q);
-      const job = await service.get(row.id);
+      const job = await service.get(tenant, row.id);
       expect(job.deadLetter.reason).toBe('attempts_exhausted');
       expect(job.attemptHistory).toHaveLength(1);
     });
 
     it('404s a job that is not dead-lettered (and says what it is)', async () => {
       const row = store.add(q, { status: 'queued', deadReason: null, deadLetteredAt: null });
-      const err = await service.get(row.id).catch((e: unknown) => e);
+      const err = await service.get(tenant, row.id).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(NotFoundError);
       expect((err as NotFoundError).details).toMatchObject({ status: 'queued' });
-      await expect(service.get(randomUUID())).rejects.toBeInstanceOf(NotFoundError);
+      await expect(service.get(tenant, randomUUID())).rejects.toBeInstanceOf(NotFoundError);
     });
   });
 
   describe('replay', () => {
     it('replays into the same queue with a fresh budget and reports the previous reason', async () => {
       const row = store.add(q, { deadReason: 'non_retryable' });
-      const result = await service.replay({ queue: q.name, jobId: row.id, delayMs: 5_000 });
+      const result = await service.replay({
+        tenantId: tenant,
+        queue: q.name,
+        jobId: row.id,
+        delayMs: 5_000,
+      });
       expect(store.lastReplay).toEqual({ jobId: row.id, queueId: q.id, delayMs: 5_000 });
       expect(result).toMatchObject({
         job: { id: row.id, status: 'scheduled', attempts: 0 },
@@ -251,29 +277,33 @@ describe('DlqService', () => {
 
     it('defaults to an immediate replay', async () => {
       const row = store.add(q);
-      expect((await service.replay({ queue: q.name, jobId: row.id })).job.status).toBe('queued');
+      expect(
+        (await service.replay({ tenantId: tenant, queue: q.name, jobId: row.id })).job.status,
+      ).toBe('queued');
     });
 
     it('409s a job that is not in the DLQ, 404s unknown jobs and jobs of another queue', async () => {
       const live = store.add(q, { status: 'running', deadReason: null, deadLetteredAt: null });
-      await expect(service.replay({ queue: q.name, jobId: live.id })).rejects.toBeInstanceOf(
-        JobNotDeadLetteredError,
-      );
       await expect(
-        service.replay({ queue: q.name, jobId: randomUUID() as JobId }),
+        service.replay({ tenantId: tenant, queue: q.name, jobId: live.id }),
+      ).rejects.toBeInstanceOf(JobNotDeadLetteredError);
+      await expect(
+        service.replay({ tenantId: tenant, queue: q.name, jobId: randomUUID() as JobId }),
       ).rejects.toBeInstanceOf(NotFoundError);
       const other = queues.add('reports');
       const foreign = store.add(other);
-      await expect(service.replay({ queue: q.name, jobId: foreign.id })).rejects.toBeInstanceOf(
-        NotFoundError,
-      );
+      await expect(
+        service.replay({ tenantId: tenant, queue: q.name, jobId: foreign.id }),
+      ).rejects.toBeInstanceOf(NotFoundError);
       expect(foreign.status).toBe('dead');
     });
 
     it('409s when a concurrent replay wins between the read and the guarded write', async () => {
       const row = store.add(q);
       store.stealNextReplay = true;
-      const err = await service.replay({ queue: q.name, jobId: row.id }).catch((e: unknown) => e);
+      const err = await service
+        .replay({ tenantId: tenant, queue: q.name, jobId: row.id })
+        .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(JobNotDeadLetteredError);
       expect((err as JobNotDeadLetteredError).statusCode).toBe(409);
       expect((err as JobNotDeadLetteredError).details).toMatchObject({ status: 'queued' });
@@ -290,6 +320,7 @@ describe('DlqService', () => {
       ];
       const rows = reasons.map((deadReason) => store.add(q, { deadReason }));
       const result = await service.replayBatch({
+        tenantId: tenant,
         queue: q.name,
         limit: 10,
         reason: 'invalid_payload',
@@ -304,16 +335,18 @@ describe('DlqService', () => {
   describe('purge', () => {
     it('deletes one dead job; 409 if not dead; 404 if unknown or in another queue', async () => {
       const dead = store.add(q);
-      await service.purge(q.name, dead.id);
+      await service.purge(tenant, q.name, dead.id);
       expect(store.rows.has(dead.id)).toBe(false);
 
       const live = store.add(q, { status: 'queued', deadReason: null, deadLetteredAt: null });
-      await expect(service.purge(q.name, live.id)).rejects.toBeInstanceOf(JobNotDeadLetteredError);
-      await expect(service.purge(q.name, randomUUID() as JobId)).rejects.toBeInstanceOf(
+      await expect(service.purge(tenant, q.name, live.id)).rejects.toBeInstanceOf(
+        JobNotDeadLetteredError,
+      );
+      await expect(service.purge(tenant, q.name, randomUUID() as JobId)).rejects.toBeInstanceOf(
         NotFoundError,
       );
       const foreign = store.add(queues.add('reports'));
-      await expect(service.purge(q.name, foreign.id)).rejects.toBeInstanceOf(NotFoundError);
+      await expect(service.purge(tenant, q.name, foreign.id)).rejects.toBeInstanceOf(NotFoundError);
       expect(store.rows.has(foreign.id)).toBe(true);
     });
 
@@ -321,6 +354,7 @@ describe('DlqService', () => {
       store.add(q);
       store.add(q);
       const result = await service.purgeOlderThan({
+        tenantId: tenant,
         queue: q.name,
         olderThan: new Date('2100-01-01T00:00:00Z'),
         limit: 1,
@@ -328,7 +362,12 @@ describe('DlqService', () => {
       expect(result).toEqual({ purged: 1 });
       expect(store.lastPurge).toMatchObject({ queueId: q.id, limit: 1 });
       await expect(
-        service.purgeOlderThan({ queue: 'missing' as QueueName, olderThan: new Date(), limit: 1 }),
+        service.purgeOlderThan({
+          tenantId: tenant,
+          queue: 'missing' as QueueName,
+          olderThan: new Date(),
+          limit: 1,
+        }),
       ).rejects.toBeInstanceOf(NotFoundError);
     });
   });
@@ -352,16 +391,16 @@ describe('DlqService signals (Milestone 5)', () => {
   it('replay and a non-empty bulk replay make jobs runnable', async () => {
     const row = store.add(q);
     store.add(q);
-    await service.replay({ queue: q.name, jobId: row.id });
-    await service.replayBatch({ queue: q.name, limit: 10 });
+    await service.replay({ tenantId: tenant, queue: q.name, jobId: row.id });
+    await service.replayBatch({ tenantId: tenant, queue: q.name, limit: 10 });
     expect(signals.runnable()).toEqual(['emails', 'emails']);
     expect(signals.changed()).toEqual([]);
   });
 
   it('an empty bulk replay or a failed replay signals nothing', async () => {
-    await service.replayBatch({ queue: q.name, limit: 10 });
+    await service.replayBatch({ tenantId: tenant, queue: q.name, limit: 10 });
     await expect(
-      service.replay({ queue: q.name, jobId: randomUUID() as JobId }),
+      service.replay({ tenantId: tenant, queue: q.name, jobId: randomUUID() as JobId }),
     ).rejects.toBeInstanceOf(NotFoundError);
     expect(signals.calls).toEqual([]);
   });
@@ -369,13 +408,15 @@ describe('DlqService signals (Milestone 5)', () => {
   it('purges only change stats (nothing became runnable)', async () => {
     const dead = store.add(q);
     store.add(q);
-    await service.purge(q.name, dead.id);
+    await service.purge(tenant, q.name, dead.id);
     await service.purgeOlderThan({
+      tenantId: tenant,
       queue: q.name,
       olderThan: new Date('2100-01-01T00:00:00Z'),
       limit: 10,
     });
     await service.purgeOlderThan({
+      tenantId: tenant,
       queue: q.name,
       olderThan: new Date('2100-01-01T00:00:00Z'),
       limit: 10,

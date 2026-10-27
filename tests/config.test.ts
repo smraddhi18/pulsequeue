@@ -286,3 +286,56 @@ describe('Redis settings (Milestone 5)', () => {
     ).toThrow(/WORKER_WAKEUP_FALLBACK_POLL_MS/);
   });
 });
+
+describe('auth and rate-limit settings (Milestone 6)', () => {
+  const db = { DATABASE_URL: validEnv.DATABASE_URL };
+
+  it('applies auth cache and rate-limit defaults', () => {
+    expect(loadEnv({ ...validEnv })).toMatchObject({
+      AUTH_CACHE_TTL_MS: 5_000,
+      AUTH_CACHE_MAX_ENTRIES: 10_000,
+      RATE_LIMIT_ENABLED: true,
+      RATE_LIMIT_TENANT_PER_SEC: 100,
+      RATE_LIMIT_TENANT_BURST: 200,
+      RATE_LIMIT_FAIL_MODE: 'open',
+      RATE_LIMIT_SETTINGS_CACHE_TTL_MS: 5_000,
+    });
+  });
+
+  it('allows AUTH_CACHE_TTL_MS=0 (verify every request against Postgres)', () => {
+    expect(loadEnv({ ...db, AUTH_CACHE_TTL_MS: '0' }).AUTH_CACHE_TTL_MS).toBe(0);
+  });
+
+  it.each([
+    ['AUTH_CACHE_TTL_MS', '-1'],
+    ['AUTH_CACHE_TTL_MS', '60001'],
+    ['RATE_LIMIT_TENANT_PER_SEC', '0'],
+    ['RATE_LIMIT_TENANT_BURST', '1.5'],
+    ['RATE_LIMIT_FAIL_MODE', 'maybe'],
+    ['RATE_LIMIT_ENABLED', 'on'],
+    ['RATE_LIMIT_SETTINGS_CACHE_TTL_MS', '-5'],
+    ['RATE_LIMIT_SETTINGS_CACHE_TTL_MS', '60001'],
+  ])('rejects %s=%j', (key, value) => {
+    expect(() => loadEnv({ ...validEnv, [key]: value })).toThrow(
+      /Invalid environment configuration/,
+    );
+  });
+
+  it('refuses fail-closed rate limiting without Redis (every enqueue would be rejected)', () => {
+    expect(() => loadEnv({ ...db, RATE_LIMIT_FAIL_MODE: 'closed' })).toThrow(
+      /RATE_LIMIT_FAIL_MODE: closed requires REDIS_URL/,
+    );
+    expect(
+      loadEnv({ ...db, RATE_LIMIT_FAIL_MODE: 'closed', RATE_LIMIT_ENABLED: 'false' })
+        .RATE_LIMIT_FAIL_MODE,
+    ).toBe('closed');
+    expect(loadEnv({ ...validEnv, RATE_LIMIT_FAIL_MODE: 'closed' }).RATE_LIMIT_FAIL_MODE).toBe(
+      'closed',
+    );
+  });
+
+  it('keeps rate-limit settings out of the worker and scheduler', () => {
+    expect(loadWorkerEnv(db)).not.toHaveProperty('RATE_LIMIT_ENABLED');
+    expect(loadSchedulerEnv(db)).not.toHaveProperty('AUTH_CACHE_TTL_MS');
+  });
+});

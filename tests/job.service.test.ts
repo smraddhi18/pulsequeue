@@ -7,6 +7,7 @@ import {
   ValidationError,
 } from '../src/domain/errors.js';
 import { JOB_LIMITS, type JobId, type Queue, type QueueName } from '../src/domain/job.js';
+import type { TenantId } from '../src/domain/tenant.js';
 import { requestFingerprint } from '../src/lib/fingerprint.js';
 import { decodeCursor, encodeCursor } from '../src/lib/cursor.js';
 import type {
@@ -23,17 +24,19 @@ class FakeQueues implements QueueStore {
   readonly queues = new Map<string, Queue>();
   ensureCalls = 0;
 
-  async ensure(name: QueueName): Promise<Queue> {
+  async ensure(tenantId: TenantId, name: QueueName): Promise<Queue> {
     this.ensureCalls++;
-    const existing = this.queues.get(name);
+    const existing = this.queues.get(`${tenantId}:${name}`);
     if (existing) return existing;
-    const queue: Queue = { id: String(this.queues.size + 1), name, createdAt: new Date() };
-    this.queues.set(name, queue);
+    // The id encodes the owner so FakeJobs can scope lookups like the SQL does.
+    const id = `${tenantId}/${this.queues.size + 1}`;
+    const queue: Queue = { id, tenantId, name, createdAt: new Date() };
+    this.queues.set(`${tenantId}:${name}`, queue);
     return queue;
   }
 
-  async findByName(name: QueueName): Promise<Queue | null> {
-    return this.queues.get(name) ?? null;
+  async findByName(tenantId: TenantId, name: QueueName): Promise<Queue | null> {
+    return this.queues.get(`${tenantId}:${name}`) ?? null;
   }
 }
 
@@ -74,8 +77,8 @@ class FakeJobs implements JobStore {
     return { job, inserted: true };
   }
 
-  async findById(id: string): Promise<StoredJob | null> {
-    return this.rows.find((r) => r.id === id) ?? null;
+  async findById(tenantId: TenantId, id: string): Promise<StoredJob | null> {
+    return this.rows.find((r) => r.id === id && r.queueId.startsWith(`${tenantId}/`)) ?? null;
   }
 
   async listByQueue(params: ListJobsParams): Promise<StoredJob[]> {
@@ -85,6 +88,7 @@ class FakeJobs implements JobStore {
 }
 
 const queue = 'emails' as QueueName;
+const tenant = 'acme' as TenantId;
 
 describe('JobService.enqueue', () => {
   let queues: FakeQueues;
@@ -98,7 +102,7 @@ describe('JobService.enqueue', () => {
   });
 
   it('applies defaults and enqueues as queued', async () => {
-    const { job, created } = await service.enqueue({ queue, payload: { a: 1 } });
+    const { job, created } = await service.enqueue({ tenantId: tenant, queue, payload: { a: 1 } });
     expect(created).toBe(true);
     expect(jobs.lastInsert).toMatchObject({
       status: 'queued',
@@ -113,7 +117,7 @@ describe('JobService.enqueue', () => {
   });
 
   it('marks delayed jobs as scheduled', async () => {
-    await service.enqueue({ queue, payload: {}, delayMs: 5_000 });
+    await service.enqueue({ tenantId: tenant, queue, payload: {}, delayMs: 5_000 });
     expect(jobs.lastInsert?.status).toBe('scheduled');
     expect(jobs.lastInsert?.delayMs).toBe(5_000);
   });
@@ -128,22 +132,32 @@ describe('JobService.enqueue', () => {
 
     it('enqueues a future runAt as scheduled and passes the instant to storage', async () => {
       const runAt = new Date(NOW + 60_000);
-      await pinned.enqueue({ queue, payload: {}, runAt });
+      await pinned.enqueue({ tenantId: tenant, queue, payload: {}, runAt });
       expect(jobs.lastInsert).toMatchObject({ status: 'scheduled', delayMs: 0, runAt });
     });
 
     it('enqueues a past or present runAt as queued (storage clamps it to now)', async () => {
-      await pinned.enqueue({ queue, payload: {}, runAt: new Date(NOW - 5_000) });
+      await pinned.enqueue({ tenantId: tenant, queue, payload: {}, runAt: new Date(NOW - 5_000) });
       expect(jobs.lastInsert?.status).toBe('queued');
-      await pinned.enqueue({ queue, payload: {}, runAt: new Date(NOW) });
+      await pinned.enqueue({ tenantId: tenant, queue, payload: {}, runAt: new Date(NOW) });
       expect(jobs.lastInsert?.status).toBe('queued');
     });
 
     it('accepts exactly the 30-day horizon and rejects 1 ms beyond it before storage', async () => {
-      await pinned.enqueue({ queue, payload: {}, runAt: new Date(NOW + JOB_LIMITS.MAX_DELAY_MS) });
+      await pinned.enqueue({
+        tenantId: tenant,
+        queue,
+        payload: {},
+        runAt: new Date(NOW + JOB_LIMITS.MAX_DELAY_MS),
+      });
       expect(jobs.rows).toHaveLength(1);
       const err = await pinned
-        .enqueue({ queue, payload: {}, runAt: new Date(NOW + JOB_LIMITS.MAX_DELAY_MS + 1) })
+        .enqueue({
+          tenantId: tenant,
+          queue,
+          payload: {},
+          runAt: new Date(NOW + JOB_LIMITS.MAX_DELAY_MS + 1),
+        })
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(ValidationError);
       expect((err as ValidationError).details).toMatchObject({
@@ -156,21 +170,22 @@ describe('JobService.enqueue', () => {
 
     it('rejects delayMs and runAt together and invalid dates', async () => {
       await expect(
-        pinned.enqueue({ queue, payload: {}, delayMs: 1, runAt: new Date(NOW) }),
+        pinned.enqueue({ tenantId: tenant, queue, payload: {}, delayMs: 1, runAt: new Date(NOW) }),
       ).rejects.toBeInstanceOf(ValidationError);
       await expect(
-        pinned.enqueue({ queue, payload: {}, runAt: new Date(Number.NaN) }),
+        pinned.enqueue({ tenantId: tenant, queue, payload: {}, runAt: new Date(Number.NaN) }),
       ).rejects.toBeInstanceOf(ValidationError);
       expect(jobs.rows).toHaveLength(0);
     });
 
     it('keeps pre-M4 fingerprints stable and makes runAt part of the request identity', async () => {
-      await pinned.enqueue({ queue, payload: { a: 1 }, idempotencyKey: 'k1' });
+      await pinned.enqueue({ tenantId: tenant, queue, payload: { a: 1 }, idempotencyKey: 'k1' });
       const withoutRunAt = jobs.lastInsert?.requestFingerprint;
       expect(withoutRunAt).toBe(
         requestFingerprint({ payload: { a: 1 }, priority: 0, delayMs: 0, maxAttempts: 3 }),
       );
       await pinned.enqueue({
+        tenantId: tenant,
         queue,
         payload: { a: 1 },
         runAt: new Date(NOW + 1000),
@@ -179,6 +194,7 @@ describe('JobService.enqueue', () => {
       expect(jobs.lastInsert?.requestFingerprint).not.toBe(withoutRunAt);
       await expect(
         pinned.enqueue({
+          tenantId: tenant,
           queue,
           payload: { a: 1 },
           runAt: new Date(NOW + 2000),
@@ -190,21 +206,29 @@ describe('JobService.enqueue', () => {
 
   it('rejects payloads over the byte budget before touching storage', async () => {
     const payload = { text: 'x'.repeat(100) };
-    await expect(service.enqueue({ queue, payload })).rejects.toBeInstanceOf(PayloadTooLargeError);
+    await expect(service.enqueue({ tenantId: tenant, queue, payload })).rejects.toBeInstanceOf(
+      PayloadTooLargeError,
+    );
     expect(queues.ensureCalls).toBe(0);
     expect(jobs.rows).toHaveLength(0);
   });
 
   it('counts UTF-8 bytes, not characters', async () => {
     // 20 x "€" = 60 bytes of text + quotes/braces > 64 bytes, though only ~30 chars.
-    await expect(service.enqueue({ queue, payload: { t: '€'.repeat(20) } })).rejects.toBeInstanceOf(
-      PayloadTooLargeError,
-    );
+    await expect(
+      service.enqueue({ tenantId: tenant, queue, payload: { t: '€'.repeat(20) } }),
+    ).rejects.toBeInstanceOf(PayloadTooLargeError);
   });
 
   it('replays the original job for the same key and equivalent request', async () => {
-    const first = await service.enqueue({ queue, payload: { a: 1, b: 2 }, idempotencyKey: 'k1' });
+    const first = await service.enqueue({
+      tenantId: tenant,
+      queue,
+      payload: { a: 1, b: 2 },
+      idempotencyKey: 'k1',
+    });
     const replay = await service.enqueue({
+      tenantId: tenant,
       queue,
       payload: { b: 2, a: 1 },
       priority: 0, // explicit default == omitted
@@ -217,17 +241,23 @@ describe('JobService.enqueue', () => {
   });
 
   it('rejects the same key with a different request', async () => {
-    await service.enqueue({ queue, payload: { a: 1 }, idempotencyKey: 'k1' });
+    await service.enqueue({ tenantId: tenant, queue, payload: { a: 1 }, idempotencyKey: 'k1' });
     await expect(
-      service.enqueue({ queue, payload: { a: 2 }, idempotencyKey: 'k1' }),
+      service.enqueue({ tenantId: tenant, queue, payload: { a: 2 }, idempotencyKey: 'k1' }),
     ).rejects.toBeInstanceOf(IdempotencyKeyReusedError);
     await expect(
-      service.enqueue({ queue, payload: { a: 1 }, priority: 9, idempotencyKey: 'k1' }),
+      service.enqueue({
+        tenantId: tenant,
+        queue,
+        payload: { a: 1 },
+        priority: 9,
+        idempotencyKey: 'k1',
+      }),
     ).rejects.toBeInstanceOf(IdempotencyKeyReusedError);
   });
 
   it('stores a fingerprint only when a key is supplied', async () => {
-    await service.enqueue({ queue, payload: {}, idempotencyKey: 'k2' });
+    await service.enqueue({ tenantId: tenant, queue, payload: {}, idempotencyKey: 'k2' });
     expect(jobs.lastInsert?.requestFingerprint).toMatch(/^v1:[0-9a-f]{64}$/);
   });
 });
@@ -244,42 +274,44 @@ describe('JobService.getJob / listJobs', () => {
   });
 
   it('throws NotFoundError for an unknown job', async () => {
-    await expect(service.getJob(randomUUID())).rejects.toBeInstanceOf(NotFoundError);
+    await expect(service.getJob(tenant, randomUUID())).rejects.toBeInstanceOf(NotFoundError);
   });
 
   it('throws NotFoundError for an unknown queue and never creates it', async () => {
-    await expect(service.listJobs({ queue, limit: 10 })).rejects.toBeInstanceOf(NotFoundError);
+    await expect(service.listJobs({ tenantId: tenant, queue, limit: 10 })).rejects.toBeInstanceOf(
+      NotFoundError,
+    );
     expect(queues.queues.size).toBe(0);
   });
 
   it('rejects a malformed cursor before any lookup', async () => {
-    await expect(service.listJobs({ queue, limit: 10, cursor: '!!' })).rejects.toBeInstanceOf(
-      ValidationError,
-    );
+    await expect(
+      service.listJobs({ tenantId: tenant, queue, limit: 10, cursor: '!!' }),
+    ).rejects.toBeInstanceOf(ValidationError);
   });
 
   it('asks for limit + 1 rows and emits a cursor only when more rows exist', async () => {
-    for (let i = 0; i < 3; i++) await service.enqueue({ queue, payload: { i } });
+    for (let i = 0; i < 3; i++) await service.enqueue({ tenantId: tenant, queue, payload: { i } });
 
-    const page = await service.listJobs({ queue, limit: 2 });
+    const page = await service.listJobs({ tenantId: tenant, queue, limit: 2 });
     expect(jobs.lastList?.limit).toBe(3);
     expect(page.jobs).toHaveLength(2);
     expect(page.nextCursor).not.toBeNull();
     const cursor = decodeCursor(page.nextCursor!);
     expect(cursor.id).toBe(page.jobs[1]?.id);
 
-    const exact = await service.listJobs({ queue, limit: 3 });
+    const exact = await service.listJobs({ tenantId: tenant, queue, limit: 3 });
     expect(exact.jobs).toHaveLength(3);
     expect(exact.nextCursor).toBeNull();
   });
 
   it('passes the decoded cursor and status filter to the repository', async () => {
-    await service.enqueue({ queue, payload: {} });
+    await service.enqueue({ tenantId: tenant, queue, payload: {} });
     const cursor = encodeCursor({
       createdAt: '2026-10-20T00:00:00.000123Z',
       id: randomUUID(),
     });
-    await service.listJobs({ queue, limit: 5, status: 'scheduled', cursor });
+    await service.listJobs({ tenantId: tenant, queue, limit: 5, status: 'scheduled', cursor });
     expect(jobs.lastList).toMatchObject({
       status: 'scheduled',
       after: decodeCursor(cursor),
@@ -295,8 +327,8 @@ describe('JobService signals (Milestone 5)', () => {
       maxPayloadBytes: 64,
       signals,
     });
-    await service.enqueue({ queue, payload: {} });
-    await service.enqueue({ queue, payload: {}, delayMs: 5_000 });
+    await service.enqueue({ tenantId: tenant, queue, payload: {} });
+    await service.enqueue({ tenantId: tenant, queue, payload: {}, delayMs: 5_000 });
     // Scheduled jobs signal too: a push-mode worker re-reads the next due
     // time when woken instead of sleeping through it.
     expect(signals.runnable()).toEqual(['emails', 'emails']);
@@ -308,8 +340,8 @@ describe('JobService signals (Milestone 5)', () => {
       maxPayloadBytes: 64,
       signals,
     });
-    await service.enqueue({ queue, payload: {}, idempotencyKey: 'k1' });
-    await service.enqueue({ queue, payload: {}, idempotencyKey: 'k1' });
+    await service.enqueue({ tenantId: tenant, queue, payload: {}, idempotencyKey: 'k1' });
+    await service.enqueue({ tenantId: tenant, queue, payload: {}, idempotencyKey: 'k1' });
     expect(signals.calls).toHaveLength(1);
   });
 
@@ -320,7 +352,7 @@ describe('JobService signals (Milestone 5)', () => {
       signals,
     });
     await expect(
-      service.enqueue({ queue, payload: { big: 'x'.repeat(100) } }),
+      service.enqueue({ tenantId: tenant, queue, payload: { big: 'x'.repeat(100) } }),
     ).rejects.toBeInstanceOf(PayloadTooLargeError);
     expect(signals.calls).toEqual([]);
   });

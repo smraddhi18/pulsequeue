@@ -69,31 +69,35 @@ describe('health routes', () => {
     expect(body.error.code).toBe('NOT_FOUND');
   });
 
-  it('maps malformed JSON bodies to 400 BAD_REQUEST, not 500', async () => {
+  // Auth runs in onRequest, before the body is read or parsed: an anonymous
+  // caller can't make the server parse (or validate) anything.
+  it('rejects anonymous API calls with 401 before parsing the body', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/queues/emails/jobs',
       headers: { 'content-type': 'application/json' },
       payload: '{not json',
     });
-    expect(res.statusCode).toBe(400);
-    expect((res.json() as { error: { code: string } }).error.code).toBe('BAD_REQUEST');
+    expect(res.statusCode).toBe(401);
+    expect(res.headers['www-authenticate']).toBe('Bearer realm="pulsequeue"');
+    expect((res.json() as { error: { code: string } }).error.code).toBe('UNAUTHORIZED');
   });
 
-  it('validates enqueue input before touching the database', async () => {
+  it('rejects a malformed key with 401 without touching the database', async () => {
     const res = await app.inject({
-      method: 'POST',
+      method: 'GET',
       url: '/queues/emails/jobs',
-      payload: { payload: {}, priority: 1000 },
+      headers: { authorization: 'Bearer not-a-pulsequeue-key' },
     });
-    expect(res.statusCode).toBe(400);
-    expect((res.json() as { error: { code: string } }).error.code).toBe('VALIDATION_ERROR');
+    expect(res.statusCode).toBe(401);
+    expect((res.json() as { error: { message: string } }).error.message).toMatch(/Malformed/);
   });
 
-  it('maps database outages on API calls to 503 SERVICE_UNAVAILABLE', async () => {
+  it('maps a database outage during key lookup to 503, never 401', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/queues/emails/jobs',
+      headers: { authorization: `Bearer pq_abcdefghijkl_${'A'.repeat(43)}` },
       payload: { payload: {} },
     });
     expect(res.statusCode).toBe(503);

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ZodError, z } from 'zod';
-import { AppError, NotFoundError, ValidationError } from '../src/domain/errors.js';
+import {
+  AppError,
+  ForbiddenError,
+  NotFoundError,
+  UnauthorizedError,
+  ValidationError,
+} from '../src/domain/errors.js';
 import { mapErrorToResponse } from '../src/lib/error-mapper.js';
 
 describe('mapErrorToResponse', () => {
@@ -10,6 +16,25 @@ describe('mapErrorToResponse', () => {
     expect(mapped.body.error.code).toBe('NOT_FOUND');
     expect(mapped.body.error.message).toBe('Job not found');
     expect(mapped.body.error.details).toEqual({ id: 'abc' });
+  });
+
+  it('carries UnauthorizedError as 401 with a Bearer challenge header', () => {
+    const mapped = mapErrorToResponse(new UnauthorizedError('Invalid API key'));
+    expect(mapped.statusCode).toBe(401);
+    expect(mapped.body.error.code).toBe('UNAUTHORIZED');
+    expect(mapped.headers).toEqual({ 'www-authenticate': 'Bearer realm="pulsequeue"' });
+  });
+
+  it('maps ForbiddenError to 403 with details and no extra headers', () => {
+    const mapped = mapErrorToResponse(
+      new ForbiddenError('nope', { role: 'reader', required: 'enqueue' }),
+    );
+    expect(mapped.statusCode).toBe(403);
+    expect(mapped.body.error).toMatchObject({
+      code: 'FORBIDDEN',
+      details: { role: 'reader', required: 'enqueue' },
+    });
+    expect(mapped.headers).toBeUndefined();
   });
 
   it('maps ValidationError to 400', () => {
