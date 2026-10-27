@@ -2,77 +2,81 @@
 
 A production-style distributed job queue for Node.js services, built in TypeScript with Fastify, PostgreSQL and Redis. Producers enqueue jobs over an HTTP API, workers lease and execute them with retries and exponential backoff, failed jobs go to a dead-letter queue, and a dashboard API reports queue health.
 
-This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 5 (Redis pub/sub wake-ups for idle workers and a cached queue stats endpoint) is done.**
+This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 6 (per-tenant API keys hashed at rest, tenant isolation, Redis token-bucket enqueue rate limits per tenant and per queue, and fleet-wide queue concurrency limits enforced in leasing) is done.**
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    P[Producer services] -->|"POST /queues/:name/jobs<br/>Idempotency-Key"| API
-    O[Operators / dashboards] -->|"GET /jobs/:id, GET /queues/:name/jobs<br/>GET /queues/:name/stats"| API
-    OP[Operators / runbooks] -->|"GET /queues/:name/dlq, GET /dlq/:jobId<br/>POST .../dlq/:jobId/replay, POST .../dlq/replay<br/>DELETE .../dlq/:jobId, DELETE .../dlq?olderThan="| API
-    OPS[Operators / producers] -->|"POST /queues/:name/schedules, GET .../schedules<br/>GET /schedules/:id, POST /schedules/:id/pause, /resume<br/>DELETE /schedules/:id"| API
-    LB[Load balancer / k8s probes] -->|"/health, /ready<br/>(redis down = degraded, still 200)"| API
+    P[Producer services] -->|"POST /queues/:name/jobs<br/>Authorization: Bearer pq_...<br/>Idempotency-Key"| API
+    O[Operators / dashboards] -->|"GET /jobs/:id, /queues/:name/jobs<br/>GET /queues/:name/stats"| API
+    OP[Operators / runbooks] -->|"DLQ inspect / replay / purge<br/>schedules CRUD, pause, resume"| API
+    AD[Tenant admins] -->|"POST/GET/DELETE /api-keys, POST /api-keys/:id/rotate<br/>GET/PUT /queues/:name/settings, GET /auth/whoami"| API
+    LB[Load balancer / k8s probes] -->|"/health, /ready (public)<br/>(redis down = degraded, still 200)"| API
+    CLI[api-key CLI<br/>bootstrap tenants + first admin key] -->|"SQL via repositories"| PG
 
-    subgraph API[Fastify API]
+    subgraph API[Fastify API - stateless, N replicas]
         direction TB
-        RT[Routes<br/>zod validation, thin<br/>jobs + dlq + schedules + stats] --> SV[Services<br/>JobService, DlqService, ScheduleService,<br/>StatsService + StatsCache, HealthService]
-        SV --> RP[Repositories<br/>Queue, Job, DeadLetter, Schedule, QueueStats<br/>all SQL lives here]
+        AU[Auth hook onRequest<br/>every route declares access: public / read / enqueue / manage<br/>Bearer pq_prefix_secret, lookup by prefix,<br/>SHA-256 + timingSafeEqual, LRU cache AUTH_CACHE_TTL_MS<br/>401 / 403] --> RT
+        RT[Routes<br/>zod validation, thin<br/>jobs, dlq, schedules, stats, api-keys, queue settings] --> RL
+        RL[RateLimiter enqueue only<br/>tenant bucket + optional queue bucket<br/>429 + Retry-After + RateLimit-*<br/>fail open / closed] --> SV
+        RT --> SV[Services<br/>JobService, DlqService, ScheduleService, StatsService,<br/>ApiKeyService, QueueService, HealthService<br/>every query scoped by principal.tenantId]
+        SV --> RP[Repositories<br/>Tenant, ApiKey, Queue, Job, DeadLetter, Schedule, QueueStats<br/>all SQL lives here]
         SV --> SIG[QueueSignals<br/>after COMMIT: jobsRunnable / jobsChanged<br/>coalesced per queue]
     end
 
     subgraph PG["PostgreSQL 16 - source of truth"]
         direction TB
-        JT[jobs<br/>queued / scheduled / running / succeeded<br/>jobs_ready_idx: queued only<br/>jobs_scheduled_due_idx: by run_at]
-        ST[schedules<br/>cron, timezone, misfire_policy<br/>next_run_at, partial schedules_due_idx]
-        DQ[DLQ = jobs WHERE status = dead<br/>dead_reason, dead_lettered_at, replay_count<br/>partial index jobs_dlq_idx]
-        AT[job_attempts<br/>full history, kept across DLQ + replays]
+        TN[tenants<br/>slug id, optional rate limit override]
+        AK[api_keys<br/>prefix UNIQUE, secret_hash = sha256 bytea,<br/>role admin / producer / reader,<br/>expires_at, revoked_at, rotated_from]
+        QU[queues<br/>UNIQUE tenant_id, name<br/>max_concurrency, rate_limit_per_sec / burst]
+        JT[jobs<br/>queued / scheduled / running / succeeded / dead<br/>jobs_ready_idx, jobs_running_queue_idx]
+        ST[schedules]
+        AT[job_attempts]
+        TN -.- AK
+        TN -.- QU
+        QU -.- JT
+        QU -.- ST
         JT -.- AT
-        DQ -.- AT
     end
 
-    subgraph RD["Redis 7 - optional accelerator, disposable state"]
+    subgraph RD["Redis 7 - optional, disposable state"]
         direction TB
-        CH["pub/sub channels<br/>pq:wakeup:NAME"]
-        SC["stats cache<br/>pq:stats:v1:{NAME} (hash seq + data, TTL)<br/>pq:stats:dirty:{NAME} (flag, TTL)"]
+        CH["pub/sub channels<br/>pq:wakeup:NAME (by name: shared worker fleet)"]
+        SC["stats cache + dirty flags<br/>pq:stats:v1:{TENANT:NAME}, pq:stats:dirty:{TENANT:NAME}"]
+        TB["token buckets (hash tokens, ts)<br/>pq:rl:{t:TENANT}<br/>pq:rl:{t:TENANT}:q:NAME<br/>one Lua script, Redis TIME, all-or-nothing"]
     end
 
-    RP -->|"pg Pool<br/>stats: ONE aggregate statement (one snapshot)"| PG
-    MG[migrate job<br/>schema_migrations + advisory lock] -->|DDL| PG
-    SV -->|"stats read-through:<br/>HIT / STALE / claim + MISS / BYPASS<br/>Lua CAS write on snapshot time"| SC
-    SIG -.->|"PUBLISH wake-up (runnable)"| CH
-    SIG -.->|"SET dirty PX ttl (any change)"| SC
+    RP -->|"pg Pool"| PG
+    MG[migrate job<br/>0001-0007, advisory lock] -->|DDL| PG
+    RL -->|"EVALSHA token bucket<br/>(one round trip per enqueue)"| TB
+    SV -->|"stats read-through, Lua CAS"| SC
+    SIG -.->|"PUBLISH wake-up"| CH
+    SIG -.->|"SET dirty"| SC
 
     subgraph SP[Scheduler - 2 replicas, one leader]
-        direction TB
-        SL[Leader<br/>holds pg_try_advisory_lock on its own session<br/>ticks every SCHEDULER_TICK_INTERVAL_MS]
-        SS[Standby<br/>retries the lock every<br/>SCHEDULER_LEADER_RETRY_INTERVAL_MS]
-        SL --> MP[Misfire planner<br/>skip / fire_once / catch_up<br/>grace window, catch-up limit]
+        SL[Leader: advisory lock, ticks,<br/>misfire planner]
     end
-
-    SL -->|"tick = ONE transaction on the lock session:<br/>claim due schedules FOR UPDATE SKIP LOCKED,<br/>INSERT job ON CONFLICT (key schedule:id:fireTime),<br/>advance next_run_at"| PG
-    SS -.->|"lock attempt only"| PG
-    SL -.->|"after COMMIT: wake-up per fired queue"| CH
+    SL -->|"claim due schedules SKIP LOCKED,<br/>enqueue with schedule:id:time key"| PG
+    SL -.->|"wake-ups"| CH
 
     subgraph WP[Worker pool - N processes x WORKER_CONCURRENCY]
         direction TB
-        WS[Wake-up subscriber<br/>dedicated connection, SUBSCRIBE own queues,<br/>backoff reconnect, catch-up poll on resubscribe] -->|"wake()"| WL
-        WL[Worker loop<br/>push mode: sleep fallback poll, capped by next run_at<br/>poll mode: WORKER_POLL_INTERVAL_MS<br/>promote due scheduled jobs, lease free slots] --> HR["Handler registry<br/>queue name to handler"]
-        WL --> RPOL[Retry policy<br/>retry with backoff, or dead-letter:<br/>non_retryable / invalid_payload / attempts_exhausted]
-        WL --> HB[Heartbeats<br/>extend lease while running]
-        RE[Reaper<br/>reclaims expired leases<br/>poison: N lease expiries]
+        WS[Wake-up subscriber] -->|"wake()"| WL
+        WL[Worker loop<br/>push / poll, promote due jobs,<br/>lease free slots] --> HR[Handler registry]
+        WL --> HB[Heartbeats]
+        RE[Reaper + poison detection]
         WL --> LR[LeaseRepository<br/>writes fenced on lease_token]
         HB --> LR
         RE --> LR
     end
 
-    LR -->|"lease: FOR UPDATE SKIP LOCKED<br/>complete / retry / dead-letter / release<br/>(dead-letter is part of the fenced fail/reap statement)"| PG
-    CH -.->|"message = hint only, never a job"| WS
-    WP -.->|"after COMMIT: retry / release / reclaim = wake-up,<br/>lease / success / dead = dirty flag"| RD
-    WP -->|"onJobFailed hook after the move<br/>(alerts, metrics)"| HK[Notifications]
+    LR -->|"uncapped queues: one SKIP LOCKED statement<br/>capped queues: lock queue rows FOR NO KEY UPDATE (id order),<br/>count running, lease at most max_concurrency - running"| PG
+    CH -.->|"hint only"| WS
+    WP -.->|"wake-ups + dirty flags after COMMIT"| RD
 ```
 
-Solid lines are the durable path through Postgres. Dotted lines from and to Redis are best-effort hints (wake-ups, dirty flags): losing any of them costs latency or one extra query, never a job. Redis is optional; without `REDIS_URL` the dotted lines simply do not exist and workers poll as in Milestone 4.
+Solid lines are the durable path through Postgres. Dotted lines from and to Redis are best-effort hints (wake-ups, dirty flags): losing any of them costs latency or one extra query, never a job. The token buckets are the one piece of Redis state that enforces something; it is still disposable (a lost bucket refills, i.e. a burst is allowed once) and with Redis down the limiter fails open by default (`RATE_LIMIT_FAIL_MODE=closed` refuses enqueues instead). Redis is optional; without `REDIS_URL` the dotted lines and rate limiting simply do not exist. Authentication and the queue concurrency limit live entirely in Postgres and work without Redis.
 
 ## Features
 
@@ -155,9 +159,25 @@ Solid lines are the durable path through Postgres. Dotted lines from and to Redi
 - Redis config validated by zod (e.g. the fallback poll must be at least the normal poll interval, the min refresh below the TTL); CI runs a `redis:7-alpine` service and the worker smoke test requires `wakeup.subscribed`; compose runs Redis without persistence (it only holds derived state)
 - Tests: coalescer, single-flight, log throttle, stats cache policy (incl. 20 concurrent cold reads = 1 query), readiness states, the worker wake loop (push / poll switching, lost wake-ups, nextDue cap) and every service's signals as unit tests; real-Redis + real-Postgres tests for channel isolation, dirty-flag TTLs, the claim and CAS, subscriber recovery after an outage (through a TCP proxy that cuts connections), the stats API (HIT / STALE / MISS / BYPASS, 20 concurrent requests = 1 query, two API instances sharing a cache), `/ready` degraded during an outage, pickup latency under 500ms with a 20s fallback poll, push vs poll query counts, delayed jobs and retries on time in push mode, and the real `src/worker.ts` process picking up a job via a wake-up
 
+**Milestone 6: auth, multi-tenancy and rate limiting**
+
+- **Tenants and API keys** (migration `0005`): `tenants` (slug ids such as `acme`; existing data belongs to `default`) and `api_keys` with roles `admin` (everything, incl. key management, queue settings, destructive DLQ operations and schedules), `producer` (enqueue + reads) and `reader` (reads only)
+- Keys look like `pq_<prefix>_<secret>`: a random 12-char non-secret **prefix** (unique index, the lookup key and what listings and logs show) plus 256 random bits; **only `SHA-256(token)` is stored** (`bytea`, length-checked). Verification = one indexed lookup by prefix + `crypto.timingSafeEqual` on the digests, so lookup time does not depend on how many secret characters match; the plaintext is returned once (`201`, `cache-control: no-store`)
+- **Auth hook on every non-health route**: an `onRequest` hook (before the body is read) authenticates `Authorization: Bearer ...`; every route must declare `config.access` (`public`, `read`, `enqueue` or `manage`) or the app refuses to start, so a new endpoint can never ship unauthenticated by accident. `401 UNAUTHORIZED` + `WWW-Authenticate: Bearer` for missing / malformed / unknown / revoked / expired keys, `403 FORBIDDEN` when the role lacks the permission; only `/health` and `/ready` are public
+- Verified keys are cached per instance (LRU, `AUTH_CACHE_TTL_MS` = 5s, cache key = token digest); revocation is immediate on the serving instance and within the TTL elsewhere; `last_used_at` is written at most once a minute per key, off the request path
+- Key management API for the caller's tenant: `POST /api-keys`, `GET /api-keys` (keyset, `includeRevoked`), `GET /api-keys/:id`, `DELETE /api-keys/:id` (idempotent revoke), `POST /api-keys/:id/rotate` (new key, old one revoked now or after `gracePeriodSeconds`), `GET /auth/whoami`
+- Operator CLI (`npm run api-key -- ...`, `node dist/cli/api-key.js` in the image) to create tenants, bootstrap the first admin key, list / revoke keys and set a tenant's rate limit, without the API
+- **Tenant isolation** (migration `0006`): queues belong to a tenant and names are unique per tenant (two tenants can both own `emails`); jobs, schedules and DLQ entries inherit the owner through their queue and every lookup is scoped by the caller's tenant, so another tenant's resources are `404`, never `403` (no existence oracle). Stats cache entries are per tenant + queue
+- **Enqueue rate limiting**: token buckets in Redis per tenant (default `RATE_LIMIT_TENANT_PER_SEC` = 100/s, burst 200, overridable per tenant) and optionally per queue (`PUT /queues/:name/settings`). One **atomic Lua script** refills lazily from `redis.call('TIME')` (no clock skew between API instances) and takes a token from **all buckets or none**; keys expire once the bucket would be full. Success responses carry `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` (IETF draft), refusals are `429 RATE_LIMITED` with `Retry-After` (whole seconds, >= 1). Validation runs first, so bad requests cost no quota
+- Redis failure policy: `RATE_LIMIT_FAIL_MODE=open` (default; enqueues go through, throttled `ratelimit.unavailable` warning) or `closed` (`503` + `Retry-After: 1` for enqueues only; reads keep working)
+- **Queue concurrency limits** (migration `0007`): `maxConcurrency` per queue caps running jobs **across the whole worker fleet**, enforced inside the lease transaction (lock the capped queue rows `FOR NO KEY UPDATE` in id order, count running jobs via the new partial `jobs_running_queue_idx`, lease at most the remaining budget with a `LATERAL ... LIMIT`). Uncapped queues keep the single-statement M5 lease; producers are never blocked by the lock
+- `GET /queues/:name/settings` and `PUT /queues/:name/settings` (full replacement, `null` clears a limit; creates the queue so limits can be set before the first job)
+- Structured log events: `auth.forbidden`, `apikey.created`, `apikey.revoked`, `apikey.rotated`, `apikey.touch_failed`, `ratelimit.limited`, `ratelimit.unavailable`, `ratelimit.disabled`, `queue.settings_updated`; request logs carry `tenantId` and `keyPrefix`
+- Zod config for auth and rate limits (e.g. `closed` without `REDIS_URL` is rejected at startup); compose and CI updated: CI bootstraps an admin key with the compiled CLI, boots the compiled API and checks public probes, `401` without a key, and `201, 201, 429 + Retry-After` at burst 2
+- Tests: token parsing / generation (no modulo bias), the auth plugin (401 / 403 / public routes / startup guard), `ApiKeyService` (cache, expiry, rotation), `RateLimiter` policy (binding bucket, fail open / closed) and header mapping as unit tests; real-Postgres + real-Redis tests for migrations `0005`-`0007` (backfill to `default`, constraints), the key repository and CLI, the key API (hash at rest, rotation with grace, revocation, cross-tenant `404`s), tenant isolation for jobs, DLQ and schedules, the Lua bucket (refill on the Redis clock, all-or-nothing, **no over-admission under 200 concurrent takes from several connections**), the rate-limited API (two API instances share buckets, tenant and queue limits, fail open / closed through an outage), and **concurrency caps under parallel leasing** (many connections leasing at once and three real workers never exceed the cap, no deadlocks with overlapping capped queues)
+
 ### Planned
 
-- API keys, multi-tenancy, rate limits (M6)
 - Dashboard API, Prometheus, OpenTelemetry (M7)
 - Load / chaos testing and capacity notes (M8)
 
@@ -167,39 +187,55 @@ Solid lines are the durable path through Postgres. Dotted lines from and to Redi
 sequenceDiagram
     autonumber
     participant P as Producer
+    participant A as Auth hook (onRequest)
+    participant K as ApiKeyService
     participant R as Route (jobs.ts)
+    participant L as RateLimiter
+    participant RD as Redis (token buckets)
     participant S as JobService
-    participant Q as QueueRepository
-    participant J as JobRepository
+    participant J as Queue + JobRepository
     participant PG as PostgreSQL
 
-    P->>R: POST /queues/emails/jobs (Idempotency-Key: order-42)
-    R->>R: zod: queue name, header, body (strict, ranges)
-    R->>S: enqueue(input)
-    S->>S: apply defaults, check payload byte budget, fingerprint = sha256(canonical JSON)
-    S->>Q: ensure("emails")
-    Q->>PG: SELECT by name, on miss INSERT ... ON CONFLICT (name) DO NOTHING
-    S->>J: insertIdempotent(job, key, fingerprint)
-    J->>PG: INSERT ... ON CONFLICT (queue_id, idempotency_key) DO NOTHING RETURNING
-    alt new key
-        PG-->>J: inserted row
-        J-->>S: inserted = true
-        S-->>R: created
-        R-->>P: 201 Created + Location: /jobs/:id
-    else key already used
-        J->>PG: SELECT by (queue_id, idempotency_key) in a fresh statement
-        J-->>S: existing job, inserted = false
-        alt same fingerprint
-            S-->>R: replay
-            R-->>P: 200 OK + Idempotent-Replayed: true (original job)
-        else different fingerprint
-            S-->>R: IdempotencyKeyReusedError
-            R-->>P: 422 IDEMPOTENCY_KEY_REUSED
-        end
+    P->>A: POST /queues/emails/jobs<br/>Authorization: Bearer pq_ab12cd34ef56_...
+    A->>K: authenticate(header)
+    K->>K: parse pq_prefix_secret, digest = sha256(token)
+    alt digest in LRU cache (AUTH_CACHE_TTL_MS)
+        K-->>A: principal (tenant, role, tenant limit)
+    else cache miss
+        K->>PG: SELECT key + tenant WHERE prefix = $1 AND not revoked / expired
+        K->>K: timingSafeEqual(stored hash, digest)
+        K-->>A: principal, or 401 UNAUTHORIZED
     end
+    A->>A: role allows "enqueue"? else 403 FORBIDDEN
+    A->>R: request (body read + parsed only now)
+    R->>R: zod: queue name, headers, body (400 costs no quota)
+    R->>L: consume(tenant, "emails", tenant limit)
+    L->>PG: queue rate limit (cached RATE_LIMIT_SETTINGS_CACHE_TTL_MS)
+    L->>RD: EVALSHA token bucket [rl:{t:acme}, rl:{t:acme}:q:emails]
+    RD->>RD: TIME, refill each bucket, take 1 from all or none
+    alt allowed
+        RD-->>L: allowed, remaining per bucket
+        L-->>R: RateLimit-Limit / Remaining / Reset (tightest bucket)
+    else bucket empty
+        RD-->>L: refused, retry after ms
+        R-->>P: 429 RATE_LIMITED + Retry-After + RateLimit-*
+    else Redis unavailable
+        L-->>R: fail open: skip (no headers) / fail closed: 503 + Retry-After
+    end
+    R->>S: enqueue(tenant, input)
+    S->>J: ensure queue (tenant_id, name), insertIdempotent
+    J->>PG: INSERT ... ON CONFLICT (queue_id, idempotency_key) DO NOTHING
+    alt new key
+        R-->>P: 201 Created + Location + RateLimit-*
+    else same key, same body
+        R-->>P: 200 OK + Idempotent-Replayed: true
+    else same key, different body
+        R-->>P: 422 IDEMPOTENCY_KEY_REUSED
+    end
+    S-->>RD: after COMMIT: wake-up + stats dirty flag (best effort)
 ```
 
-Routes only parse input and shape output. `JobService` owns the business rules (defaults, payload budget, initial status, replay semantics, pagination). Repositories own every SQL statement and translate driver errors into domain errors. Domain types, limits and errors live under `src/domain/`.
+Authentication runs in an `onRequest` hook, before Fastify reads the body, so an unauthenticated client cannot make the server buffer or parse anything. Rate limiting runs after validation and before any write; idempotent replays count like new enqueues (a retry storm is still load). Routes only parse input and shape output. `JobService` owns the business rules (defaults, payload budget, initial status, replay semantics, pagination). Repositories own every SQL statement and translate driver errors into domain errors. Domain types, limits and errors live under `src/domain/`.
 
 ## Scheduler tick flow
 
@@ -418,13 +454,41 @@ Staleness is bounded twice: after a change a reader sees the old numbers for at 
 
 ```mermaid
 erDiagram
+    tenants ||--o{ api_keys : "credentials"
+    tenants ||--o{ queues : owns
+    api_keys |o--o{ api_keys : "rotated_from"
     queues ||--o{ jobs : contains
     queues ||--o{ schedules : "recurring jobs"
     jobs ||--o{ job_attempts : "attempt history"
 
+    tenants {
+        text id PK "slug a-z0-9- max 63, 'default' seeded"
+        text name
+        int rate_limit_per_sec "NULL = RATE_LIMIT_TENANT_PER_SEC"
+        int rate_limit_burst "set together with per_sec"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    api_keys {
+        uuid id PK
+        text tenant_id FK "ON DELETE CASCADE"
+        text name
+        text prefix UK "12 chars a-z0-9, not secret"
+        bytea secret_hash "sha256(token), 32 bytes"
+        api_key_role role "admin producer reader"
+        timestamptz created_at
+        timestamptz expires_at "NULL = never"
+        timestamptz last_used_at "throttled, 1/min"
+        timestamptz revoked_at
+        uuid rotated_from FK "predecessor on rotate"
+    }
     queues {
         bigint id PK
-        text name UK "a-z0-9._- max 64"
+        text tenant_id FK "UK with name"
+        text name "a-z0-9._- max 64, UK per tenant"
+        int max_concurrency "NULL = uncapped"
+        int rate_limit_per_sec "NULL = no queue bucket"
+        int rate_limit_burst
         timestamptz created_at
         timestamptz updated_at
     }
@@ -493,26 +557,49 @@ Invariants added in [`migrations/0003_dead_letter_queue.sql`](migrations/0003_de
 
 Invariants added in [`migrations/0004_scheduling.sql`](migrations/0004_scheduling.sql): a schedule is `enabled` **if and only if** it has a `next_run_at` (`schedules_enabled_has_next_run`), names are unique per queue and match the API's name rule, and priority / attempts / cron / timezone lengths are range-checked.
 
-Indexes (see [`0001`](migrations/0001_create_queues_jobs_attempts.sql), [`0002`](migrations/0002_worker_leasing.sql), [`0003`](migrations/0003_dead_letter_queue.sql) and [`0004`](migrations/0004_scheduling.sql)):
+Added in Milestone 6: [`migrations/0005_tenants_api_keys.sql`](migrations/0005_tenants_api_keys.sql) creates `tenants` (seeding `default`) and `api_keys`: the prefix is unique and format-checked, `secret_hash` must be exactly 32 bytes (a SHA-256 digest; a plaintext token can never be stored by mistake), a tenant's rate limit is both-or-neither, and expiry must be after creation. [`0006_queue_tenancy.sql`](migrations/0006_queue_tenancy.sql) adds `queues.tenant_id` (catalog-only `ADD COLUMN ... DEFAULT 'default'`, so every existing queue belongs to `default` without a table rewrite) and replaces the global name unique constraint with `(tenant_id, name)`. Jobs, schedules and DLQ entries reach their tenant through `queue_id`, so they need no column of their own. Rollout: drain M5 API servers before applying `0006` (their `ON CONFLICT (name)` has no matching constraint afterwards); M5 workers and schedulers are unaffected. [`0007_queue_limits.sql`](migrations/0007_queue_limits.sql) adds the nullable, range-checked `max_concurrency` and queue rate limit columns.
 
-| Index                                                                                      | Serves                                                                                                       |
-| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `jobs_lease_idx (queue_id, priority DESC, run_at, id) WHERE status IN (queued, scheduled)` | M2/M3 lease query; kept only for workers still running during a rolling deploy, dropped in a later migration |
-| `jobs_ready_idx (queue_id, priority DESC, run_at, id) WHERE status = queued`               | M4 lease query: only runnable rows, so the scan never walks a future job                                     |
-| `jobs_scheduled_due_idx (queue_id, run_at, id) WHERE status = scheduled`                   | promotion: range scan touching only the delayed / backoff rows that are due                                  |
-| `schedules_due_idx (next_run_at) WHERE enabled`                                            | scheduler claim, in due order; paused schedules are not in it                                                |
-| `schedules_queue_created_idx (queue_id, created_at DESC, id DESC)`                         | `GET /queues/:name/schedules` keyset pages                                                                   |
-| `jobs_queue_created_idx (queue_id, created_at DESC, id DESC)`                              | `GET /queues/:name/jobs` keyset pages; also covers the `queue_id` foreign key                                |
-| `jobs_queue_status_created_idx (queue_id, status, created_at DESC, id DESC)`               | the same listing filtered by `status`                                                                        |
-| `jobs_queue_idempotency_key_uq (queue_id, idempotency_key) WHERE key IS NOT NULL`          | race-safe idempotency via `ON CONFLICT`; partial, so keyless jobs cost nothing                               |
-| `job_attempts_job_attempt_uq (job_id, attempt_number)`                                     | one row per attempt; attempt history in order                                                                |
-| `jobs_running_lease_expiry_idx (lease_expires_at) WHERE status = running`                  | reaper scan for expired leases; holds only in-flight rows, so it is tiny                                     |
-| `job_attempts_one_running_per_job_uq (job_id) WHERE status = running`                      | invariant: never two in-flight attempts of one job                                                           |
-| `jobs_dlq_idx (queue_id, dead_lettered_at DESC, id DESC) WHERE status = dead`              | DLQ keyset listing, bulk replay (oldest first) and `olderThan` purges; partial, so it is as small as the DLQ |
+Indexes (see [`0001`](migrations/0001_create_queues_jobs_attempts.sql), [`0002`](migrations/0002_worker_leasing.sql), [`0003`](migrations/0003_dead_letter_queue.sql), [`0004`](migrations/0004_scheduling.sql), [`0005`](migrations/0005_tenants_api_keys.sql), [`0006`](migrations/0006_queue_tenancy.sql) and [`0007`](migrations/0007_queue_limits.sql)):
+
+| Index                                                                                      | Serves                                                                                                        |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `jobs_lease_idx (queue_id, priority DESC, run_at, id) WHERE status IN (queued, scheduled)` | M2/M3 lease query; kept only for workers still running during a rolling deploy, dropped in a later migration  |
+| `jobs_ready_idx (queue_id, priority DESC, run_at, id) WHERE status = queued`               | M4 lease query: only runnable rows, so the scan never walks a future job                                      |
+| `jobs_scheduled_due_idx (queue_id, run_at, id) WHERE status = scheduled`                   | promotion: range scan touching only the delayed / backoff rows that are due                                   |
+| `schedules_due_idx (next_run_at) WHERE enabled`                                            | scheduler claim, in due order; paused schedules are not in it                                                 |
+| `schedules_queue_created_idx (queue_id, created_at DESC, id DESC)`                         | `GET /queues/:name/schedules` keyset pages                                                                    |
+| `jobs_queue_created_idx (queue_id, created_at DESC, id DESC)`                              | `GET /queues/:name/jobs` keyset pages; also covers the `queue_id` foreign key                                 |
+| `jobs_queue_status_created_idx (queue_id, status, created_at DESC, id DESC)`               | the same listing filtered by `status`                                                                         |
+| `jobs_queue_idempotency_key_uq (queue_id, idempotency_key) WHERE key IS NOT NULL`          | race-safe idempotency via `ON CONFLICT`; partial, so keyless jobs cost nothing                                |
+| `job_attempts_job_attempt_uq (job_id, attempt_number)`                                     | one row per attempt; attempt history in order                                                                 |
+| `jobs_running_lease_expiry_idx (lease_expires_at) WHERE status = running`                  | reaper scan for expired leases; holds only in-flight rows, so it is tiny                                      |
+| `job_attempts_one_running_per_job_uq (job_id) WHERE status = running`                      | invariant: never two in-flight attempts of one job                                                            |
+| `jobs_dlq_idx (queue_id, dead_lettered_at DESC, id DESC) WHERE status = dead`              | DLQ keyset listing, bulk replay (oldest first) and `olderThan` purges; partial, so it is as small as the DLQ  |
+| `api_keys_prefix_uq (prefix)`                                                              | authentication: one index probe per (uncached) request                                                        |
+| `api_keys_tenant_created_idx (tenant_id, created_at DESC, id DESC)`                        | `GET /api-keys` keyset pages                                                                                  |
+| `queues_tenant_name_uq (tenant_id, name)`                                                  | API lookups and race-safe get-or-create, per tenant                                                           |
+| `queues_name_idx (name)`                                                                   | workers and the scheduler: a shared fleet consumes a queue name across all tenants                            |
+| `jobs_running_queue_idx (queue_id) WHERE status = running`                                 | concurrency caps: count running jobs per capped queue inside the lease transaction; holds only in-flight rows |
 
 The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries and asserts that they use these indexes.
 
 ## Design decisions and trade-offs
+
+### Milestone 6
+
+| Decision                                                                                        | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Trade-off                                                                                                                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Opaque bearer keys `pq_<prefix>_<secret>`, only `SHA-256(token)` stored, lookup by prefix**   | A DB leak or a log line never yields a usable credential. The non-secret prefix makes lookup one unique-index probe (no scan over hashes, no per-key salt search), gives operators a handle to show in listings and logs, and the `pq_` shape is greppable for secret scanners. The digest comparison uses `crypto.timingSafeEqual`, so response time does not reveal how much of a guessed secret matched.                                                                                                                                                                                                                            | Plain SHA-256, not bcrypt / argon2: correct for 256-bit random secrets (nothing to brute force), and a slow hash on every request would cost milliseconds of CPU per call. Not suitable if keys were ever user-chosen passwords. Lost keys cannot be recovered, only rotated.       |
+| **API keys over JWT / OAuth**                                                                   | Server-to-server producers want a long-lived credential that can be revoked instantly and audited (`last_used_at`); stateful keys give that with one indexed read, and no signing-key infrastructure.                                                                                                                                                                                                                                                                                                                                                                                                                                  | A Postgres read per uncached request (and one more moving part than a self-contained JWT); mitigated by the cache. No user identities or fine-grained scopes yet, just three roles.                                                                                                 |
+| **Per-instance verified-key cache (`AUTH_CACHE_TTL_MS` = 5s, LRU, keyed by token digest)**      | Keeps auth off the database for hot producers. Keyed by the digest, so a wrong secret with a valid prefix is never served from cache. Revoke / rotate evicts on the serving instance at once.                                                                                                                                                                                                                                                                                                                                                                                                                                          | A revoked key keeps working for up to the TTL on _other_ instances (bounded, documented, `0` disables the cache). Redis pub/sub invalidation would close the gap but would make auth depend on Redis.                                                                               |
+| **Auth hook in `onRequest`, deny-by-default route declarations**                                | Runs before the body is read, so anonymous traffic cannot make the server buffer and parse payloads. Every route must declare `config.access`; a route without one fails startup, which turns "forgot to protect the new endpoint" into a boot error instead of a vulnerability.                                                                                                                                                                                                                                                                                                                                                       | Health probes are the only public routes; anything else that should be public needs an explicit `access: 'public'`.                                                                                                                                                                 |
+| **Tenant scoping in services and SQL, cross-tenant = `404`**                                    | One choke point: services take the principal's `tenantId` and repositories filter on it, so a forgotten check fails closed (not found). `404` instead of `403` avoids an existence oracle for other tenants' job ids.                                                                                                                                                                                                                                                                                                                                                                                                                  | Shared tables (row-level tenancy), not schema- or database-per-tenant: cheap and simple, but a noisy tenant shares Postgres capacity (hence rate limits and concurrency caps). Postgres RLS would add defense in depth; not used yet.                                               |
+| **Token bucket in Redis via one Lua script, on the Redis clock, all-or-nothing across buckets** | A token bucket allows short bursts (`burst`) while enforcing an average rate, which matches producer traffic better than fixed windows (no 2x burst at window edges) and needs only two fields per bucket. The script is atomic, so concurrent API instances can never over-admit, and `redis.call('TIME')` avoids clock skew between API hosts. Taking from the tenant and queue buckets together means a request refused by one bucket does not spend the other's tokens. Keys use a `{t:<tenant>}` hash tag so both buckets of a request live in one Redis Cluster slot, and they expire once full, so idle tenants cost no memory. | One Redis round trip (~0.2ms) per enqueue. The script is the only shared mutable state in Redis that enforces something; a Redis failover can lose bucket state (a refilled burst, at most once). A sliding-window log would be more exact but costs memory per request.            |
+| **Fail open by default, `closed` as an option**                                                 | The limiter protects the system from overload; making every enqueue fail when Redis (an optional component) is down would turn a cache outage into a full producer outage. Teams that sell quotas can choose `closed` (enqueues `503` + `Retry-After: 1`, reads unaffected).                                                                                                                                                                                                                                                                                                                                                           | In `open` mode limits are not enforced during a Redis outage (logged, throttled, as `ratelimit.unavailable`).                                                                                                                                                                       |
+| **Only enqueue is rate limited; validation first, replays count**                               | Enqueue is the write path that creates work and storage; reads are cheap and bounded by pagination. Invalid requests are rejected before spending quota (a broken client is not locked out by its own errors). Idempotent replays count, because a retry storm is still load.                                                                                                                                                                                                                                                                                                                                                          | Expensive reads (big list pages) are not limited yet; a separate read budget would be the next step.                                                                                                                                                                                |
+| **Concurrency caps enforced in the lease transaction, not with a Redis semaphore**              | The cap must hold across the whole worker fleet and survive crashes. Counting `running` rows in the same transaction that leases means a crashed worker's slots free themselves when the reaper expires the lease, with no leaked permits. Capped queue rows are locked `FOR NO KEY UPDATE` in id order: concurrent leasers serialize per capped queue (no over-lease, no deadlock), while producers' FK checks (`KEY SHARE`) are not blocked. A `LATERAL ... LIMIT budget` with `SKIP LOCKED` leases exactly the remaining budget.                                                                                                    | Leasers of the same capped queue serialize for the length of one short transaction; uncapped queues keep the single-statement M5 path with no extra cost. The cap is per (tenant, queue) and counts leased jobs, so a job between lease and start still occupies a slot (intended). |
+| **Queue settings via full replacement `PUT`; limits cached 5s per instance**                    | `PUT` is idempotent and makes "clear this limit" explicit (`null`). It creates the queue, so limits can be in place before the first job arrives. The queue rate limit is read on every enqueue, so it is cached (`RATE_LIMIT_SETTINGS_CACHE_TTL_MS`) and forgotten on the instance that served the `PUT`.                                                                                                                                                                                                                                                                                                                             | Other API instances apply a new queue rate limit within the TTL. Concurrency caps are read inside the lease transaction and apply on the next lease.                                                                                                                                |
+| **Bootstrap with a CLI, no "auth off" switch**                                                  | There is no chicken-and-egg admin endpoint and no way to deploy an open API by misconfiguration; the first key is minted by an operator with DB access (`npm run api-key -- create ... --create-tenant`).                                                                                                                                                                                                                                                                                                                                                                                                                              | One extra step in local setup; tests use a helper that mints keys directly.                                                                                                                                                                                                         |
 
 ### Milestone 5
 
@@ -620,19 +707,24 @@ src/
   server.ts           # process entry: loadEnv -> listen -> graceful shutdown
   worker.ts           # worker process entry: loadWorkerEnv -> runtime -> SIGTERM drain
   scheduler.ts        # scheduler process entry: loadSchedulerEnv -> runtime -> SIGTERM release
+  cli/                # api-key operator CLI (tenants, keys, tenant rate limits; Milestone 6)
   config/             # zod env schema (app, database subset, worker, scheduler)
   db/                 # pg pool, query helper, pg error mapping, migration runner + CLI
-  domain/             # AppError hierarchy, job + schedule + stats models, limits, lease + dead-letter
-                      # types, QueueSignals contract
+  domain/             # AppError hierarchy (incl. 401 / 403 / 429), job + schedule + stats + queue +
+                      # tenant / API key / principal models, limits, lease + dead-letter types,
+                      # QueueSignals contract
   lib/                # logger, error mapper, keyset cursor, request fingerprint, cron wrapper,
-                      # single-flight, log throttle
+                      # single-flight, log throttle, API key token format, TTL/LRU cache
   redis/              # ioredis client, keys, coalescer, wake-up publisher + subscriber,
-                      # stats cache store (Lua CAS) + invalidator, QueueSignals (Milestone 5)
-  plugins/            # request-id, central error handler
-  repositories/       # Queue, Job, Lease, DeadLetter, Schedule and QueueStats repositories (all SQL)
-  routes/             # /health, /ready, jobs, DLQ, schedules and stats APIs + zod request schemas
+                      # stats cache store (Lua CAS) + invalidator, QueueSignals (Milestone 5),
+                      # token-bucket rate limit store (Lua, Milestone 6)
+  plugins/            # request-id, central error handler, auth hook (Milestone 6)
+  repositories/       # Tenant, ApiKey, Queue, Job, Lease, DeadLetter, Schedule and QueueStats
+                      # repositories (all SQL)
+  routes/             # /health, /ready, jobs, DLQ, schedules, stats, API keys, queue settings
+                      # + zod request schemas, rate-limit header mapping
   services/           # HealthService, JobService, DlqService, ScheduleService, StatsService +
-                      # StatsCache policy (business rules)
+                      # StatsCache policy, ApiKeyService, QueueService, RateLimiter (business rules)
   scheduler/          # Scheduler loop, advisory-lock leader election, tick, misfire planner, runtime
   worker/             # Worker loop, Reaper, handler registry, backoff + retry policy,
                       # runtime (composition root), built-in handlers
@@ -647,7 +739,7 @@ tests/integration/    # real-Postgres (+ real-Redis) tests (each suite migrates 
 
 - Node.js 20+
 - PostgreSQL 16 (local install or via Docker Compose)
-- Redis 7+ (optional; local install or via Docker Compose). Without it workers poll and stats are uncached
+- Redis 7+ (optional; local install or via Docker Compose). Without it workers poll, stats are uncached and enqueues are not rate limited
 - Docker + Docker Compose (optional, for the full stack)
 
 ### Local
@@ -661,25 +753,40 @@ docker compose up -d postgres redis
 export $(grep -v '^#' .env | xargs)
 npm run migrate:dev
 
+# Every route except /health and /ready needs an API key. Mint the first admin key
+# for the "default" tenant (it owns all pre-M6 data); the token is printed once.
+export PQ_TOKEN=$(npm run --silent api-key:dev -- create --tenant default --role admin --name local-dev | jq -r .token)
+AUTH="authorization: Bearer $PQ_TOKEN"
+
 npm run dev
-# -> http://127.0.0.1:3000/ready
+# -> http://127.0.0.1:3000/ready (public)
+curl -s http://localhost:3000/auth/whoami -H "$AUTH"
 
 # In another terminal: run a worker (consumes the built-in echo + demo queues)
 npm run worker:dev
 
 # Enqueue a job that fails twice, then succeeds, and watch the worker logs
-curl -s -X POST http://localhost:3000/queues/demo/jobs -H 'content-type: application/json' \
+# (the response carries RateLimit-Limit / -Remaining / -Reset)
+curl -si -X POST http://localhost:3000/queues/demo/jobs -H "$AUTH" -H 'content-type: application/json' \
   -d '{"payload":{"durationMs":500,"failUntilAttempt":3},"maxAttempts":5}'
 
 # In a third terminal: run the scheduler (start a second one to see leader election)
 npm run scheduler:dev
 
 # Echo a job every minute
-curl -s -X POST http://localhost:3000/queues/echo/schedules -H 'content-type: application/json' \
+curl -s -X POST http://localhost:3000/queues/echo/schedules -H "$AUTH" -H 'content-type: application/json' \
   -d '{"name":"every-minute","cron":"* * * * *","payload":{"hello":"world"}}'
 
 # Queue stats (x-cache: MISS, then HIT until the queue changes)
-curl -si http://localhost:3000/queues/demo/stats
+curl -si http://localhost:3000/queues/demo/stats -H "$AUTH"
+
+# Cap the demo queue at 2 running jobs fleet-wide and 5 enqueues/s (burst 10)
+curl -s -X PUT http://localhost:3000/queues/demo/settings -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"maxConcurrency":2,"rateLimit":{"perSec":5,"burst":10}}'
+
+# A producer-only key for a service (can enqueue and read, cannot manage)
+curl -s -X POST http://localhost:3000/api-keys -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"name":"billing-service","role":"producer"}'
 ```
 
 Required env vars are documented in `.env.example`. Config validation fails the process immediately if anything required is missing or invalid.
@@ -689,6 +796,8 @@ Required env vars are documented in `.env.example`. Config validation fails the 
 ```bash
 docker compose up --build
 docker compose up -d --scale worker=3   # more workers; SKIP LOCKED shares the queue
+# Bootstrap a tenant and its first admin key with the CLI shipped in the image
+docker compose run --rm app node dist/cli/api-key.js create --tenant acme --role admin --name bootstrap --create-tenant
 ```
 
 Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. Redis is a soft dependency (`required: false`): it is started first so the first wake-up is not missed, but every service runs without it. It runs with persistence off and an LRU memory cap because it only holds derived, disposable state. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The `scheduler` service runs 2 replicas of `node dist/scheduler.js` from the same image: one leads, the other waits on the advisory lock; `stop_grace_period` (20s) exceeds the 10s tick-finish budget so leadership is released cleanly. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory.
@@ -726,7 +835,7 @@ TEST_REDIS_URL=redis://localhost:6379 TEST_DATABASE_URL=... npm test
 
 The worker also reads `DATABASE_URL`, the `PG_*` pool settings, the Redis settings below, `NODE_ENV` and `LOG_LEVEL` (it does not need `PORT`). With `REDIS_URL` set and `WAKEUP_ENABLED=true` it holds two Redis connections (commands + subscriber). Size the worker's `PG_POOL_MAX` between about `WORKER_CONCURRENCY / 2 + 2` and `WORKER_CONCURRENCY + 2` (the 10 / 10 defaults are fine): heartbeats and outcome writes are short and share the pool with the lease and reaper queries. If the pool is too small, outcome writes wait for a connection and fail after `PG_CONNECTION_TIMEOUT_MS`; the job is then re-run after its lease expires (never lost, but wasted work).
 
-Integration suites create a uniquely named schema per suite (`pq_test_<random>`), run the real migrations into it, and drop it afterwards, so they run in parallel and never touch existing data. CI runs them against a `postgres:16` service container after running the compiled migration CLI twice (to prove it is idempotent) and a worker smoke test (start the compiled worker, send SIGTERM, require exit code 0). The worker suites include a concurrency test (8 workers with their own pools, 400 jobs: each runs exactly once and never concurrently with itself), lease-expiry reclaim with fencing of the crashed worker, retry-then-succeed, exhaust-to-failed, timeouts, heartbeats outliving the lease, drain and drain-timeout release, and the real `src/worker.ts` process draining a job on SIGTERM. The DLQ suites cover the `0003` invariants and backfill, stale-lease fencing of dead-lettering, poison detection, 10 concurrent replays of one job (exactly one wins), replay-vs-purge races, concurrent bulk replays (`SKIP LOCKED`, no overlap), and the HTTP API end to end with a real worker. The scheduling suites cover promotion and "never leased before `run_at`", the schedules API, two schedulers in one process (exactly one leads, failover on graceful stop and on a terminated session, concurrent ticks never duplicate, a failed tick rolls back), each misfire policy after a simulated 5 h outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM. The Redis suites (run when `TEST_REDIS_URL` is set; CI runs a `redis:7-alpine` service) use a unique key prefix per test and cover channel isolation, coalescing, dirty-flag TTLs, the refresh claim and CAS, subscriber recovery through a TCP proxy that cuts and restores connections, the stats API cache states and stampede protection across two API instances, `/ready` degraded during an outage, pickup latency with a 20s fallback poll, push vs poll query counts, delayed jobs and retries on time in push mode, and the real `src/worker.ts` picking up a job via a wake-up.
+Integration suites create a uniquely named schema per suite (`pq_test_<random>`), run the real migrations into it, and drop it afterwards, so they run in parallel and never touch existing data. CI runs them against a `postgres:16` service container after running the compiled migration CLI twice (to prove it is idempotent) and a worker smoke test (start the compiled worker, send SIGTERM, require exit code 0). The worker suites include a concurrency test (8 workers with their own pools, 400 jobs: each runs exactly once and never concurrently with itself), lease-expiry reclaim with fencing of the crashed worker, retry-then-succeed, exhaust-to-failed, timeouts, heartbeats outliving the lease, drain and drain-timeout release, and the real `src/worker.ts` process draining a job on SIGTERM. The DLQ suites cover the `0003` invariants and backfill, stale-lease fencing of dead-lettering, poison detection, 10 concurrent replays of one job (exactly one wins), replay-vs-purge races, concurrent bulk replays (`SKIP LOCKED`, no overlap), and the HTTP API end to end with a real worker. The scheduling suites cover promotion and "never leased before `run_at`", the schedules API, two schedulers in one process (exactly one leads, failover on graceful stop and on a terminated session, concurrent ticks never duplicate, a failed tick rolls back), each misfire policy after a simulated 5 h outage, and two real `src/scheduler.ts` processes handing over leadership on SIGTERM. The Redis suites (run when `TEST_REDIS_URL` is set; CI runs a `redis:7-alpine` service) use a unique key prefix per test and cover channel isolation, coalescing, dirty-flag TTLs, the refresh claim and CAS, subscriber recovery through a TCP proxy that cuts and restores connections, the stats API cache states and stampede protection across two API instances, `/ready` degraded during an outage, pickup latency with a 20s fallback poll, push vs poll query counts, delayed jobs and retries on time in push mode, and the real `src/worker.ts` picking up a job via a wake-up. The Milestone 6 suites cover migrations `0005`-`0007` (backfill into `default`, constraints, hash length), the key repository and the CLI, the key API (only the digest at rest, rotation with a grace period, revoke, roles, cross-tenant `404`s), tenant isolation of jobs, DLQ, schedules and stats, the Lua token bucket (Redis clock refill, all-or-nothing, 200 concurrent takes over 4 connections admit exactly the burst, outage fails fast), the rate-limited API across two API instances with fail-open and fail-closed outages, and concurrency caps (parallel lease calls from many connections never over-lease, overlapping capped queues never deadlock, three real workers never exceed the cap).
 
 ### Scheduler configuration
 
@@ -762,32 +871,102 @@ The scheduler also reads `DATABASE_URL`, `PG_*`, the Redis settings (it publishe
 
 Keep `STATS_CACHE_TTL_MS` and `REDIS_KEY_PREFIX` identical across the API, workers and the scheduler of one environment: they all write the same dirty flags.
 
+### Auth and rate limit configuration (API)
+
+| Variable                           | Default | Meaning                                                                                                                         |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `AUTH_CACHE_TTL_MS`                | `5000`  | how long an instance trusts a verified key (0-60000) = how long a revoked key may still work on other instances; `0` = no cache |
+| `AUTH_CACHE_MAX_ENTRIES`           | `10000` | verified keys cached per instance (LRU)                                                                                         |
+| `RATE_LIMIT_ENABLED`               | `true`  | enqueue rate limiting (needs `REDIS_URL`; without Redis it is off)                                                              |
+| `RATE_LIMIT_TENANT_PER_SEC`        | `100`   | default tenant refill rate; per-tenant override via `api-key tenant-rate-limit`                                                 |
+| `RATE_LIMIT_TENANT_BURST`          | `200`   | default tenant bucket size (>= 1)                                                                                               |
+| `RATE_LIMIT_FAIL_MODE`             | `open`  | Redis unavailable: `open` = allow (logged), `closed` = `503` + `Retry-After: 1` (requires `REDIS_URL`)                          |
+| `RATE_LIMIT_SETTINGS_CACHE_TTL_MS` | `5000`  | per-instance cache of queue rate limits; a `PUT` applies at once on the serving instance                                        |
+
+Authentication cannot be switched off. Workers and the scheduler do not authenticate (they talk to Postgres directly) and ignore these settings; concurrency caps need no configuration beyond `PUT /queues/:name/settings`.
+
 ### Scripts
 
-| Script                     | Purpose                                        |
-| -------------------------- | ---------------------------------------------- |
-| `npm run dev`              | tsx watch server                               |
-| `npm run build`            | compile to `dist/`                             |
-| `npm start`                | run compiled server                            |
-| `npm run worker`           | run compiled worker                            |
-| `npm run worker:dev`       | tsx watch worker                               |
-| `npm run scheduler`        | run compiled scheduler                         |
-| `npm run scheduler:dev`    | tsx watch scheduler                            |
-| `npm run migrate`          | apply migrations (compiled, used in Docker/CI) |
-| `npm run migrate:dev`      | apply migrations from source via tsx           |
-| `npm run lint`             | ESLint                                         |
-| `npm run typecheck`        | `tsc --noEmit`                                 |
-| `npm test`                 | Vitest (unit + integration when a DB is set)   |
-| `npm run test:unit`        | unit tests only                                |
-| `npm run test:integration` | integration tests only                         |
-| `npm run format`           | Prettier write                                 |
-| `npm run format:check`     | Prettier check                                 |
+| Script                         | Purpose                                                                                   |
+| ------------------------------ | ----------------------------------------------------------------------------------------- |
+| `npm run dev`                  | tsx watch server                                                                          |
+| `npm run build`                | compile to `dist/`                                                                        |
+| `npm start`                    | run compiled server                                                                       |
+| `npm run worker`               | run compiled worker                                                                       |
+| `npm run worker:dev`           | tsx watch worker                                                                          |
+| `npm run scheduler`            | run compiled scheduler                                                                    |
+| `npm run scheduler:dev`        | tsx watch scheduler                                                                       |
+| `npm run migrate`              | apply migrations (compiled, used in Docker/CI)                                            |
+| `npm run migrate:dev`          | apply migrations from source via tsx                                                      |
+| `npm run api-key -- <cmd>`     | operator CLI (compiled): `create`, `list`, `revoke`, `tenant-create`, `tenant-rate-limit` |
+| `npm run api-key:dev -- <cmd>` | the same CLI from source via tsx                                                          |
+| `npm run lint`                 | ESLint                                                                                    |
+| `npm run typecheck`            | `tsc --noEmit`                                                                            |
+| `npm test`                     | Vitest (unit + integration when a DB is set)                                              |
+| `npm run test:unit`            | unit tests only                                                                           |
+| `npm run test:integration`     | integration tests only                                                                    |
+| `npm run format`               | Prettier write                                                                            |
+| `npm run format:check`         | Prettier check                                                                            |
 
-CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
+CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests, an API smoke test (bootstrap an admin key with the compiled CLI; public probes, `401` without a key, `201, 201, 429 + Retry-After` at burst 2) and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
 
 ## API
 
 All responses are JSON. Every response echoes `x-request-id` (inbound header or a generated UUID).
+
+### Authentication, roles and tenancy (Milestone 6)
+
+Every endpoint except `GET /health` and `GET /ready` requires an API key:
+
+```http
+Authorization: Bearer pq_ab12cd34ef56_kq3V...43 base64url chars...
+```
+
+A key belongs to one tenant and has one role. All resources (queues, jobs, schedules, DLQ entries, stats, API keys) are scoped to the key's tenant: queue names are per tenant, and another tenant's job / schedule / key ids answer `404`. The examples below omit the header for brevity.
+
+| Permission | Endpoints                                                                                                                                                                                                               | `admin` | `producer` | `reader` |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ---------- | -------- |
+| `read`     | `GET /jobs/:id`, `GET /queues/:name/jobs`, `GET /queues/:name/stats`, `GET /queues/:name/dlq`, `GET /dlq/:jobId`, `GET /queues/:name/schedules`, `GET /schedules/:id`, `GET /queues/:name/settings`, `GET /auth/whoami` | yes     | yes        | yes      |
+| `enqueue`  | `POST /queues/:name/jobs`                                                                                                                                                                                               | yes     | yes        | no       |
+| `manage`   | DLQ replay / purge, schedule create / pause / resume / delete, `PUT /queues/:name/settings`, all `/api-keys` endpoints                                                                                                  | yes     | no         | no       |
+
+| Situation                                                                                                      | Response                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No `Authorization` header, not `Bearer`, malformed token, unknown prefix, wrong secret, revoked or expired key | `401 UNAUTHORIZED` + `WWW-Authenticate: Bearer realm="pulsequeue"` (the message says what is wrong with the header, never whether a well-formed key exists, was revoked or expired) |
+| Valid key, role lacks the permission                                                                           | `403 FORBIDDEN` (`details.required`, `details.role`)                                                                                                                                |
+
+The first admin key of a tenant comes from the CLI (`npm run api-key -- create --tenant <id> --role admin --name <name> --create-tenant`, or `node dist/cli/api-key.js ...` in the container); later keys can be managed over HTTP. `npm run api-key -- tenant-rate-limit --tenant <id> --per-sec <n> --burst <n>` (or `--clear`) overrides a tenant's enqueue budget.
+
+### Rate limits (Milestone 6)
+
+`POST /queues/:name/jobs` spends one token from the tenant's bucket and, if the queue has a rate limit, from the queue's bucket (both or neither). Other endpoints are not rate limited. When limiting ran, successful enqueues (including `200` idempotent replays) carry:
+
+| Header                | Meaning                                                                          |
+| --------------------- | -------------------------------------------------------------------------------- |
+| `RateLimit-Limit`     | size (burst) of the bucket closest to refusing                                   |
+| `RateLimit-Remaining` | tokens left in that bucket                                                       |
+| `RateLimit-Reset`     | seconds until that bucket is full again                                          |
+| `Retry-After`         | on `429` only: whole seconds (>= 1) until one token is available in every bucket |
+
+```http
+HTTP/1.1 429 Too Many Requests
+retry-after: 1
+ratelimit-limit: 200
+ratelimit-remaining: 0
+ratelimit-reset: 2
+```
+
+```json
+{
+  "error": {
+    "code": "RATE_LIMITED",
+    "message": "Enqueue rate limit exceeded (tenant); retry in 1s",
+    "details": { "scope": "tenant", "retryAfterMs": 10 }
+  }
+}
+```
+
+`details.scope` is `tenant` or `queue`. Requests rejected by validation (`400`, `413`) do not spend tokens. Without `REDIS_URL` (or with `RATE_LIMIT_ENABLED=false`) there are no rate-limit headers and no `429`s. If Redis is unreachable, `RATE_LIMIT_FAIL_MODE=open` lets enqueues through without headers, `closed` answers `503 SERVICE_UNAVAILABLE` (`details.reason: "rate_limit_unavailable"`, `Retry-After: 1`).
 
 ### `POST /queues/:name/jobs`
 
@@ -842,7 +1021,7 @@ Idempotency semantics:
 | Same key, different body                                 | `422 IDEMPOTENCY_KEY_REUSED`                                            |
 | Same key on a different queue                            | independent job (`201`)                                                 |
 
-Errors: `400 VALIDATION_ERROR` / `BAD_REQUEST` (bad input or malformed JSON), `413 PAYLOAD_TOO_LARGE`, `422 IDEMPOTENCY_KEY_REUSED`, `503 SERVICE_UNAVAILABLE` (database unavailable or timed out).
+Errors: `400 VALIDATION_ERROR` / `BAD_REQUEST` (bad input or malformed JSON), `401 UNAUTHORIZED`, `403 FORBIDDEN` (`reader` key), `413 PAYLOAD_TOO_LARGE`, `422 IDEMPOTENCY_KEY_REUSED`, `429 RATE_LIMITED` (tenant or queue budget spent; see [Rate limits](#rate-limits-milestone-6)), `503 SERVICE_UNAVAILABLE` (database unavailable or timed out, or rate limiting unavailable in `closed` mode).
 
 ### `GET /jobs/:id`
 
@@ -1087,6 +1266,84 @@ The schedule; `404` if unknown, `400` for a non-UUID id.
 
 `204`. Jobs already enqueued by the schedule are not touched.
 
+### Queue settings (Milestone 6)
+
+#### `GET /queues/:name/settings`
+
+Any role. `404` if the tenant has no such queue.
+
+```json
+{
+  "queue": "emails",
+  "maxConcurrency": 5,
+  "rateLimit": { "perSec": 50, "burst": 100 },
+  "updatedAt": "2026-10-27T05:12:09.481Z"
+}
+```
+
+#### `PUT /queues/:name/settings`
+
+Admin only. Full replacement: both fields are required and `null` clears a limit; the queue is created if it does not exist yet, so limits can be set before the first job. Returns `200` with the settings.
+
+| Body field       | Type            | Rules                                                                                                     |
+| ---------------- | --------------- | --------------------------------------------------------------------------------------------------------- |
+| `maxConcurrency` | integer or null | `1`-`10000`: max jobs of this queue running at once across all workers                                    |
+| `rateLimit`      | object or null  | `{ "perSec": 1-100000, "burst": 1-1000000 }`: enqueue token bucket for this queue, on top of the tenant's |
+
+```bash
+curl -X PUT http://localhost:3000/queues/emails/settings -H 'content-type: application/json' \
+  -d '{"maxConcurrency":5,"rateLimit":{"perSec":50,"burst":100}}'
+```
+
+`maxConcurrency` applies to the next lease. Lowering it below the number of running jobs does not stop them; no new job of the queue is leased until enough have finished. The queue rate limit applies at once on the instance that served the `PUT` and within `RATE_LIMIT_SETTINGS_CACHE_TTL_MS` on the others. Logged as `queue.settings_updated`.
+
+### API keys (Milestone 6)
+
+All `/api-keys` endpoints are admin only and act on the caller's tenant. A key resource never contains the secret:
+
+```json
+{
+  "id": "7c0e3f5e-2b8f-4a59-9a0a-1f9a7d3b52c1",
+  "tenantId": "acme",
+  "name": "billing-service",
+  "prefix": "ab12cd34ef56",
+  "role": "producer",
+  "createdAt": "2026-10-27T05:10:00.000Z",
+  "expiresAt": null,
+  "lastUsedAt": "2026-10-27T05:11:42.120Z",
+  "revokedAt": null,
+  "rotatedFrom": null
+}
+```
+
+#### `POST /api-keys`
+
+Body `{ "name": "billing-service", "role": "admin" | "producer" | "reader", "expiresAt"?: ISO-8601 in the future }`. Returns `201`, `Location: /api-keys/:id`, `Cache-Control: no-store` and the key plus `"token": "pq_ab12cd34ef56_..."`. **The token is shown only in this response**; only its SHA-256 digest is stored.
+
+#### `GET /api-keys?limit=<1-200, default 50>&cursor=<opaque>&includeRevoked=<true|false>`
+
+Keyset page `{ "data": [...], "nextCursor": "..." | null }`, newest first; revoked keys are hidden unless `includeRevoked=true`.
+
+#### `GET /api-keys/:id`
+
+One key (`404` if it is not in the caller's tenant).
+
+#### `DELETE /api-keys/:id`
+
+Revoke. Idempotent (`200` with the key, `revokedAt` set; revoking twice keeps the first timestamp). Takes effect at once on the serving instance and within `AUTH_CACHE_TTL_MS` (5s) on others. A key may revoke itself.
+
+#### `POST /api-keys/:id/rotate`
+
+Body (optional) `{ "gracePeriodSeconds": 0-604800 (default 0), "expiresAt"?: ISO-8601 }`. Issues a new key with the same name and role (`rotatedFrom` = old id; `201` with the new token, like create) and revokes the old one now, or lets it expire at the end of the grace period so clients can switch over without downtime. `409 CONFLICT` if the key is already revoked or expired.
+
+### `GET /auth/whoami`
+
+Any role. Returns the calling key's identity, handy when debugging client configuration:
+
+```json
+{ "tenantId": "acme", "keyId": "7c0e3f5e-...", "keyPrefix": "ab12cd34ef56", "role": "producer" }
+```
+
 ### `GET /health`
 
 Liveness probe. Does **not** check Postgres or Redis.
@@ -1117,7 +1374,7 @@ Without `REDIS_URL` there is no `redis` check. Alert on `degraded` (or on `redis
 
 ### Errors
 
-Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `NOT_FOUND` (404), `CONFLICT` / `JOB_NOT_DEAD_LETTERED` (409), `PAYLOAD_TOO_LARGE` (413), `IDEMPOTENCY_KEY_REUSED` (422), `SERVICE_UNAVAILABLE` (503), `INTERNAL_ERROR` (500). All errors use a consistent shape:
+Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `UNAUTHORIZED` (401, with `WWW-Authenticate: Bearer`), `FORBIDDEN` (403), `NOT_FOUND` (404, also for other tenants' resources), `CONFLICT` / `JOB_NOT_DEAD_LETTERED` (409), `PAYLOAD_TOO_LARGE` (413), `IDEMPOTENCY_KEY_REUSED` (422), `RATE_LIMITED` (429, with `Retry-After` and `RateLimit-*`), `SERVICE_UNAVAILABLE` (503), `INTERNAL_ERROR` (500). All errors use a consistent shape:
 
 ```json
 {
@@ -1145,6 +1402,10 @@ Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `NOT_FOUND` (404), `CONFLICT` /
 - **Redis (M5)** removes idle polling: with wake-ups an idle worker issues one lease query per `WORKER_WAKEUP_FALLBACK_POLL_MS` (30s) instead of one per second, so 100 idle workers drop from ~100 to ~3 empty lease queries per second (plus one tiny `min(run_at)` query per idle cycle), while pickup latency falls from up to a poll interval to a few milliseconds. Publishes are coalesced per queue, so Redis load does not grow with enqueue rate. Each worker holds two Redis connections, the API and scheduler one each. Postgres stays the lease authority, so losing Redis degrades latency, not correctness.
 - **Stats** cost one aggregate query per queue per `STATS_CACHE_MIN_REFRESH_MS` at most, cluster-wide, however many dashboards poll; the count is O(jobs in the queue), so very large queues need retention or counter tables (M7/M8). Redis memory is tiny (one small hash and flag per queue) and every key has a TTL.
 - **Redis topology**: a single primary is enough; on Redis Cluster the stats keys are hash-tagged per queue, and pub/sub is broadcast cluster-wide (sharded pub/sub would be the next step at very large scale). A failover that loses writes only loses hints.
+- **Auth (M6)** costs one unique-index probe on `api_keys.prefix` plus one SHA-256 per uncached request; with the 5s per-instance cache a busy producer costs about one lookup per key per instance every 5s. `last_used_at` writes are throttled to one per key per minute and run off the request path, so auth adds no write load proportional to traffic.
+- **Rate limiting (M6)** is one `EVALSHA` per enqueue (two keys, O(1)), on a separate concern from Postgres; a single Redis primary handles well over 100k such calls per second. Bucket keys carry a `{t:<tenant>}` hash tag, so on Redis Cluster both buckets of one request live in one slot and tenants spread across shards. Idle buckets expire as soon as they would be full, so memory is proportional to _active_ tenants and queues. The queue limit lookup is cached per instance for 5s.
+- **Concurrency caps (M6)** cost nothing for uncapped queues (same single lease statement as M5). For capped queues the lease runs in a short transaction that locks the capped queue rows and counts running jobs through the partial `jobs_running_queue_idx` (in-flight rows only), so leasers of the _same_ capped queue serialize for a few milliseconds; with many workers on one capped queue, keep `WORKER_CONCURRENCY` modest and let wake-ups, not tight polling, drive leases. Enqueues are never blocked by these locks (`FOR NO KEY UPDATE` does not conflict with the foreign-key `KEY SHARE` lock).
+- **Multi-tenancy** is row-level in shared tables; per-tenant rate limits and per-queue caps are the noisy-neighbour controls. Very large tenants could later be moved to their own database or partition by `tenant_id`.
 - Capacity numbers and k6 results land in Milestone 8.
 
 ## License
