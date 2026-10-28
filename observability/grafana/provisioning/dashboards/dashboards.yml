@@ -1,0 +1,14 @@
+# Loads every dashboard JSON from /var/lib/grafana/dashboards (mounted from
+# observability/grafana/dashboards). Edits in the UI are not persisted: the
+# JSON in the repo is the source of truth.
+apiVersion: 1
+
+providers:
+  - name: pulsequeue
+    folder: PulseQueue
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
