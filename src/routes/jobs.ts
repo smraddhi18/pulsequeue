@@ -10,12 +10,23 @@ import {
   queueParamsSchema,
 } from './jobs.schemas.js';
 import { principalOf } from '../plugins/auth.js';
+import { NOOP_ENQUEUE_METRICS, type EnqueueMetrics } from '../observability/metrics.js';
+import {
+  DISABLED_TRACING,
+  recordSpanError,
+  SpanKind,
+  type Tracing,
+} from '../observability/tracing.js';
 import { enforceRateLimit } from './rate-limit.js';
 
 export interface JobRoutesOptions {
   jobService: JobService;
   rateLimiter: RateLimiter;
   maxPayloadBytes: number;
+  /** M7: enqueue + rate-limit counters (no-op when omitted). */
+  metrics?: EnqueueMetrics;
+  /** M7: PRODUCER span per enqueue, its traceparent stored on the job. */
+  tracing?: Tracing;
 }
 
 /** Public JSON contract for a job. Built explicitly so storage columns never leak. */
@@ -61,6 +72,8 @@ export const IDEMPOTENT_REPLAY_HEADER = 'idempotent-replayed';
  */
 export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): Promise<void> {
   const { jobService, rateLimiter } = opts;
+  const metrics = opts.metrics ?? NOOP_ENQUEUE_METRICS;
+  const tracing = opts.tracing ?? DISABLED_TRACING;
 
   app.post(
     '/queues/:name/jobs',
@@ -83,6 +96,7 @@ export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): P
         name,
         principal.tenantRateLimit,
       );
+      metrics.rateLimitDecision(decision);
       if (decision.outcome === 'limited') {
         request.log.info(
           {
@@ -97,18 +111,48 @@ export async function jobRoutes(app: FastifyInstance, opts: JobRoutesOptions): P
       }
       enforceRateLimit(reply, decision);
 
-      const { job, created } = await jobService.enqueue({
-        tenantId: principal.tenantId,
-        queue: name as QueueName,
-        payload: body.payload,
-        ...(body.priority !== undefined ? { priority: body.priority } : {}),
-        ...(body.delayMs !== undefined ? { delayMs: body.delayMs } : {}),
-        ...(body.runAt !== undefined ? { runAt: body.runAt } : {}),
-        ...(body.maxAttempts !== undefined ? { maxAttempts: body.maxAttempts } : {}),
-        ...(headers['idempotency-key'] !== undefined
-          ? { idempotencyKey: headers['idempotency-key'] }
-          : {}),
+      // PRODUCER span, child of the request span. Its traceparent goes on the
+      // row; each worker attempt starts a CONSUMER span under it, so one
+      // trace shows request -> enqueue -> attempt 1..n even hours later.
+      const span = tracing.startSpan('pulsequeue.enqueue', {
+        kind: SpanKind.PRODUCER,
+        ...(request.span !== null ? { parent: tracing.contextWithSpan(request.span) } : {}),
+        attributes: {
+          'messaging.system': 'pulsequeue',
+          'messaging.operation.type': 'send',
+          'messaging.destination.name': name,
+          'pulsequeue.tenant_id': principal.tenantId,
+        },
       });
+      const traceparent = tracing.traceparentOf(span);
+
+      let result;
+      try {
+        result = await jobService.enqueue({
+          tenantId: principal.tenantId,
+          queue: name as QueueName,
+          payload: body.payload,
+          ...(body.priority !== undefined ? { priority: body.priority } : {}),
+          ...(body.delayMs !== undefined ? { delayMs: body.delayMs } : {}),
+          ...(body.runAt !== undefined ? { runAt: body.runAt } : {}),
+          ...(body.maxAttempts !== undefined ? { maxAttempts: body.maxAttempts } : {}),
+          ...(headers['idempotency-key'] !== undefined
+            ? { idempotencyKey: headers['idempotency-key'] }
+            : {}),
+          ...(traceparent !== null ? { traceparent } : {}),
+        });
+      } catch (err) {
+        recordSpanError(span, err);
+        throw err;
+      } finally {
+        if (result !== undefined) {
+          span.setAttribute('messaging.message.id', result.job.id);
+          span.setAttribute('pulsequeue.idempotent_replay', !result.created);
+        }
+        span.end();
+      }
+      const { job, created } = result;
+      metrics.jobEnqueued(principal.tenantId, name, created ? 'created' : 'duplicate');
 
       if (created) {
         request.log.info(
