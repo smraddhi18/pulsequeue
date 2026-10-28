@@ -2,14 +2,14 @@
 
 A production-style distributed job queue for Node.js services, built in TypeScript with Fastify, PostgreSQL and Redis. Producers enqueue jobs over an HTTP API, workers lease and execute them with retries and exponential backoff, failed jobs go to a dead-letter queue, and a dashboard API reports queue health.
 
-This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 6 (per-tenant API keys hashed at rest, tenant isolation, Redis token-bucket enqueue rate limits per tenant and per queue, and fleet-wide queue concurrency limits enforced in leasing) is done.**
+This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 7 (tenant-scoped dashboard API for depth, throughput, latency percentiles and failure rate; Prometheus metrics from the API, workers and scheduler on a separate token-protected listener; OpenTelemetry traces from the HTTP request through `jobs.traceparent` into every execution attempt; Prometheus + Grafana + Jaeger in docker-compose) is done.**
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     P[Producer services] -->|"POST /queues/:name/jobs<br/>Authorization: Bearer pq_...<br/>Idempotency-Key"| API
-    O[Operators / dashboards] -->|"GET /jobs/:id, /queues/:name/jobs<br/>GET /queues/:name/stats"| API
+    O[Operators / dashboards] -->|"GET /jobs/:id, /queues/:name/jobs<br/>GET /queues/:name/stats<br/>GET /dashboard/queues/... (M7)"| API
     OP[Operators / runbooks] -->|"DLQ inspect / replay / purge<br/>schedules CRUD, pause, resume"| API
     AD[Tenant admins] -->|"POST/GET/DELETE /api-keys, POST /api-keys/:id/rotate<br/>GET/PUT /queues/:name/settings, GET /auth/whoami"| API
     LB[Load balancer / k8s probes] -->|"/health, /ready (public)<br/>(redis down = degraded, still 200)"| API
@@ -17,11 +17,12 @@ flowchart LR
 
     subgraph API[Fastify API - stateless, N replicas]
         direction TB
+        OBP[Observability hooks onRequest / onResponse<br/>SERVER span from inbound traceparent, trace_id in logs,<br/>HTTP histogram by route template] --> AU
         AU[Auth hook onRequest<br/>every route declares access: public / read / enqueue / manage<br/>Bearer pq_prefix_secret, lookup by prefix,<br/>SHA-256 + timingSafeEqual, LRU cache AUTH_CACHE_TTL_MS<br/>401 / 403] --> RT
-        RT[Routes<br/>zod validation, thin<br/>jobs, dlq, schedules, stats, api-keys, queue settings] --> RL
+        RT[Routes<br/>zod validation, thin<br/>jobs, dlq, schedules, stats, dashboard, api-keys, queue settings] --> RL
         RL[RateLimiter enqueue only<br/>tenant bucket + optional queue bucket<br/>429 + Retry-After + RateLimit-*<br/>fail open / closed] --> SV
-        RT --> SV[Services<br/>JobService, DlqService, ScheduleService, StatsService,<br/>ApiKeyService, QueueService, HealthService<br/>every query scoped by principal.tenantId]
-        SV --> RP[Repositories<br/>Tenant, ApiKey, Queue, Job, DeadLetter, Schedule, QueueStats<br/>all SQL lives here]
+        RT --> SV[Services<br/>JobService, DlqService, ScheduleService, StatsService,<br/>ApiKeyService, QueueService, DashboardService, HealthService<br/>every query scoped by principal.tenantId]
+        SV --> RP[Repositories<br/>Tenant, ApiKey, Queue, Job, DeadLetter, Schedule, QueueStats, Dashboard<br/>all SQL lives here]
         SV --> SIG[QueueSignals<br/>after COMMIT: jobsRunnable / jobsChanged<br/>coalesced per queue]
     end
 
@@ -30,9 +31,9 @@ flowchart LR
         TN[tenants<br/>slug id, optional rate limit override]
         AK[api_keys<br/>prefix UNIQUE, secret_hash = sha256 bytea,<br/>role admin / producer / reader,<br/>expires_at, revoked_at, rotated_from]
         QU[queues<br/>UNIQUE tenant_id, name<br/>max_concurrency, rate_limit_per_sec / burst]
-        JT[jobs<br/>queued / scheduled / running / succeeded / dead<br/>jobs_ready_idx, jobs_running_queue_idx]
+        JT[jobs<br/>queued / scheduled / running / succeeded / dead<br/>jobs_ready_idx, jobs_running_queue_idx<br/>traceparent of the enqueue span]
         ST[schedules]
-        AT[job_attempts]
+        AT[job_attempts<br/>queue_id, ready_at for queue wait<br/>job_attempts_queue_finished_idx]
         TN -.- AK
         TN -.- QU
         QU -.- JT
@@ -48,7 +49,7 @@ flowchart LR
     end
 
     RP -->|"pg Pool"| PG
-    MG[migrate job<br/>0001-0007, advisory lock] -->|DDL| PG
+    MG[migrate job<br/>0001-0008, advisory lock] -->|DDL| PG
     RL -->|"EVALSHA token bucket<br/>(one round trip per enqueue)"| TB
     SV -->|"stats read-through, Lua CAS"| SC
     SIG -.->|"PUBLISH wake-up"| CH
@@ -77,6 +78,61 @@ flowchart LR
 ```
 
 Solid lines are the durable path through Postgres. Dotted lines from and to Redis are best-effort hints (wake-ups, dirty flags): losing any of them costs latency or one extra query, never a job. The token buckets are the one piece of Redis state that enforces something; it is still disposable (a lost bucket refills, i.e. a burst is allowed once) and with Redis down the limiter fails open by default (`RATE_LIMIT_FAIL_MODE=closed` refuses enqueues instead). Redis is optional; without `REDIS_URL` the dotted lines and rate limiting simply do not exist. Authentication and the queue concurrency limit live entirely in Postgres and work without Redis.
+
+### Observability architecture (Milestone 7)
+
+```mermaid
+flowchart LR
+    C[Caller<br/>traceparent header optional] -->|"POST /queues/:name/jobs"| API
+    D[Dashboards / UI<br/>reader key] -->|"GET /dashboard/queues<br/>/dashboard/queues/:name/throughput, latency, failure-rate"| API
+
+    subgraph API[API process]
+        direction TB
+        H[onRequest: SERVER span + trace_id in request log<br/>onResponse: http_request_duration_seconds by route template]
+        E[enqueue route: PRODUCER span pulsequeue.enqueue<br/>jobs_enqueued_total created / duplicate]
+        DS[DashboardService<br/>zod window / bucket, tenant-scoped SQL]
+        MA["/metrics listener :9464, bearer token<br/>queue_depth gauge read lazily, cached, timed out"]
+        H --> E
+        H --> DS
+    end
+
+    subgraph PG[PostgreSQL]
+        J[jobs.traceparent<br/>W3C context of the enqueue span]
+        A[job_attempts.queue_id, ready_at<br/>job_attempts_queue_finished_idx<br/>INCLUDE status, started_at, ready_at]
+    end
+
+    subgraph W[Worker process]
+        direction TB
+        X[job.execute CONSUMER span<br/>parent = jobs.traceparent<br/>trace_id / span_id in job logs]
+        MW["/metrics listener :9464<br/>leased, completed, failed, dead-lettered,<br/>execution + queue-wait histograms,<br/>lease lost, reaper, in-flight"]
+    end
+
+    subgraph S[Scheduler process]
+        MS["/metrics listener :9464<br/>is_leader, ticks, occurrences"]
+    end
+
+    E -->|"INSERT ... traceparent"| J
+    DS -->|"date_bin buckets, percentile_cont,<br/>index-only range scans"| A
+    MA -->|"count per queue x status<br/>READ ONLY, statement_timeout"| PG
+    J -->|"lease returns traceparent"| X
+    X -->|"attempt row with queue_id, ready_at"| A
+
+    subgraph OBS[Observability stack - docker-compose]
+        PR[(Prometheus<br/>dns_sd per service, Bearer)]
+        GF[Grafana<br/>provisioned datasources + PulseQueue dashboard]
+        JG[(Jaeger all-in-one<br/>OTLP/HTTP :4318, UI :16686)]
+    end
+
+    PR -->|"scrape 15s"| MA
+    PR -->|"scrape 15s"| MW
+    PR -->|"scrape 15s"| MS
+    GF -->|PromQL| PR
+    GF -->|trace search| JG
+    H -.->|"OTLP/HTTP batch export<br/>(TRACING_ENABLED, off by default)"| JG
+    X -.->|"OTLP/HTTP batch export"| JG
+```
+
+Metrics and traces are best-effort side channels: a failed scrape, an unreachable collector or a metrics port that cannot bind is logged and never blocks an enqueue or a job. `/metrics` is deliberately **not** on the public API port (it is a `404` there), so the deny-by-default auth hook is untouched and no tenant key can read another tenant's series.
 
 ## Features
 
@@ -176,9 +232,23 @@ Solid lines are the durable path through Postgres. Dotted lines from and to Redi
 - Zod config for auth and rate limits (e.g. `closed` without `REDIS_URL` is rejected at startup); compose and CI updated: CI bootstraps an admin key with the compiled CLI, boots the compiled API and checks public probes, `401` without a key, and `201, 201, 429 + Retry-After` at burst 2
 - Tests: token parsing / generation (no modulo bias), the auth plugin (401 / 403 / public routes / startup guard), `ApiKeyService` (cache, expiry, rotation), `RateLimiter` policy (binding bucket, fail open / closed) and header mapping as unit tests; real-Postgres + real-Redis tests for migrations `0005`-`0007` (backfill to `default`, constraints), the key repository and CLI, the key API (hash at rest, rotation with grace, revocation, cross-tenant `404`s), tenant isolation for jobs, DLQ and schedules, the Lua bucket (refill on the Redis clock, all-or-nothing, **no over-admission under 200 concurrent takes from several connections**), the rate-limited API (two API instances share buckets, tenant and queue limits, fail open / closed through an outage), and **concurrency caps under parallel leasing** (many connections leasing at once and three real workers never exceed the cap, no deadlocks with overlapping capped queues)
 
+**Milestone 7: dashboard API and observability**
+
+- **Dashboard API** (reader role, tenant-scoped like every other read; another tenant's queue is `404`): `GET /dashboard/queues` (depth per status, oldest queued job and its age, concurrency cap; keyset-paginated by name), `GET /dashboard/queues/:name/throughput?window=1h&bucket=1m` (zero-filled, epoch-aligned buckets of enqueued / succeeded / failed / timed-out / dead-lettered plus totals), `GET /dashboard/queues/:name/latency?window=1h` (p50 / p95 / p99 / max of execution time and queue wait, in ms) and `GET /dashboard/queues/:name/failure-rate?window=1h` (attempt failure rate and terminal job failure rate)
+- Zod-validated `window` / `bucket` (`<int><s|m|h|d>`): buckets 10s-1d, windows up to 7d (latency up to 1d), the window must be a whole number of buckets and at most 1440 of them; latency percentiles use at most `DASHBOARD_LATENCY_MAX_SAMPLES` most recent attempts and say so (`truncated`)
+- Migration `0008`: `job_attempts.queue_id` (backfilled) and `ready_at` (when the job became runnable, written at lease time), so queue wait is measured on the database clock; `job_attempts_queue_finished_idx (queue_id, finished_at) INCLUDE (status, started_at, ready_at)` makes every dashboard attempt query an index-only range scan; `jobs.traceparent` with a format `CHECK`
+- **Prometheus metrics** (prom-client, one registry per process, `role` label): `http_request_duration_seconds` by method, **route template** and status (unmatched routes collapse to `__unmatched__`); `jobs_enqueued_total` (created / duplicate), `ratelimit_decisions_total`; worker `jobs_leased_total`, `jobs_completed_total`, `jobs_failed_total` (outcome x disposition), `jobs_dead_lettered_total` (reason x source worker / reaper), `job_execution_seconds`, `job_queue_wait_seconds`, `lease_lost_total` (stage), `jobs_released_total`, `lease_errors_total`, `reaper_reclaimed_total`, `worker_jobs_in_flight`; scheduler `scheduler_is_leader`, `scheduler_leadership_changes_total`, `scheduler_ticks_total`, `scheduler_tick_duration_seconds`, `schedule_occurrences_total`; process metrics outside tests
+- `pulsequeue_queue_depth{tenant,queue,status}` is **read lazily from Postgres at scrape time** by the API: cached (`METRICS_QUEUE_DEPTH_CACHE_MS`), single-flight, `READ ONLY` with its own `statement_timeout`, limited to `METRICS_MAX_QUEUE_SERIES` queues; on failure the scrape still succeeds with the previous snapshot and `queue_depth_collect_errors_total` counts it
+- Label cardinality is bounded: at most `METRICS_MAX_QUEUE_SERIES` tenant/queue pairs per process, the rest are recorded as `__other__`; job ids, raw URLs and error messages are never labels
+- **Metrics listener per process** (`METRICS_PORT`, default host `127.0.0.1`): `GET`/`HEAD /metrics` only, optional bearer token compared in constant time (required in production on a non-loopback host), `401` + `WWW-Authenticate`, `404` / `405` otherwise; a listener that cannot bind is logged (`metrics.listen_failed`) and the process keeps working
+- **OpenTelemetry tracing** (off by default; `TRACING_ENABLED` + `OTEL_EXPORTER_OTLP_ENDPOINT`, OTLP/HTTP, parent-based ratio sampling): a SERVER span per request continues an inbound W3C `traceparent`; the enqueue PRODUCER span's context is stored in `jobs.traceparent`; the worker's `job.execute` CONSUMER span is its child, so one trace covers request -> enqueue -> every attempt (retries included), with outcome, disposition and errors recorded on the span. `trace_id` / `span_id` are added to request and job log lines. Tracing off is a true no-op (nothing stored, nothing exported)
+- docker-compose: **Prometheus** (scrapes app, worker and scheduler replicas through Docker DNS, with the bearer token), **Grafana** (provisioned Prometheus + Jaeger datasources and a PulseQueue dashboard: throughput, failure ratio, DLQ, depth, execution and queue-wait percentiles, HTTP p99 per route, in-flight, lost leases, rate limits, scheduler leadership) and **Jaeger** all-in-one (OTLP :4318, UI :16686)
+- Structured log events: `metrics.listening`, `metrics.listen_failed`, `metrics.scrape_failed`, `metrics.queue_depth_failed`, `metrics.series_limit_reached`, `tracing.enabled`, `tracing.export_failed`; zod config for metrics and tracing (tracing without an endpoint, or an open production metrics port without a token, fail at startup)
+- CI metrics smoke test: the compiled API and worker serve `/metrics` on their own ports, `401` without / with a wrong token, `200` with the HTTP histogram (route template), enqueue counter, queue depth and the worker's completion and queue-wait series, and `404` for `/metrics` on the API port
+- Tests: duration parsing and query schemas, the metrics listener (token, methods, collect failures), series limiter, tracing (disabled no-op, traceparent round trip, invalid input, sampling) and every metrics class as unit tests; real-Postgres tests for the dashboard (exact percentiles over 100 seeded attempts, aligned zero-filled buckets, tenant isolation, validation, truncation), migration `0008` (backfill, `CHECK`, index-only plan), the queue-depth collector (cache, single-flight, queue limit, lock timeout, database down), the metrics lifecycle enqueue -> execute -> retry -> dead-letter through the real API and worker runtime, scheduler leadership metrics on two replicas, and **trace propagation from an HTTP caller through `jobs.traceparent` into the worker span** with matching `trace_id` in logs
+
 ### Planned
 
-- Dashboard API, Prometheus, OpenTelemetry (M7)
 - Load / chaos testing and capacity notes (M8)
 
 ## Enqueue request flow
@@ -450,6 +520,46 @@ sequenceDiagram
 
 Staleness is bounded twice: after a change a reader sees the old numbers for at most `STATS_CACHE_MIN_REFRESH_MS` (default 1s); if the invalidation itself was lost (Redis blip between commit and SET, crashed writer), the entry still expires after `STATS_CACHE_TTL_MS` (default 10s). `computedAt` in the body says when the numbers were true.
 
+## Trace and metrics flow (Milestone 7)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant A as API (observability hooks)
+    participant R as Enqueue route
+    participant PG as PostgreSQL
+    participant W as Worker
+    participant H as Handler
+    participant J as Jaeger (OTLP)
+    participant P as Prometheus
+
+    C->>A: POST /queues/emails/jobs<br/>traceparent: 00-T-c1-01
+    A->>A: SERVER span s1 (parent c1, trace T)<br/>request log gets trace_id T
+    A->>R: auth, validation, rate limit
+    R->>R: PRODUCER span e1 "pulsequeue.enqueue" (child of s1)
+    R->>PG: INSERT job ... traceparent = 00-T-e1-01
+    R-->>C: 201 Created
+    A->>A: observe http_request_duration_seconds{route="/queues/:name/jobs"}<br/>jobs_enqueued_total{result="created"}
+    A-->>J: batch export s1, e1 (async, best effort)
+    W->>PG: lease (SKIP LOCKED) returns traceparent,<br/>attempt row gets queue_id + ready_at = run_at
+    W->>W: jobs_leased_total, job_queue_wait_seconds (started_at - ready_at, DB clock)
+    W->>W: CONSUMER span x1 "job.execute" (parent e1, trace T)
+    W->>H: run(job), logs carry trace_id T, span_id x1
+    alt success
+        W->>PG: complete (fenced on lease_token)
+        W->>W: jobs_completed_total, job_execution_seconds{outcome="succeeded"}
+    else failure
+        W->>PG: fail: retry (scheduled) or dead-letter (same statement)
+        W->>W: jobs_failed_total{disposition}, jobs_dead_lettered_total{reason, source="worker"},<br/>span status ERROR + exception event
+    end
+    W-->>J: batch export x1 (one trace: request -> enqueue -> each attempt)
+    P->>A: GET :9464/metrics (Bearer) -> HTTP + enqueue series, queue_depth from Postgres (cached)
+    P->>W: GET :9464/metrics (Bearer) -> job series
+```
+
+The worker does not hold a span open across retries: each attempt is its own `job.execute` span with the enqueue span as parent, so a job retried three times shows three sibling attempt spans under one enqueue in Jaeger, with the backoff gaps visible between them. Jobs fired by the scheduler (or replayed from the DLQ) have no caller, so their attempts start a new trace.
+
 ## Data model
 
 ```mermaid
@@ -515,6 +625,7 @@ erDiagram
         int lease_expiries "poison counter, reset on replay"
         int replay_count
         timestamptz last_replayed_at
+        text traceparent "M7, W3C context of the enqueue span (tracing on)"
         timestamptz created_at
         timestamptz updated_at
     }
@@ -546,6 +657,8 @@ erDiagram
         text error
         timestamptz started_at
         timestamptz finished_at
+        bigint queue_id FK "M7, denormalized for dashboard range scans"
+        timestamptz ready_at "M7, jobs.run_at at lease time; NULL before 0008"
     }
 ```
 
@@ -581,9 +694,31 @@ Indexes (see [`0001`](migrations/0001_create_queues_jobs_attempts.sql), [`0002`]
 | `queues_name_idx (name)`                                                                   | workers and the scheduler: a shared fleet consumes a queue name across all tenants                            |
 | `jobs_running_queue_idx (queue_id) WHERE status = running`                                 | concurrency caps: count running jobs per capped queue inside the lease transaction; holds only in-flight rows |
 
-The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries and asserts that they use these indexes.
+Added in Milestone 7 ([`migrations/0008_observability.sql`](migrations/0008_observability.sql)): `jobs.traceparent` (format `CHECK`, `NULL` when tracing is off), `job_attempts.queue_id` (backfilled from `jobs`) and `job_attempts.ready_at`, plus:
+
+| Index                                                                                                                          | Serves                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `job_attempts_queue_finished_idx (queue_id, finished_at) INCLUDE (status, started_at, ready_at) WHERE finished_at IS NOT NULL` | dashboard throughput, latency and failure rate: index-only range scans of one queue's finished attempts in a window |
+
+Dashboard depth counts reuse `jobs_queue_status_created_idx`, enqueue throughput `jobs_queue_created_idx` and dead-letter throughput `jobs_dlq_idx`; no other index was needed.
+
+The integration suite runs `EXPLAIN` on the lease, reaper, pagination and dashboard queries and asserts that they use these indexes.
 
 ## Design decisions and trade-offs
+
+### Milestone 7
+
+| Decision                                                                          | Why                                                                                                                                                                                                                                                                                                                                                        | Trade-off                                                                                                                                                                                                                                                                                             |
+| --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Dashboard numbers computed in SQL from `job_attempts`, not from Prometheus**    | The dashboard API must be tenant-scoped, exact and available without a metrics stack; Postgres already holds every attempt. `date_bin` + `generate_series` give aligned, zero-filled buckets in one statement, `percentile_cont` gives exact percentiles, and the new covering index makes each query an index-only range scan of one queue's window.      | Cost grows with attempts in the window, so windows are capped (7d, latency 1d) and percentiles use at most `DASHBOARD_LATENCY_MAX_SAMPLES` recent attempts (flagged `truncated`). No cache: windows move with `now()`. At very high volume, pre-aggregated rollup tables would replace the raw scans. |
+| **Denormalize `queue_id` and `ready_at` onto `job_attempts`**                     | "Attempts of queue X finished in the last hour" without joining every attempt to `jobs`; attempts never change queue, so the copy cannot go stale. `ready_at` (the job's `run_at` at lease time) makes queue wait `started_at - ready_at` on the database clock, immune to worker clock skew and to retries' backoff.                                      | Two more columns per attempt; rows from before `0008` have no `ready_at` and are excluded from wait percentiles (they still count for throughput and failure rate). The backfill is one statement, fine at this scale; a large table would backfill in batches before the index.                      |
+| **`/metrics` on a separate listener (`METRICS_PORT`), not on the API port**       | Keeps the M6 deny-by-default hook intact (no "public except /metrics" hole), never exposes cross-tenant series to tenant keys, and works the same for workers and schedulers, which have no HTTP server. Loopback by default; a non-loopback production listener refuses to start without `METRICS_TOKEN` (constant-time compare).                         | One more port to wire in deployment; Prometheus needs the bearer token. A metrics port that fails to bind is logged, not fatal, so a misconfiguration costs observability, not job processing.                                                                                                        |
+| **Bounded label cardinality**                                                     | Route templates instead of URLs, `__unmatched__` for 404 scans, no job ids or error messages as labels, and a per-process cap on tenant/queue pairs (`__other__` beyond it), because one tenant creating thousands of queues must not be able to take down Prometheus.                                                                                     | Beyond the cap, per-queue detail is lost in metrics (the dashboard API still has it).                                                                                                                                                                                                                 |
+| **Queue depth read lazily from Postgres at scrape time, in the API only**         | Depth is a property of the database, not of any process, so counting it in worker memory would be wrong across replicas. A collector runs one grouped count when scraped, cached for `METRICS_QUEUE_DEPTH_CACHE_MS`, single-flight, `READ ONLY` with a `statement_timeout`, and limited to N queues; on failure it serves the previous snapshot.           | Each API replica exports the same depth (use `max by (queue)` in PromQL, as the dashboard does), and the value is up to the cache TTL old. Counting `queued` rows is O(backlog); a huge backlog would need counter tables.                                                                            |
+| **Worker counts outcomes where they are decided**                                 | Completed / failed / dead-lettered counters are incremented only after the fenced write succeeds, so a worker that lost its lease does not count work it did not commit (it increments `lease_lost_total{stage}` instead). Reaper reclaims are separate series (`source="reaper"`).                                                                        | Counters are per process and reset on restart; PromQL `rate()` handles resets, and exact historical totals come from the dashboard API.                                                                                                                                                               |
+| **Trace context in a column (`jobs.traceparent`), one span per attempt**          | The queue is the async boundary: storing the enqueue span's W3C context on the row lets any worker, any time later, continue the same trace with no shared state. Each attempt is its own `job.execute` span (CONSUMER) under the enqueue span, so retries and backoff gaps are visible.                                                                   | Only the API and worker are traced; the scheduler and DLQ replays start new traces, and `pg` / `ioredis` calls are not auto-instrumented (explicit spans keep overhead and dependencies small; auto-instrumentation can be layered on later).                                                         |
+| **Tracing off by default, explicit context instead of a global SDK**              | `createTracing` builds a provider per process and passes context explicitly (no global context manager, no monkey-patching), so tests run tracers side by side with in-memory exporters and "off" is a genuine no-op: no spans, no exporter, nothing written to `traceparent`. OTLP/HTTP with a batch processor works with Jaeger, Tempo or any collector. | Libraries that rely on the global OTel API do not see our spans; spans that are not yet exported are lost if a process is killed (flushed on graceful shutdown).                                                                                                                                      |
+| **Prometheus, Grafana and Jaeger as compose services, provisioned from the repo** | `docker compose up` gives a working dashboard with no clicking; the dashboard JSON and scrape config are reviewed like code. Workers and schedulers are discovered through Docker DNS, so scaling needs no config change.                                                                                                                                  | Dev-grade settings (anonymous Viewer in Grafana, a default dev token, in-memory Jaeger storage); production would use real secrets, persistent trace storage and alerting rules.                                                                                                                      |
 
 ### Milestone 6
 
@@ -614,7 +749,7 @@ The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries
 | **Stats cache: invalidate by a dirty flag, not by deleting or rewriting the entry**                                                            | "Delete on write" races: a reader that computed before the commit writes its old result back after the delete and the cache stays wrong until TTL. Writers instead set a flag (O(1), idempotent, coalesced); the reader that later clears the flag (atomic `DEL`, one winner cluster-wide) snapshots _after_ clearing, so any change after that point dirties the new entry again. Writes are a Lua compare-and-set on the snapshot time (`computedAt`), so an older snapshot can never replace a newer one.                                                                          | Every committed change in every process costs one coalesced `SET PX` (about 2 per queue per 100ms when hot).                                                                                                                                                                                                                         |
 | **Serve STALE inside `STATS_CACHE_MIN_REFRESH_MS`, hard TTL as the safety net**                                                                | On a busy queue every change dirties the entry; recomputing on each read would turn the cache into a pass-through exactly when the count query is most expensive. The min-refresh window caps recomputes at about 1 per queue per second across all API instances. The TTL bounds staleness even if invalidations are lost.                                                                                                                                                                                                                                                           | Stats can be up to 1s (min refresh) or, if invalidations were lost, 10s (TTL) behind. Fine for dashboards and autoscalers; anything that needs exact numbers reads jobs directly.                                                                                                                                                    |
 | **Two-level stampede protection** (cluster-wide claim + in-process single-flight)                                                              | The claim ensures one instance recomputes a dirty entry; single-flight ensures N concurrent requests on a cold key cost one query per instance (tested: 20 concurrent requests = 1 query; a regression where a leftover dirty flag made every request force its own query was caught by that test).                                                                                                                                                                                                                                                                                   | A cold key hit by K instances at the same instant still costs K queries (one each); a distributed lock would fix that at the price of lock waits and timeouts on the read path.                                                                                                                                                      |
-| **Stats from one aggregate statement** (correlated subqueries, one snapshot)                                                                   | All numbers are mutually consistent and timestamped with the database clock; each aggregate uses an existing index (no migration needed).                                                                                                                                                                                                                                                                                                                                                                                                                                             | The count is O(jobs in the queue) per recompute; that is the cost the cache amortizes. Very large queues will want counter tables or retention (M7/M8).                                                                                                                                                                              |
+| **Stats from one aggregate statement** (correlated subqueries, one snapshot)                                                                   | All numbers are mutually consistent and timestamped with the database clock; each aggregate uses an existing index (no migration needed).                                                                                                                                                                                                                                                                                                                                                                                                                                             | The count is O(jobs in the queue) per recompute; that is the cost the cache amortizes. Very large queues will want counter tables or retention (M8).                                                                                                                                                                                 |
 | **`/ready`: Redis down = `degraded` with HTTP 200, Postgres down = `not_ready` 503**                                                           | Redis is shared by every replica; failing readiness on it would pull the whole API out of the load balancer during a Redis blip, turning a latency problem into a full outage, even though every request still works. The check stays in the body (and in logs) so monitoring alerts on it.                                                                                                                                                                                                                                                                                           | A load balancer cannot route around a single replica with a broken Redis path; alerting has to look at the body or the `redis.*` logs, not just the status code.                                                                                                                                                                     |
 | **ioredis** (v6) as the client                                                                                                                 | Mature, widely deployed, typed, first-class pub/sub, Lua `defineCommand`, pipelines, Cluster and Sentinel support, and fine-grained failure controls (`enableOfflineQueue`, `commandTimeout`, `maxRetriesPerRequest`, `retryStrategy`, `reconnectOnError`) that make "fail fast, fall back to Postgres" easy to express. `node-redis` v4+ is an equally valid choice (official, RESP3); ioredis' explicit offline-queue and per-command timeout semantics fit this design slightly better.                                                                                            | One more runtime dependency. Fail-fast settings mean commands issued during a reconnect fail immediately (by design: callers fall back).                                                                                                                                                                                             |
 | **Keys and channels namespaced by `REDIS_KEY_PREFIX`, stats keys hash-tagged (`{queue}`) and versioned (`v1`)**                                | Several environments can share one Redis; the entry and its dirty flag share a Cluster slot so the read is one pipeline; a deploy that changes the cached shape starts from fresh keys instead of misreading old ones.                                                                                                                                                                                                                                                                                                                                                                | Key names are an API between versions; the dirty flag is deliberately unversioned so old and new writers invalidate the same entries during a rolling deploy.                                                                                                                                                                        |
@@ -702,6 +837,7 @@ The integration suite runs `EXPLAIN` on the lease, reaper and pagination queries
 
 ```
 migrations/           # forward-only SQL migrations (NNNN_name.sql)
+observability/        # Prometheus scrape config, Grafana provisioning + dashboard JSON (Milestone 7)
 src/
   app.ts              # composition root: config -> pool -> repositories -> services -> routes
   server.ts           # process entry: loadEnv -> listen -> graceful shutdown
@@ -718,13 +854,16 @@ src/
   redis/              # ioredis client, keys, coalescer, wake-up publisher + subscriber,
                       # stats cache store (Lua CAS) + invalidator, QueueSignals (Milestone 5),
                       # token-bucket rate limit store (Lua, Milestone 6)
-  plugins/            # request-id, central error handler, auth hook (Milestone 6)
-  repositories/       # Tenant, ApiKey, Queue, Job, Lease, DeadLetter, Schedule and QueueStats
-                      # repositories (all SQL)
-  routes/             # /health, /ready, jobs, DLQ, schedules, stats, API keys, queue settings
+  observability/      # Prometheus registry + metric classes, /metrics listener, series limiter,
+                      # queue-depth collector, OpenTelemetry tracing (Milestone 7)
+  plugins/            # request-id, central error handler, auth hook (Milestone 6),
+                      # observability hooks: spans, trace_id in logs, HTTP histogram (Milestone 7)
+  repositories/       # Tenant, ApiKey, Queue, Job, Lease, DeadLetter, Schedule, QueueStats and
+                      # Dashboard repositories (all SQL)
+  routes/             # /health, /ready, jobs, DLQ, schedules, stats, dashboard, API keys, queue settings
                       # + zod request schemas, rate-limit header mapping
   services/           # HealthService, JobService, DlqService, ScheduleService, StatsService +
-                      # StatsCache policy, ApiKeyService, QueueService, RateLimiter (business rules)
+                      # StatsCache policy, ApiKeyService, QueueService, RateLimiter, DashboardService
   scheduler/          # Scheduler loop, advisory-lock leader election, tick, misfire planner, runtime
   worker/             # Worker loop, Reaper, handler registry, backoff + retry policy,
                       # runtime (composition root), built-in handlers
@@ -791,16 +930,22 @@ curl -s -X POST http://localhost:3000/api-keys -H "$AUTH" -H 'content-type: appl
 
 Required env vars are documented in `.env.example`. Config validation fails the process immediately if anything required is missing or invalid.
 
-### Docker Compose (migrate + app + worker + scheduler x2 + Postgres 16 + Redis 7)
+### Docker Compose (migrate + app + worker + scheduler x2 + Postgres 16 + Redis 7 + Prometheus + Grafana + Jaeger)
 
 ```bash
 docker compose up --build
 docker compose up -d --scale worker=3   # more workers; SKIP LOCKED shares the queue
 # Bootstrap a tenant and its first admin key with the CLI shipped in the image
 docker compose run --rm app node dist/cli/api-key.js create --tenant acme --role admin --name bootstrap --create-tenant
+# Observability (Milestone 7)
+#   Grafana     http://localhost:3001   (PulseQueue overview dashboard, anonymous read-only; admin/admin to edit)
+#   Prometheus  http://localhost:9090   (Status -> Targets: app, worker and scheduler replicas)
+#   Jaeger      http://localhost:16686  (service pulsequeue-api: request -> enqueue -> job.execute)
+docker compose exec app wget -qO- --header "Authorization: Bearer pulsequeue-dev-metrics-token" http://127.0.0.1:9464/metrics | head
+TRACING_ENABLED=false docker compose up -d   # metrics only, no trace export
 ```
 
-Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. Redis is a soft dependency (`required: false`): it is started first so the first wake-up is not missed, but every service runs without it. It runs with persistence off and an LRU memory cap because it only holds derived, disposable state. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The `scheduler` service runs 2 replicas of `node dist/scheduler.js` from the same image: one leads, the other waits on the advisory lock; `stop_grace_period` (20s) exceeds the 10s tick-finish budget so leadership is released cleanly. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory.
+Postgres and Redis become healthy, the one-shot `migrate` service applies the schema and exits, and only then do `app` and `worker` start. Redis is a soft dependency (`required: false`): it is started first so the first wake-up is not missed, but every service runs without it. It runs with persistence off and an LRU memory cap because it only holds derived, disposable state. The worker runs from the same image (`node dist/worker.js`), reports health through a liveness file its loop touches, and gets a 40s `stop_grace_period` so `docker compose stop` drains in-flight jobs (25s budget) before Docker would SIGKILL it. The `scheduler` service runs 2 replicas of `node dist/scheduler.js` from the same image: one leads, the other waits on the advisory lock; `stop_grace_period` (20s) exceeds the 10s tick-finish budget so leadership is released cleanly. The image is a multi-stage Node 20 build that runs as a non-root user and ships the `migrations/` directory. Since Milestone 7 every app container serves metrics on `:9464` inside the compose network only (not published to the host), Prometheus discovers each replica through Docker DNS, and traces go to Jaeger over OTLP/HTTP; none of the app services depend on the observability containers, so stopping them affects nothing but visibility.
 
 ### Tests
 
@@ -812,6 +957,8 @@ npm run test:unit           # unit only
 npm run test:integration    # integration only (needs TEST_DATABASE_URL or DATABASE_URL)
 TEST_REDIS_URL=redis://localhost:6379 TEST_DATABASE_URL=... npm test
                             # also runs the Redis suites (wake-ups, stats cache, outages)
+# Observability tests need no collector: spans go to an in-memory exporter and
+# metrics listeners bind ephemeral ports (METRICS_PORT=0).
 ```
 
 ### Worker configuration
@@ -885,6 +1032,23 @@ Keep `STATS_CACHE_TTL_MS` and `REDIS_KEY_PREFIX` identical across the API, worke
 
 Authentication cannot be switched off. Workers and the scheduler do not authenticate (they talk to Postgres directly) and ignore these settings; concurrency caps need no configuration beyond `PUT /queues/:name/settings`.
 
+### Observability configuration (API, worker and scheduler)
+
+| Variable                         | Default     | Meaning                                                                                                 |
+| -------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------- |
+| `METRICS_PORT`                   | unset       | port of this process's `/metrics` listener; unset = no listener, `0` = ephemeral (tests)                |
+| `METRICS_HOST`                   | `127.0.0.1` | listener address; a non-loopback address in production requires `METRICS_TOKEN`                         |
+| `METRICS_TOKEN`                  | unset       | bearer token scrapers must send (>= 16 chars, constant-time compare)                                    |
+| `METRICS_MAX_QUEUE_SERIES`       | `1000`      | distinct tenant/queue label pairs per process; further pairs are recorded as `__other__`                |
+| `METRICS_QUEUE_DEPTH_ENABLED`    | `true`      | API only: export `pulsequeue_queue_depth` (read from Postgres on scrape)                                |
+| `METRICS_QUEUE_DEPTH_CACHE_MS`   | `5000`      | API only: reuse a depth snapshot this long (0 = every scrape)                                           |
+| `METRICS_QUEUE_DEPTH_TIMEOUT_MS` | `2000`      | API only: `statement_timeout` of the depth query; on timeout the previous snapshot is served            |
+| `DASHBOARD_LATENCY_MAX_SAMPLES`  | `100000`    | API only: most recent attempts used per latency percentile computation                                  |
+| `TRACING_ENABLED`                | `false`     | OpenTelemetry tracing (API and worker)                                                                  |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`    | unset       | OTLP/HTTP base URL, required when tracing is on (spans go to `<url>/v1/traces`)                         |
+| `OTEL_SERVICE_NAME`              | per role    | defaults to `pulsequeue-api` / `pulsequeue-worker`                                                      |
+| `OTEL_TRACES_SAMPLER_RATIO`      | `1`         | head sampling for new traces (0-1); parent-based, so a sampled inbound `traceparent` is always followed |
+
 ### Scripts
 
 | Script                         | Purpose                                                                                   |
@@ -908,7 +1072,7 @@ Authentication cannot be switched off. Workers and the scheduler do not authenti
 | `npm run format`               | Prettier write                                                                            |
 | `npm run format:check`         | Prettier check                                                                            |
 
-CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests, an API smoke test (bootstrap an admin key with the compiled CLI; public probes, `401` without a key, `201, 201, 429 + Retry-After` at burst 2) and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
+CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests, an API smoke test (bootstrap an admin key with the compiled CLI; public probes, `401` without a key, `201, 201, 429 + Retry-After` at burst 2), a metrics smoke test (API and worker `/metrics` listeners: `401` without the token, expected series with it, `404` on the API port) and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
 
 ## API
 
@@ -1344,6 +1508,106 @@ Any role. Returns the calling key's identity, handy when debugging client config
 { "tenantId": "acme", "keyId": "7c0e3f5e-...", "keyPrefix": "ab12cd34ef56", "role": "producer" }
 ```
 
+### Dashboard (Milestone 7)
+
+Any role (`reader` is enough); everything is scoped to the caller's tenant, and another tenant's queue is `404`. Windows and buckets are durations `<int><s|m|h|d>` (`30s`, `5m`, `1h`, `7d`); invalid values are `400 VALIDATION_ERROR`. All numbers are computed from Postgres per request.
+
+| Parameter | Endpoints                | Default | Bounds                                                                     |
+| --------- | ------------------------ | ------- | -------------------------------------------------------------------------- |
+| `window`  | throughput, failure-rate | `1h`    | 10s-7d                                                                     |
+| `window`  | latency                  | `1h`    | 10s-1d (percentiles sort their samples)                                    |
+| `bucket`  | throughput               | `1m`    | 10s-1d, `<= window`, window must be a whole multiple, at most 1440 buckets |
+| `limit`   | `GET /dashboard/queues`  | `100`   | 1-500                                                                      |
+| `after`   | `GET /dashboard/queues`  |         | queue name from `nextAfter` (keyset by name)                               |
+
+#### `GET /dashboard/queues?limit=<n>&after=<name>`
+
+```json
+{
+  "data": [
+    {
+      "queue": "emails",
+      "counts": { "queued": 120, "scheduled": 4, "running": 10, "dead": 2 },
+      "maxConcurrency": 10,
+      "oldestQueuedAt": "2026-10-28T04:00:00.000Z",
+      "oldestQueuedAgeMs": 42000
+    }
+  ],
+  "nextAfter": null,
+  "computedAt": "2026-10-28T04:00:42.000Z"
+}
+```
+
+#### `GET /dashboard/queues/:name/throughput?window=1h&bucket=1m`
+
+Buckets are aligned to the bucket size (epoch-based, like Prometheus steps), cover `[from, to)`, and are zero-filled. `enqueued` counts jobs created, `succeeded` / `failed` / `timedOut` count finished attempts, `deadLettered` counts jobs moved to the DLQ.
+
+```json
+{
+  "queue": "emails",
+  "from": "2026-10-28T03:01:00.000Z",
+  "to": "2026-10-28T04:01:00.000Z",
+  "bucketMs": 60000,
+  "buckets": [
+    {
+      "start": "2026-10-28T03:01:00.000Z",
+      "enqueued": 31,
+      "succeeded": 29,
+      "failed": 2,
+      "timedOut": 0,
+      "deadLettered": 0
+    }
+  ],
+  "totals": { "enqueued": 1800, "succeeded": 1750, "failed": 41, "timedOut": 3, "deadLettered": 5 }
+}
+```
+
+#### `GET /dashboard/queues/:name/latency?window=1h`
+
+Execution time (`finished_at - started_at`) and queue wait (`started_at - ready_at`, the time a runnable job waited for a worker, on the database clock) over finished attempts (`succeeded`, `failed`, `timed_out`; released attempts are excluded). Percentiles are exact (`percentile_cont`) over at most `sampleLimit` most recent attempts; `truncated: true` means older ones were left out. With no attempts every value is `null` and `samples` is `0`.
+
+```json
+{
+  "queue": "emails",
+  "from": "2026-10-28T03:00:42.000Z",
+  "to": "2026-10-28T04:00:42.000Z",
+  "unit": "ms",
+  "executionMs": { "samples": 1794, "p50": 182.4, "p95": 940.1, "p99": 2210.7, "max": 4980.2 },
+  "queueWaitMs": { "samples": 1794, "p50": 3.1, "p95": 48.9, "p99": 310.5, "max": 1204.4 },
+  "truncated": false,
+  "sampleLimit": 100000
+}
+```
+
+#### `GET /dashboard/queues/:name/failure-rate?window=1h`
+
+`attemptFailureRate` = (failed + timed out) / finished attempts (how flaky the handler is); `jobFailureRate` = dead-lettered / (succeeded + dead-lettered) jobs in the window (how often retries do not save a job). `null` when the denominator is zero.
+
+```json
+{
+  "queue": "emails",
+  "from": "2026-10-28T03:00:42.000Z",
+  "to": "2026-10-28T04:00:42.000Z",
+  "attempts": { "succeeded": 1750, "failed": 41, "timedOut": 3, "total": 1794 },
+  "attemptFailureRate": 0.0245,
+  "jobs": { "succeeded": 1750, "deadLettered": 5 },
+  "jobFailureRate": 0.0028
+}
+```
+
+### Metrics (Milestone 7)
+
+Served by each process on its own listener (`METRICS_PORT`), **not** on the API port (`GET /metrics` there is `404`). `GET` / `HEAD /metrics` only, Prometheus text format; with `METRICS_TOKEN` set a scrape needs `Authorization: Bearer <token>` (`401` + `WWW-Authenticate: Bearer` otherwise).
+
+```bash
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:9464/metrics
+# pulsequeue_http_request_duration_seconds_bucket{le="0.05",method="POST",route="/queues/:name/jobs",status_code="201",role="api"} 41
+# pulsequeue_jobs_enqueued_total{tenant="acme",queue="emails",result="created",role="api"} 41
+# pulsequeue_queue_depth{tenant="acme",queue="emails",status="queued",role="api"} 120
+```
+
+Useful PromQL: `histogram_quantile(0.95, sum by (le) (rate(pulsequeue_job_execution_seconds_bucket{queue="emails"}[5m])))` (p95 execution), `sum(rate(pulsequeue_jobs_dead_lettered_total[5m])) > 0` (DLQ inflow alert), `max by (queue) (pulsequeue_queue_depth{status="queued"})` (backlog; `max` because every API replica exports the same database value), `sum(pulsequeue_scheduler_is_leader) != 1` (leadership alert).
+
 ### `GET /health`
 
 Liveness probe. Does **not** check Postgres or Redis.
@@ -1400,12 +1664,15 @@ Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `UNAUTHORIZED` (401, with `WWW-
 - **Scheduler**: one leader does all firing, so run 2 replicas for availability, not throughput. A tick costs one indexed claim plus one insert and one update per due schedule; at the default batch of 100 with immediate re-ticks a single leader fires thousands of schedules per second, far beyond typical needs (100k schedules at one per minute are about 1.7k fires/s spread over the minute). Each replica holds one connection. Failover time is about `SCHEDULER_LEADER_RETRY_INTERVAL_MS` on graceful exit or a killed process; on a network partition it is bounded by TCP keepalive and Postgres' `tcp_keepalives_*` / `idle_session_timeout` settings. If firing ever outgrows one leader, shard schedules by a hash of the id across several lock keys.
 - **Pagination** cost is O(limit) at any depth thanks to keyset cursors; there are no `OFFSET` scans or total counts.
 - **Redis (M5)** removes idle polling: with wake-ups an idle worker issues one lease query per `WORKER_WAKEUP_FALLBACK_POLL_MS` (30s) instead of one per second, so 100 idle workers drop from ~100 to ~3 empty lease queries per second (plus one tiny `min(run_at)` query per idle cycle), while pickup latency falls from up to a poll interval to a few milliseconds. Publishes are coalesced per queue, so Redis load does not grow with enqueue rate. Each worker holds two Redis connections, the API and scheduler one each. Postgres stays the lease authority, so losing Redis degrades latency, not correctness.
-- **Stats** cost one aggregate query per queue per `STATS_CACHE_MIN_REFRESH_MS` at most, cluster-wide, however many dashboards poll; the count is O(jobs in the queue), so very large queues need retention or counter tables (M7/M8). Redis memory is tiny (one small hash and flag per queue) and every key has a TTL.
+- **Stats** cost one aggregate query per queue per `STATS_CACHE_MIN_REFRESH_MS` at most, cluster-wide, however many dashboards poll; the count is O(jobs in the queue), so very large queues need retention or counter tables (M8). Redis memory is tiny (one small hash and flag per queue) and every key has a TTL.
 - **Redis topology**: a single primary is enough; on Redis Cluster the stats keys are hash-tagged per queue, and pub/sub is broadcast cluster-wide (sharded pub/sub would be the next step at very large scale). A failover that loses writes only loses hints.
 - **Auth (M6)** costs one unique-index probe on `api_keys.prefix` plus one SHA-256 per uncached request; with the 5s per-instance cache a busy producer costs about one lookup per key per instance every 5s. `last_used_at` writes are throttled to one per key per minute and run off the request path, so auth adds no write load proportional to traffic.
 - **Rate limiting (M6)** is one `EVALSHA` per enqueue (two keys, O(1)), on a separate concern from Postgres; a single Redis primary handles well over 100k such calls per second. Bucket keys carry a `{t:<tenant>}` hash tag, so on Redis Cluster both buckets of one request live in one slot and tenants spread across shards. Idle buckets expire as soon as they would be full, so memory is proportional to _active_ tenants and queues. The queue limit lookup is cached per instance for 5s.
 - **Concurrency caps (M6)** cost nothing for uncapped queues (same single lease statement as M5). For capped queues the lease runs in a short transaction that locks the capped queue rows and counts running jobs through the partial `jobs_running_queue_idx` (in-flight rows only), so leasers of the _same_ capped queue serialize for a few milliseconds; with many workers on one capped queue, keep `WORKER_CONCURRENCY` modest and let wake-ups, not tight polling, drive leases. Enqueues are never blocked by these locks (`FOR NO KEY UPDATE` does not conflict with the foreign-key `KEY SHARE` lock).
 - **Multi-tenancy** is row-level in shared tables; per-tenant rate limits and per-queue caps are the noisy-neighbour controls. Very large tenants could later be moved to their own database or partition by `tenant_id`.
+- **Dashboard API (M7)** queries are index-only range scans of `job_attempts_queue_finished_idx` bounded by the window, so their cost is proportional to the attempts of one queue in that window, not to table size; latency percentiles sort at most `DASHBOARD_LATENCY_MAX_SAMPLES` rows. Throughput over 7 days of a very busy queue is the most expensive call; at that volume, minute rollup tables maintained by the worker (or a materialized view refreshed per minute) would make every dashboard query O(buckets).
+- **Metrics (M7)**: a scrape is in-memory except `queue_depth`, which costs at most one grouped count per `METRICS_QUEUE_DEPTH_CACHE_MS` per API instance (scrapers beyond the first hit the cache). Series count is roughly (queues x statuses x histogram buckets) per process, capped by `METRICS_MAX_QUEUE_SERIES`; with 1000 queues the worker's histograms dominate (about 1000 x 2 histograms x 15 series), well within one Prometheus. Beyond that, drop the per-queue label on histograms or use recording rules.
+- **Tracing (M7)** adds two spans per enqueue and one per attempt, batched and exported off the hot path; at high volume set `OTEL_TRACES_SAMPLER_RATIO` (for example `0.05`) or tail-sample in an OTel collector. Writing `traceparent` is 55 bytes per job.
 - Capacity numbers and k6 results land in Milestone 8.
 
 ## License
