@@ -139,6 +139,46 @@ jobs:
           wait "$pid"
           cat api.log
 
+      # Milestone 7: the compiled API and worker each serve Prometheus metrics
+      # on their own listener. Checks: 401 without the bearer token, 200 with
+      # it (HTTP histogram labelled by route template, enqueue counter, queue
+      # depth from Postgres), and that the public API port does NOT serve
+      # /metrics (deny-by-default stays intact).
+      - name: Metrics smoke test (/metrics access and content)
+        env:
+          NODE_ENV: production
+          PORT: 3200
+          METRICS_HOST: 127.0.0.1
+          METRICS_TOKEN: ci-metrics-token-0123456789
+          RATE_LIMIT_ENABLED: 'false'
+        run: |
+          token=$(npm run --silent api-key -- create --tenant ci-metrics --role admin --name ci-metrics --create-tenant | jq -r .token)
+          METRICS_PORT=9464 node dist/server.js > api-metrics.log 2>&1 &
+          api=$!
+          METRICS_PORT=9465 WORKER_QUEUES=echo node dist/worker.js > worker-metrics.log 2>&1 &
+          worker=$!
+          for i in $(seq 1 30); do curl -sf localhost:3200/health > /dev/null && break; sleep 0.5; done
+          curl -sf -X POST localhost:3200/queues/echo/jobs -H "authorization: Bearer $token" \
+            -H 'content-type: application/json' -d '{"payload":{"hello":"metrics"}}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:9464/metrics)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'authorization: Bearer wrong-token-0123456789' localhost:9464/metrics)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $token" localhost:3200/metrics)" = 404
+          curl -sf -H "authorization: Bearer $METRICS_TOKEN" localhost:9464/metrics > api-metrics.txt
+          grep -q 'pulsequeue_http_request_duration_seconds_bucket{.*route="/queues/:name/jobs"' api-metrics.txt
+          grep -q 'pulsequeue_jobs_enqueued_total{.*queue="echo".*result="created"' api-metrics.txt
+          grep -q 'pulsequeue_queue_depth{' api-metrics.txt
+          for i in $(seq 1 20); do
+            curl -sf -H "authorization: Bearer $METRICS_TOKEN" localhost:9465/metrics > worker-metrics.txt || true
+            grep -q 'pulsequeue_jobs_completed_total{.*queue="echo"' worker-metrics.txt && break
+            sleep 0.5
+          done
+          grep -q 'pulsequeue_jobs_completed_total{.*queue="echo"' worker-metrics.txt
+          grep -q 'pulsequeue_job_queue_wait_seconds_bucket' worker-metrics.txt
+          kill -TERM "$api" "$worker"
+          wait "$api"
+          wait "$worker"
+          cat api-metrics.log worker-metrics.log
+
       # Unit tests plus integration tests (each suite migrates its own schema).
       - name: Test
         run: npm test
