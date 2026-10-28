@@ -141,6 +141,86 @@ const rateLimitEnvShape = {
   RATE_LIMIT_SETTINGS_CACHE_TTL_MS: z.coerce.number().int().min(0).max(60_000).default(5_000),
 } as const;
 
+/**
+ * Prometheus metrics (Milestone 7), shared by the API, worker and scheduler.
+ * Every process serves GET /metrics on its own small HTTP listener, never on
+ * the API port: the API's deny-by-default auth stays untouched (tenant API
+ * keys must not see other tenants' series), and workers/schedulers, which
+ * have no HTTP server, expose metrics the same way.
+ */
+const metricsEnvShape = {
+  /** Unset = no metrics listener. 0 = ephemeral port (tests). */
+  METRICS_PORT: z.coerce.number().int().min(0).max(65535).optional(),
+  /** Loopback by default: only a sidecar/agent on the same host can scrape. */
+  METRICS_HOST: z.string().min(1).default('127.0.0.1'),
+  /**
+   * Optional bearer token the scraper must send (Prometheus `authorization`).
+   * Required in production when METRICS_HOST is not a loopback address.
+   */
+  METRICS_TOKEN: z.string().min(16, 'Must be at least 16 characters').optional(),
+  /**
+   * Max distinct tenant/queue label pairs per process. Beyond it, new pairs
+   * are recorded under tenant/queue="__other__", so a tenant creating
+   * thousands of queues cannot blow up Prometheus memory.
+   */
+  METRICS_MAX_QUEUE_SERIES: positiveInt.max(100_000).default(1_000),
+} as const;
+
+/**
+ * OpenTelemetry tracing (Milestone 7). Off by default; when on, spans are
+ * exported over OTLP/HTTP (Jaeger, an OTel collector, Tempo...).
+ */
+const tracingEnvShape = {
+  TRACING_ENABLED: booleanFlag(false),
+  /** OTLP/HTTP base URL, e.g. http://jaeger:4318 (spans go to <url>/v1/traces). */
+  OTEL_EXPORTER_OTLP_ENDPOINT: z
+    .string()
+    .url()
+    .refine((v) => v.startsWith('http://') || v.startsWith('https://'), {
+      message: 'Must be an http:// or https:// URL',
+    })
+    .optional(),
+  /** Overrides the per-process default (pulsequeue-api / -worker / -scheduler). */
+  OTEL_SERVICE_NAME: z.string().trim().min(1).max(100).optional(),
+  /** Head sampling ratio for new traces (parent-based: a sampled caller is always followed). */
+  OTEL_TRACES_SAMPLER_RATIO: z.coerce.number().min(0).max(1).default(1),
+} as const;
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+
+function refineObservability(
+  env: {
+    NODE_ENV: string;
+    METRICS_PORT?: number | undefined;
+    METRICS_HOST: string;
+    METRICS_TOKEN?: string | undefined;
+    TRACING_ENABLED: boolean;
+    OTEL_EXPORTER_OTLP_ENDPOINT?: string | undefined;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (
+    env.METRICS_PORT !== undefined &&
+    env.NODE_ENV === 'production' &&
+    !LOOPBACK_HOSTS.has(env.METRICS_HOST) &&
+    env.METRICS_TOKEN === undefined
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['METRICS_TOKEN'],
+      message:
+        'Required in production when METRICS_HOST is not loopback (metrics would be readable by anyone on the network)',
+    });
+  }
+  if (env.TRACING_ENABLED && env.OTEL_EXPORTER_OTLP_ENDPOINT === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['OTEL_EXPORTER_OTLP_ENDPOINT'],
+      message: 'Required when TRACING_ENABLED is true',
+    });
+  }
+}
+
 const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -163,9 +243,26 @@ const envSchema = z
     STATS_CACHE_MIN_REFRESH_MS: z.coerce.number().int().min(0).max(3_600_000).default(1_000),
     ...authEnvShape,
     ...rateLimitEnvShape,
+    ...metricsEnvShape,
+    ...tracingEnvShape,
+    /** Export pulsequeue_queue_depth (read from Postgres on scrape) from this API instance. */
+    METRICS_QUEUE_DEPTH_ENABLED: booleanFlag(true),
+    /**
+     * Queue depth is recomputed at most once per this interval per instance,
+     * however often (and however many) scrapers hit /metrics. 0 = every scrape.
+     */
+    METRICS_QUEUE_DEPTH_CACHE_MS: z.coerce.number().int().min(0).max(600_000).default(5_000),
+    /** statement_timeout for the depth query: a slow database yields stale gauges, not a hung scrape. */
+    METRICS_QUEUE_DEPTH_TIMEOUT_MS: positiveInt.max(60_000).default(2_000),
+    /**
+     * Max attempts fed into one latency percentile computation (the most
+     * recent ones in the window). Bounds the sort behind percentile_cont.
+     */
+    DASHBOARD_LATENCY_MAX_SAMPLES: positiveInt.max(10_000_000).default(100_000),
   })
   .superRefine((env, ctx) => {
     refineRedis(env, ctx);
+    refineObservability(env, ctx);
     if (env.STATS_CACHE_MIN_REFRESH_MS >= env.STATS_CACHE_TTL_MS) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -260,9 +357,12 @@ const workerEnvSchema = z
     /** Retry backoff: delay = random(0, min(MAX, BASE * 2^(attempt-1))) ("full jitter"). */
     RETRY_BACKOFF_BASE_MS: positiveInt.max(3_600_000).default(1_000),
     RETRY_BACKOFF_MAX_MS: positiveInt.max(86_400_000).default(300_000),
+    ...metricsEnvShape,
+    ...tracingEnvShape,
   })
   .superRefine((env, ctx) => {
     refineRedis(env, ctx);
+    refineObservability(env, ctx);
     if (env.WORKER_WAKEUP_FALLBACK_POLL_MS < env.WORKER_POLL_INTERVAL_MS) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -325,9 +425,12 @@ const schedulerEnvSchema = z
     SCHEDULER_SHUTDOWN_TIMEOUT_MS: positiveInt.max(600_000).default(10_000),
     /** Optional file touched by the scheduler loop (leader or follower) for container healthchecks. */
     SCHEDULER_LIVENESS_FILE: z.string().min(1).optional(),
+    ...metricsEnvShape,
+    ...tracingEnvShape,
   })
   .superRefine((env, ctx) => {
     refineRedis(env, ctx);
+    refineObservability(env, ctx);
     if (env.SCHEDULER_MISFIRE_GRACE_MS < env.SCHEDULER_TICK_INTERVAL_MS * 2) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -344,6 +447,19 @@ export type WorkerEnv = z.infer<typeof workerEnvSchema>;
 export type SchedulerEnv = z.infer<typeof schedulerEnvSchema>;
 /** The Redis settings every process shares (see redisEnvShape). */
 export type RedisEnv = z.infer<typeof redisEnvSchema>;
+/** Metrics + tracing settings every process shares (Milestone 7). */
+export type ObservabilityEnv = Pick<
+  Env,
+  | 'NODE_ENV'
+  | 'METRICS_PORT'
+  | 'METRICS_HOST'
+  | 'METRICS_TOKEN'
+  | 'METRICS_MAX_QUEUE_SERIES'
+  | 'TRACING_ENABLED'
+  | 'OTEL_EXPORTER_OTLP_ENDPOINT'
+  | 'OTEL_SERVICE_NAME'
+  | 'OTEL_TRACES_SAMPLER_RATIO'
+>;
 
 function parseEnv<T extends z.ZodTypeAny>(schema: T, raw: NodeJS.ProcessEnv): z.infer<T> {
   const result = schema.safeParse(raw);
