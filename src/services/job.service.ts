@@ -99,6 +99,7 @@ export class JobService {
       runAt: runAt ?? null,
       idempotencyKey,
       requestFingerprint: fingerprint,
+      ...(input.traceparent !== undefined ? { traceparent: input.traceparent } : {}),
     });
 
     if (!inserted && job.requestFingerprint !== fingerprint) {
