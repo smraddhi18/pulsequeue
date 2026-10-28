@@ -4,6 +4,15 @@ import type { DeadLetterReason } from '../domain/dead-letter.js';
 import { jobQueueRef, type LeasedJob } from '../domain/lease.js';
 import { NOOP_QUEUE_SIGNALS, uniqueQueueRefs, type QueueSignals } from '../domain/signals.js';
 import type { Logger } from '../lib/logger.js';
+import { NOOP_WORKER_METRICS, type WorkerMetrics } from '../observability/metrics.js';
+import {
+  DISABLED_TRACING,
+  recordSpanError,
+  SpanKind,
+  SpanStatusCode,
+  type Span,
+  type Tracing,
+} from '../observability/tracing.js';
 import type { LeaseRepository } from '../repositories/lease.repository.js';
 import type { BackoffOptions } from './backoff.js';
 import {
@@ -86,6 +95,10 @@ export interface WorkerOptions {
   livenessFile?: string;
   /** Injectable randomness for deterministic tests (backoff and poll jitter). */
   random?: () => number;
+  /** M7: Prometheus counters/histograms (no-op when omitted). */
+  metrics?: WorkerMetrics;
+  /** M7: one CONSUMER span per attempt, child of the job's enqueue span (no-op when omitted). */
+  tracing?: Tracing;
 }
 
 export interface StopResult {
@@ -145,6 +158,8 @@ export class Worker {
   private pushMode = false;
   private lastLivenessTouch = 0;
   private readonly signals: QueueSignals;
+  private readonly metrics: WorkerMetrics;
+  private readonly tracing: Tracing;
 
   constructor(private readonly options: WorkerOptions) {
     if (options.queues.length === 0) throw new Error('Worker needs at least one queue');
@@ -161,6 +176,8 @@ export class Worker {
     this.random = options.random ?? Math.random;
     this.logger = options.logger.child({ workerId: options.workerId });
     this.signals = options.signals ?? NOOP_QUEUE_SIGNALS;
+    this.metrics = options.metrics ?? NOOP_WORKER_METRICS;
+    this.tracing = options.tracing ?? DISABLED_TRACING;
   }
 
   /**
@@ -269,6 +286,7 @@ export class Worker {
         consecutiveErrors = 0;
       } catch (err) {
         consecutiveErrors++;
+        this.metrics.leaseError();
         const delay = Math.min(
           pollIntervalMs * 2 ** Math.min(consecutiveErrors - 1, 10),
           MAX_ERROR_BACKOFF_MS,
@@ -292,7 +310,10 @@ export class Worker {
         this.logger.debug({ leased: jobs.length, free }, 'Leased jobs');
         for (const queue of uniqueQueueRefs(jobs.map(jobQueueRef))) this.signals.jobsChanged(queue);
       }
-      for (const job of jobs) this.dispatch(job);
+      for (const job of jobs) {
+        this.metrics.jobLeased(job);
+        this.dispatch(job);
+      }
 
       // A full batch means there is probably more work: poll again at once.
       // So does a wake-up that arrived while the query ran: its job may have
@@ -368,8 +389,39 @@ export class Worker {
     this.inFlight.set(job.attemptId, { job, controller, promise });
   }
 
+  /**
+   * One attempt inside its CONSUMER span. The span's parent is the enqueue
+   * span stored on the row (jobs.traceparent), so attempts appear in the
+   * producer's trace; without a stored context (tracing was off at enqueue,
+   * scheduler-fired jobs) the attempt starts its own trace.
+   */
   private async execute(job: LeasedJob, controller: AbortController): Promise<void> {
-    const log = this.jobLogger(job);
+    const span = this.tracing.startSpan('job.execute', {
+      kind: SpanKind.CONSUMER,
+      parent: this.tracing.contextFromTraceparent(job.traceparent),
+      attributes: {
+        'messaging.system': 'pulsequeue',
+        'messaging.operation.type': 'process',
+        'messaging.destination.name': job.queue,
+        'messaging.message.id': job.jobId,
+        'pulsequeue.tenant_id': job.tenantId,
+        'pulsequeue.attempt': job.attempt,
+        'pulsequeue.max_attempts': job.maxAttempts,
+        'pulsequeue.worker_id': this.options.workerId,
+      },
+    });
+    try {
+      await this.runAttempt(job, controller, span);
+    } catch (err) {
+      recordSpanError(span, err);
+      throw err;
+    } finally {
+      span.end();
+    }
+  }
+
+  private async runAttempt(job: LeasedJob, controller: AbortController, span: Span): Promise<void> {
+    const log = this.jobLogger(job, span);
     const handler = this.options.registry.get(job.queue);
     const startedAt = performance.now();
     log.info('Job attempt started');
@@ -407,15 +459,21 @@ export class Worker {
       heartbeat.stop();
     }
 
-    const durationMs = Math.round(performance.now() - startedAt);
+    const elapsedMs = performance.now() - startedAt;
+    const durationMs = Math.round(elapsedMs);
+    const seconds = elapsedMs / 1000;
     const abortReason: unknown = controller.signal.aborted ? controller.signal.reason : undefined;
 
     if (succeeded) {
       await this.persist(log, 'complete', async () => {
         if (await this.options.store.complete(job)) {
           this.slotFreed(job);
+          this.metrics.jobSucceeded(job, seconds);
+          span.setAttribute('pulsequeue.outcome', 'succeeded');
           log.info({ durationMs, outcome: 'succeeded' }, 'Job attempt succeeded');
         } else {
+          this.metrics.leaseLost(job, 'complete');
+          span.setAttribute('pulsequeue.outcome', 'lease_lost');
           log.warn({ durationMs }, 'Job finished but its lease was lost; result discarded');
         }
       });
@@ -423,11 +481,15 @@ export class Worker {
     }
 
     if (abortReason instanceof LeaseLostError) {
+      this.metrics.leaseLost(job, 'running');
+      span.setAttribute('pulsequeue.outcome', 'lease_lost');
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'lease lost' });
       log.warn({ durationMs }, 'Lease lost while running; stopped without writing an outcome');
       return;
     }
 
     if (abortReason instanceof ShutdownAbortError) {
+      span.setAttribute('pulsequeue.outcome', 'released');
       await this.releaseLease(job, log, abortReason.message);
       return;
     }
@@ -441,6 +503,7 @@ export class Worker {
       this.random,
     );
     const retryDelayMs = decision.kind === 'retry' ? decision.delayMs : null;
+    recordSpanError(span, error);
 
     await this.persist(log, 'fail', async () => {
       const disposition = await this.options.store.fail(job, {
@@ -450,9 +513,14 @@ export class Worker {
         ...(decision.kind === 'fail' ? { deadLetterReason: decision.reason } : {}),
       });
       if (disposition === null) {
+        this.metrics.leaseLost(job, 'fail');
+        span.setAttribute('pulsequeue.outcome', 'lease_lost');
         log.warn({ durationMs, err: error }, 'Job failed but its lease was lost; nothing written');
         return;
       }
+      this.metrics.jobFailed(job, attemptStatus, disposition, seconds);
+      span.setAttribute('pulsequeue.outcome', attemptStatus);
+      span.setAttribute('pulsequeue.disposition', disposition);
       if (decision.kind === 'retry') {
         // The retry has a later run_at; idle push-mode workers re-read the
         // next due time when woken, so it is not left to the fallback poll.
@@ -464,6 +532,7 @@ export class Worker {
         return;
       }
       this.slotFreed(job);
+      this.metrics.jobDeadLettered(job, decision.reason, 'worker');
       log.error(
         {
           event: 'dlq.dead_lettered',
@@ -542,9 +611,13 @@ export class Worker {
     await this.persist(log, 'release', async () => {
       const released = await this.options.store.release(job, reason);
       if (released) {
+        this.metrics.jobReleased(job);
         this.signals.jobsRunnable(jobQueueRef(job));
         log.info({ reason }, 'Lease released, job requeued');
-      } else log.warn({ reason }, 'Lease already lost, nothing to release');
+      } else {
+        this.metrics.leaseLost(job, 'release');
+        log.warn({ reason }, 'Lease already lost, nothing to release');
+      }
     });
   }
 
@@ -573,7 +646,8 @@ export class Worker {
     }
   }
 
-  private jobLogger(job: LeasedJob): Logger {
+  /** Every line about one attempt carries the job ids and, when traced, trace_id/span_id. */
+  private jobLogger(job: LeasedJob, span?: Span): Logger {
     return this.logger.child({
       jobId: job.jobId,
       tenantId: job.tenantId,
@@ -582,6 +656,7 @@ export class Worker {
       maxAttempts: job.maxAttempts,
       attemptId: job.attemptId,
       attemptNumber: job.attemptNumber,
+      ...(span !== undefined ? this.tracing.logFields(span) : {}),
     });
   }
 
