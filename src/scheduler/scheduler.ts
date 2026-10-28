@@ -1,6 +1,8 @@
 import { writeFile } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import type { Queryable } from '../db/pool.js';
 import type { Logger } from '../lib/logger.js';
+import { NOOP_SCHEDULER_METRICS, type SchedulerMetrics } from '../observability/metrics.js';
 import { Sleeper, jitter } from '../worker/sleeper.js';
 import type { LeaderLock } from './leader-lock.js';
 import type { TickResult } from './tick.js';
@@ -22,6 +24,8 @@ export interface SchedulerOptions {
   maxConsecutiveFailures?: number;
   livenessFile?: string;
   random?: () => number;
+  /** M7: leadership gauge, tick counters and durations (no-op when omitted). */
+  metrics?: SchedulerMetrics;
 }
 
 export type SchedulerRole = 'leader' | 'follower';
@@ -58,12 +62,14 @@ export class Scheduler {
   private stopPromise: Promise<void> | null = null;
   private leader = false;
   private failures = 0;
+  private readonly metrics: SchedulerMetrics;
   private lastLivenessTouch = 0;
 
   constructor(private readonly options: SchedulerOptions) {
     this.random = options.random ?? Math.random;
     this.maxBatches = options.maxBatchesPerTick ?? DEFAULT_MAX_BATCHES_PER_TICK;
     this.maxFailures = options.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES;
+    this.metrics = options.metrics ?? NOOP_SCHEDULER_METRICS;
   }
 
   get role(): SchedulerRole {
@@ -116,9 +122,11 @@ export class Scheduler {
       if (!acquired) return this.retryDelay();
       this.leader = true;
       this.failures = 0;
+      this.metrics.leadershipChanged('acquired');
       logger.info({ event: 'scheduler.leader_acquired', schedulerId }, 'Became scheduler leader');
     }
 
+    const tickStartedAt = performance.now();
     try {
       const total: TickResult = { claimed: 0, fired: 0, duplicates: 0, skipped: 0, errors: 0 };
       let batches = 0;
@@ -130,11 +138,13 @@ export class Scheduler {
         full = r.claimed >= this.options.batchSize;
       } while (full && batches < this.maxBatches && !this.stopping);
       this.failures = 0;
+      this.metrics.tickCompleted(total, (performance.now() - tickStartedAt) / 1000);
       logger.debug({ event: 'scheduler.tick', schedulerId, batches, ...total }, 'Scheduler tick');
       // Still behind after maxBatches: yield briefly, then continue.
       return full ? 0 : jitter(this.options.tickIntervalMs, 0.1, this.random);
     } catch (err) {
       this.failures++;
+      this.metrics.tickFailed((performance.now() - tickStartedAt) / 1000);
       logger.error(
         { event: 'scheduler.tick_failed', schedulerId, err, consecutiveFailures: this.failures },
         'Scheduler tick failed',
@@ -191,6 +201,7 @@ export class Scheduler {
     this.leader = false;
     await this.options.lock.release();
     if (wasLeader) {
+      this.metrics.leadershipChanged('released');
       this.options.logger.info(
         { event: 'scheduler.leader_released', schedulerId: this.options.schedulerId },
         'Released scheduler leadership',
@@ -204,6 +215,7 @@ export class Scheduler {
 
   private stepDown(reason: 'session_lost' | 'too_many_failures'): void {
     this.leader = false;
+    this.metrics.leadershipChanged('lost');
     this.options.logger.warn(
       { event: 'scheduler.leader_lost', schedulerId: this.options.schedulerId, reason },
       'Lost scheduler leadership',
