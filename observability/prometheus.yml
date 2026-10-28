@@ -1,0 +1,48 @@
+# Prometheus scrape config for the docker-compose stack (Milestone 7).
+#
+# Every PulseQueue process serves /metrics on its own listener (port 9464),
+# separate from the public API port and protected by a bearer token. Workers
+# and schedulers are scaled replicas, so they are discovered through Docker's
+# embedded DNS (one A record per replica) instead of a static target list:
+# `docker compose up --scale worker=3` is picked up without a config change.
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: pulsequeue-api
+    # Dev token; must match METRICS_TOKEN in docker-compose.yml. In a real
+    # deployment use credentials_file with a mounted secret instead.
+    authorization:
+      type: Bearer
+      credentials: pulsequeue-dev-metrics-token
+    dns_sd_configs:
+      - names: ['app']
+        type: A
+        port: 9464
+        refresh_interval: 15s
+
+  - job_name: pulsequeue-worker
+    authorization:
+      type: Bearer
+      credentials: pulsequeue-dev-metrics-token
+    dns_sd_configs:
+      - names: ['worker']
+        type: A
+        port: 9464
+        refresh_interval: 15s
+
+  - job_name: pulsequeue-scheduler
+    authorization:
+      type: Bearer
+      credentials: pulsequeue-dev-metrics-token
+    dns_sd_configs:
+      - names: ['scheduler']
+        type: A
+        port: 9464
+        refresh_interval: 15s
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
