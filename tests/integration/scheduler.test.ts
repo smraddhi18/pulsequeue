@@ -382,6 +382,20 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
   });
 
   describe('Scheduler runtime: two replicas', () => {
+    /** Sum of a metric's samples on one replica's registry (optionally filtered by one label). */
+    async function metric(
+      runtime: SchedulerRuntime,
+      name: string,
+      label?: [string, string],
+    ): Promise<number> {
+      const found = runtime.observability.registry.getSingleMetric(name);
+      if (!found) return 0;
+      const { values } = await found.get();
+      return values
+        .filter((v) => !label || (v.labels as Record<string, unknown>)[label[0]] === label[1])
+        .reduce((sum, v) => sum + v.value, 0);
+    }
+
     function startReplica(id: string, lock?: PgAdvisoryLeaderLock) {
       const log = capture();
       const env = loadSchedulerEnv({
@@ -423,8 +437,26 @@ describeWithDb('scheduler (Postgres)', { timeout: 30_000 }, () => {
       await expect.poll(async () => (await jobsFor(first.id)).length).toBe(1);
       expect(follower.log.count('scheduler.fired')).toBe(0);
 
+      // Leadership is visible in metrics: exactly one replica reports is_leader=1.
+      expect(await metric(leader.runtime, 'pulsequeue_scheduler_is_leader')).toBe(1);
+      expect(await metric(follower.runtime, 'pulsequeue_scheduler_is_leader')).toBe(0);
+      expect(
+        await metric(leader.runtime, 'pulsequeue_schedule_occurrences_total', ['outcome', 'fired']),
+      ).toBe(1);
+      expect(
+        await metric(leader.runtime, 'pulsequeue_scheduler_ticks_total', ['result', 'ok']),
+      ).toBeGreaterThan(0);
+      expect(await metric(follower.runtime, 'pulsequeue_scheduler_ticks_total')).toBe(0);
+
       await leader.runtime.stop();
       expect(leader.log.count('scheduler.leader_released')).toBe(1);
+      expect(await metric(leader.runtime, 'pulsequeue_scheduler_is_leader')).toBe(0);
+      expect(
+        await metric(leader.runtime, 'pulsequeue_scheduler_leadership_changes_total', [
+          'event',
+          'released',
+        ]),
+      ).toBe(1);
       await expect.poll(() => follower.runtime.scheduler.role, { timeout: 5_000 }).toBe('leader');
 
       const second = await createSchedule('after-failover');

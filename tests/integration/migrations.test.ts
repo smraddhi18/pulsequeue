@@ -139,6 +139,41 @@ describeWithDb('migration runner (Postgres)', () => {
     );
     expect(rows).toEqual([{ tenant_id: 'default', jobs: '1' }]);
   });
+
+  it('upgrades an M6 database: 0008 backfills job_attempts.queue_id, leaves ready_at unknown', async () => {
+    const db = await freshDb();
+    const dir = await mkdtemp(path.join(tmpdir(), 'pq-mig-0008-'));
+    tempDirs.push(dir);
+    const files = (await readdir(DEFAULT_MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')).sort();
+    for (const f of files.filter((f) => f < '0008')) {
+      await cp(path.join(DEFAULT_MIGRATIONS_DIR, f), path.join(dir, f));
+    }
+    await runMigrations(db.pool, { dir });
+    const { rows: queues } = await db.pool.query<{ id: string }>(
+      "INSERT INTO queues (name) VALUES ('history') RETURNING id",
+    );
+    const { rows: jobs } = await db.pool.query<{ id: string }>(
+      "INSERT INTO jobs (queue_id, payload, status, attempts) VALUES ($1, '{}', 'succeeded', 1) RETURNING id",
+      [queues[0]!.id],
+    );
+    await db.pool.query(
+      `INSERT INTO job_attempts (job_id, attempt_number, status, started_at, finished_at)
+       VALUES ($1, 1, 'succeeded', now() - interval '2 seconds', now())`,
+      [jobs[0]!.id],
+    );
+
+    const result = await runMigrations(db.pool);
+    expect(result.applied).toHaveLength(1);
+    expect(result.applied[0]).toMatch(/^0008_/);
+    const { rows } = await db.pool.query<{ queue_id: string; ready_at: Date | null }>(
+      'SELECT queue_id::text, ready_at FROM job_attempts',
+    );
+    expect(rows).toEqual([{ queue_id: queues[0]!.id, ready_at: null }]);
+    const { rows: traces } = await db.pool.query<{ traceparent: string | null }>(
+      'SELECT traceparent FROM jobs',
+    );
+    expect(traces).toEqual([{ traceparent: null }]);
+  });
 });
 
 describeWithDb('schema invariants (Postgres)', () => {
@@ -298,6 +333,24 @@ describeWithDb('schema invariants (Postgres)', () => {
     });
   });
 
+  describe('observability (0008)', () => {
+    it('accepts well-formed W3C traceparents only', async () => {
+      await insertJob({ traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' });
+      await insertJob({ traceparent: null });
+      for (const bad of [
+        'garbage',
+        '00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01',
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7',
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01; drop',
+      ]) {
+        await expect(insertJob({ traceparent: bad })).rejects.toMatchObject({
+          code: '23514',
+          constraint: 'jobs_traceparent_format',
+        });
+      }
+    });
+  });
+
   describe('query plans', () => {
     async function plan(sql: string, params: unknown[]): Promise<string> {
       const client = await db.pool.connect();
@@ -311,6 +364,19 @@ describeWithDb('schema invariants (Postgres)', () => {
         client.release();
       }
     }
+
+    it('dashboard attempt scans (M7) are index-only on job_attempts_queue_finished_idx', async () => {
+      await db.pool.query('VACUUM ANALYZE job_attempts');
+      const text = await plan(
+        `SELECT count(*) FILTER (WHERE status = 'succeeded'),
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY started_at - ready_at)
+         FROM job_attempts
+         WHERE queue_id = $1 AND finished_at IS NOT NULL
+           AND finished_at >= now() - interval '1 hour' AND finished_at < now()`,
+        [queueId],
+      );
+      expect(text).toContain('Index Only Scan using job_attempts_queue_finished_idx');
+    });
 
     it('running count per queue (M6 concurrency cap) uses jobs_running_queue_idx', async () => {
       const text = await plan(
