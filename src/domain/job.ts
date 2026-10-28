@@ -98,6 +98,12 @@ export interface EnqueueJobInput {
   runAt?: Date;
   maxAttempts?: number;
   idempotencyKey?: string;
+  /**
+   * W3C trace context of the enqueue span (M7). Stored on the row so worker
+   * spans join the producer's trace; not part of the idempotency fingerprint
+   * (a retried request carries a different trace but is the same job).
+   */
+  traceparent?: string;
 }
 
 export interface EnqueueJobResult {

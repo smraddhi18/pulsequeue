@@ -41,6 +41,17 @@ export interface LeasedJob extends LeaseRef {
   workerId: string;
   leaseExpiresAt: Date;
   createdAt: Date;
+  /**
+   * W3C trace context of the enqueue span (M7), or null when the job was
+   * enqueued with tracing off. The execution span is started as its child.
+   * Optional so in-memory test stores need not set it.
+   */
+  traceparent?: string | null;
+  /**
+   * How long the job waited between becoming runnable (run_at) and this
+   * lease, measured on the database clock (M7, queue-wait histogram).
+   */
+  queueWaitMs?: number;
 }
 
 export type AttemptOutcome = 'succeeded' | 'failed' | 'timed_out' | 'released';
