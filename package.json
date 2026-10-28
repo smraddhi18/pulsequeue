@@ -1,7 +1,7 @@
 {
   "name": "pulsequeue",
   "version": "0.1.0",
-  "description": "Production-style distributed job queue for Node.js \u2014 TypeScript, Fastify, PostgreSQL, Redis",
+  "description": "Production-style distributed job queue for Node.js — TypeScript, Fastify, PostgreSQL, Redis",
   "private": true,
   "type": "module",
   "engines": {
@@ -29,11 +29,18 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/core": "^3.0.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.300.0",
+    "@opentelemetry/resources": "^3.0.0",
+    "@opentelemetry/sdk-trace": "^3.0.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
     "cron-parser": "^5.10.2",
     "fastify": "^5.2.1",
     "ioredis": "^6.0.0",
     "pg": "^8.23.1",
     "pino": "^9.6.0",
+    "prom-client": "^15.1.3",
     "zod": "^3.24.2"
   },
   "devDependencies": {

@@ -8,6 +8,20 @@ x-app-env: &app-env
   # polling, and enqueues skip rate limiting (RATE_LIMIT_FAIL_MODE=open).
   REDIS_URL: redis://redis:6379
   REDIS_KEY_PREFIX: pq
+  # Milestone 7: every process (API, worker, scheduler) serves Prometheus
+  # metrics on its own listener, never on the public API port. Bound to all
+  # interfaces inside the compose network (Prometheus scrapes it) but not
+  # published to the host, and protected by a bearer token: production
+  # refuses to start with a non-loopback METRICS_HOST and no token.
+  METRICS_PORT: 9464
+  METRICS_HOST: 0.0.0.0
+  METRICS_TOKEN: ${METRICS_TOKEN:-pulsequeue-dev-metrics-token}
+  # OpenTelemetry traces over OTLP/HTTP to Jaeger (UI on :16686). Off by
+  # default outside this stack; one trace spans HTTP request -> enqueue ->
+  # every execution attempt via jobs.traceparent.
+  TRACING_ENABLED: ${TRACING_ENABLED:-true}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+  OTEL_TRACES_SAMPLER_RATIO: ${OTEL_TRACES_SAMPLER_RATIO:-1}
 
 services:
   # One-shot schema migration. Runs to completion before the API starts, so
@@ -196,5 +210,50 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # --- Observability (Milestone 7) -----------------------------------------
+  # Prometheus scrapes app, worker and scheduler (replicas discovered through
+  # Docker DNS); Grafana ships with both datasources and the PulseQueue
+  # dashboard provisioned; Jaeger receives OTLP traces. None of the app
+  # services depend on them: metrics and traces are best-effort, jobs are not.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - pulsequeue_prometheus:/prometheus
+    ports:
+      - '9090:9090'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      # Local dev only: read-only anonymous access, admin login for edits.
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pulsequeue-overview.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - '3001:3000'
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - '16686:16686' # UI
+      - '4318:4318' # OTLP/HTTP (spans from app, worker)
+    restart: unless-stopped
+
 volumes:
   pulsequeue_pg:
+  pulsequeue_prometheus:
