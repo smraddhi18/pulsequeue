@@ -1,13 +1,22 @@
 import { hostname } from 'node:os';
 import Fastify, { type FastifyInstance } from 'fastify';
+import type { Registry } from 'prom-client';
 import type { Env } from './config/env.js';
 import type { QueueName } from './domain/job.js';
 import { createPool, pingDatabase, type Pool } from './db/pool.js';
+import { ApiMetrics } from './observability/metrics.js';
+import { MetricsServer } from './observability/metrics-server.js';
+import { QueueDepthCollector } from './observability/queue-depth.js';
+import { createMetricsRegistry, enableDefaultMetrics } from './observability/registry.js';
+import { SeriesLimiter } from './observability/series-limiter.js';
+import { createTracing, tracingConfigFromEnv, type Tracing } from './observability/tracing.js';
 import { registerAuth } from './plugins/auth.js';
+import { registerHttpObservability } from './plugins/observability.js';
 import { registerRequestId } from './plugins/request-id.js';
 import { registerErrorHandler } from './plugins/error-handler.js';
 import { createRedisServices } from './redis/index.js';
 import { ApiKeyRepository } from './repositories/api-key.repository.js';
+import { DashboardRepository } from './repositories/dashboard.repository.js';
 import { DeadLetterRepository } from './repositories/dead-letter.repository.js';
 import { JobRepository } from './repositories/job.repository.js';
 import { QueueRepository } from './repositories/queue.repository.js';
@@ -15,6 +24,7 @@ import { ScheduleRepository } from './repositories/schedule.repository.js';
 import { QueueStatsRepository } from './repositories/stats.repository.js';
 import { registerRoutes } from './routes/index.js';
 import { ApiKeyService } from './services/api-key.service.js';
+import { DashboardService } from './services/dashboard.service.js';
 import { DlqService } from './services/dlq.service.js';
 import { HealthService } from './services/health.service.js';
 import { JobService } from './services/job.service.js';
@@ -36,6 +46,29 @@ export interface BuildAppOptions {
   pool?: Pool;
   /** Write JSON log lines here instead of stdout (tests assert on structured events). */
   logStream?: { write(line: string): void };
+  /**
+   * Tracing to use (tests inject one with an in-memory exporter). When
+   * omitted it is built from env (off unless TRACING_ENABLED) and owned by
+   * the app: flushed and shut down in onClose.
+   */
+  tracing?: Tracing;
+  /** Process metrics (CPU, heap, event loop). Default: on when METRICS_PORT is set, outside tests. */
+  defaultMetrics?: boolean;
+}
+
+/** Per-app observability handles (tests read the registry and the metrics port). */
+export interface AppObservability {
+  registry: Registry;
+  metrics: ApiMetrics;
+  /** null unless METRICS_PORT is set. */
+  metricsServer: MetricsServer | null;
+  tracing: Tracing;
+}
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    observability: AppObservability;
+  }
 }
 
 /**
@@ -132,6 +165,52 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const scheduleService = new ScheduleService(queueRepository, new ScheduleRepository(pool), {
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
   });
+  const dashboardService = new DashboardService(queueRepository, new DashboardRepository(pool), {
+    latencySampleLimit: env.DASHBOARD_LATENCY_MAX_SAMPLES,
+  });
+
+  // --- Observability (M7) -------------------------------------------------
+  const registry = createMetricsRegistry('api');
+  if (options.defaultMetrics ?? (env.METRICS_PORT !== undefined && env.NODE_ENV !== 'test')) {
+    enableDefaultMetrics(registry);
+  }
+  const metrics = new ApiMetrics(registry, new SeriesLimiter(env.METRICS_MAX_QUEUE_SERIES));
+  if (env.METRICS_QUEUE_DEPTH_ENABLED) {
+    new QueueDepthCollector({
+      pool,
+      registry,
+      logger: app.log,
+      maxQueues: env.METRICS_MAX_QUEUE_SERIES,
+      cacheMs: env.METRICS_QUEUE_DEPTH_CACHE_MS,
+      timeoutMs: env.METRICS_QUEUE_DEPTH_TIMEOUT_MS,
+    });
+  }
+  const tracing = options.tracing ?? createTracing(tracingConfigFromEnv(env, 'pulsequeue-api'));
+  if (options.tracing === undefined && tracing.enabled) {
+    // onClose runs after in-flight requests finished, so their spans have
+    // ended; shutdown flushes the batch processor before the process exits.
+    app.addHook('onClose', async () => {
+      await tracing.shutdown();
+    });
+  }
+  const metricsServer =
+    env.METRICS_PORT !== undefined
+      ? new MetricsServer({
+          registry,
+          host: env.METRICS_HOST,
+          port: env.METRICS_PORT,
+          token: env.METRICS_TOKEN,
+          logger: app.log,
+        })
+      : null;
+  if (metricsServer !== null) {
+    await metricsServer.start();
+    app.addHook('onClose', async () => {
+      await metricsServer.stop();
+    });
+  }
+  app.decorate('observability', { registry, metrics, metricsServer, tracing });
+
   const statsService = new StatsService(
     new QueueStatsRepository(pool),
     new StatsCache({
@@ -142,6 +221,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   );
 
   await registerRequestId(app);
+  // After request-id, before auth: trace ids join the request logger first.
+  await registerHttpObservability(app, { metrics, tracing });
   await registerErrorHandler(app);
   // Before the routes: its onRoute hook checks that each one declares an access policy.
   await registerAuth(app, { apiKeyService });
@@ -153,8 +234,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     dlqService,
     scheduleService,
     statsService,
+    dashboardService,
     rateLimiter,
     maxPayloadBytes: env.JOB_MAX_PAYLOAD_BYTES,
+    enqueueMetrics: metrics,
+    tracing,
   });
 
   return app;
