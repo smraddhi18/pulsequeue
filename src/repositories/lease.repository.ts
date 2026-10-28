@@ -48,6 +48,8 @@ interface LeasedRow {
   created_at: Date;
   attempt_id: string;
   attempt_number: number;
+  traceparent: string | null;
+  queue_wait_ms: number;
 }
 
 interface ReclaimedRow {
@@ -103,23 +105,30 @@ function leaseStatement(candidateCtes: string): string {
          FROM candidates c
          WHERE j.id = c.id
          RETURNING j.id, j.queue_id, j.payload, j.priority, j.attempts, j.max_attempts,
-                   j.lease_token, j.locked_by, j.lease_expires_at, j.run_at, j.created_at
+                   j.lease_token, j.locked_by, j.lease_expires_at, j.run_at, j.created_at,
+                   j.traceparent, j.locked_at
        ),
        attempt AS (
          -- attempt_number counts every execution (released ones too), so it is
          -- derived from the history rather than from jobs.attempts. Safe without
          -- a race: the job row is locked by this statement.
-         INSERT INTO job_attempts (job_id, attempt_number, worker_id, status)
+         -- queue_id and ready_at (M7) feed the dashboard: started_at - ready_at
+         -- is the attempt's queue wait, both on the database clock.
+         INSERT INTO job_attempts (job_id, attempt_number, worker_id, status, queue_id, ready_at, started_at)
          SELECT l.id,
                 (SELECT count(*) FROM job_attempts a WHERE a.job_id = l.id) + 1,
                 $3,
-                'running'
+                'running',
+                l.queue_id,
+                l.run_at,
+                l.locked_at
          FROM leased l
          RETURNING id, job_id, attempt_number
        )
        SELECT l.id, q.tenant_id, q.name AS queue_name, q.max_concurrency, l.payload, l.priority,
               l.attempts, l.max_attempts, l.lease_token, l.locked_by, l.lease_expires_at,
-              l.created_at, a.id AS attempt_id, a.attempt_number
+              l.created_at, a.id AS attempt_id, a.attempt_number, l.traceparent,
+              greatest(0, extract(epoch FROM l.locked_at - l.run_at) * 1000)::float8 AS queue_wait_ms
        FROM leased l
        JOIN attempt a ON a.job_id = l.id
        JOIN queues q ON q.id = l.queue_id
@@ -142,6 +151,8 @@ function toLeasedJob(row: LeasedRow): LeasedJob {
     workerId: row.locked_by,
     leaseExpiresAt: row.lease_expires_at,
     createdAt: row.created_at,
+    traceparent: row.traceparent,
+    queueWaitMs: row.queue_wait_ms,
   };
 }
 

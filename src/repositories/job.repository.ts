@@ -22,6 +22,8 @@ export interface InsertJobParams {
   runAt?: Date | null;
   idempotencyKey: string | null;
   requestFingerprint: string | null;
+  /** W3C traceparent of the enqueue span (M7); omitted/null when tracing is off. */
+  traceparent?: string | null;
 }
 
 export interface InsertJobResult {
@@ -114,7 +116,7 @@ export class JobRepository {
         `WITH inserted AS (
            INSERT INTO jobs (
              queue_id, status, priority, payload, max_attempts, run_at,
-             idempotency_key, request_fingerprint
+             idempotency_key, request_fingerprint, traceparent
            )
            VALUES (
              $1, $2, $3, $4::jsonb, $5,
@@ -122,7 +124,7 @@ export class JobRepository {
                   THEN now() + ($6::bigint * interval '1 millisecond')
                   ELSE greatest($9::timestamptz, now())
              END,
-             $7, $8
+             $7, $8, $10
            )
            ON CONFLICT (queue_id, idempotency_key) WHERE idempotency_key IS NOT NULL
            DO NOTHING
@@ -143,6 +145,7 @@ export class JobRepository {
           params.idempotencyKey,
           params.requestFingerprint,
           params.runAt ?? null,
+          params.traceparent ?? null,
         ],
       );
 
