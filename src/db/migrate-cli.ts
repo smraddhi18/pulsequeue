@@ -15,7 +15,9 @@ async function main(): Promise<void> {
     NODE_ENV: nodeEnv === 'production' || nodeEnv === 'test' ? nodeEnv : 'development',
     LOG_LEVEL: 'info',
   }).child({ component: 'migrate' });
-  const pool = createPool(env, { logger });
+  // Migrations may run longer than any request; they set statement_timeout = 0
+  // themselves, so the client-side backstop is off as well.
+  const pool = createPool(env, { logger, queryTimeoutMs: false });
 
   try {
     const result = await runMigrations(pool, { logger });

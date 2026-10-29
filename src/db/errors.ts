@@ -55,12 +55,16 @@ export function mapDatabaseError(err: unknown): unknown {
     }
   }
 
-  // pg-pool raises plain Errors for these, without a code.
+  // pg / pg-pool raise plain Errors for these, without a code.
   const message = (err as { message?: unknown }).message;
   if (
     typeof message === 'string' &&
     (message.includes('timeout exceeded when trying to connect') ||
-      message.includes('Connection terminated'))
+      message.includes('Connection terminated') ||
+      // The client already lost its connection (see createPool).
+      message.includes('not queryable') ||
+      // Client-side query_timeout: the network went silent.
+      message.includes('Query read timeout'))
   ) {
     return withCause(new ServiceUnavailableError('Database unavailable'), err);
   }
