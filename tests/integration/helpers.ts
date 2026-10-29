@@ -138,20 +138,115 @@ export async function deleteRedisPrefix(redis: Redis, prefix: string): Promise<v
 }
 
 /**
- * A TCP proxy in front of Redis for outage tests: `cut()` drops every client
- * connection and refuses new ones (like a Redis crash or a network
- * partition), `restore()` accepts connections again on the same port.
+ * A TCP proxy that can simulate dependency failures (Milestone 5 for Redis,
+ * generalised in Milestone 8 for Postgres):
+ *
+ * - cut(): every connection is reset and new ones are refused (the server
+ *   crashed or restarted; clients see ECONNRESET / ECONNREFUSED at once).
+ * - freeze(): connections stay open but no byte moves in either direction,
+ *   and new connections are accepted but never answered (a silent network
+ *   partition: only client-side timeouts can notice it).
+ * - restore(): back to normal; frozen bytes are delivered (TCP retransmits
+ *   after a healed partition).
  */
-export class RedisOutageProxy {
+export class TcpOutageProxy {
   private server: net.Server | null = null;
   private readonly sockets = new Set<net.Socket>();
-  private port = 0;
+  private readonly pairs = new Set<{ client: net.Socket; upstream: net.Socket }>();
+  private frozen = false;
+  protected port = 0;
 
-  private constructor(
+  protected constructor(
     private readonly targetHost: string,
     private readonly targetPort: number,
   ) {}
 
+  static async forTarget(host: string, port: number): Promise<TcpOutageProxy> {
+    const proxy = new TcpOutageProxy(host, port);
+    await proxy.listen(0);
+    return proxy;
+  }
+
+  get listenPort(): number {
+    return this.port;
+  }
+
+  /** Connections currently open through the proxy (client side). */
+  get openConnections(): number {
+    return this.pairs.size;
+  }
+
+  async cut(): Promise<void> {
+    const server = this.server;
+    this.server = null;
+    this.frozen = false;
+    for (const socket of this.sockets) socket.destroy();
+    this.sockets.clear();
+    this.pairs.clear();
+    if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  freeze(): void {
+    this.frozen = true;
+    for (const pair of this.pairs) this.unlink(pair);
+  }
+
+  async restore(): Promise<void> {
+    if (this.frozen) {
+      this.frozen = false;
+      for (const pair of this.pairs) this.link(pair);
+    }
+    if (!this.server) await this.listen(this.port);
+  }
+
+  async stop(): Promise<void> {
+    await this.cut();
+  }
+
+  private link(pair: { client: net.Socket; upstream: net.Socket }): void {
+    pair.client.pipe(pair.upstream);
+    pair.upstream.pipe(pair.client);
+  }
+
+  private unlink(pair: { client: net.Socket; upstream: net.Socket }): void {
+    pair.client.unpipe(pair.upstream);
+    pair.upstream.unpipe(pair.client);
+    pair.client.pause();
+    pair.upstream.pause();
+  }
+
+  protected listen(port: number): Promise<void> {
+    const server = net.createServer((client) => {
+      const upstream = net.connect(this.targetPort, this.targetHost);
+      const pair = { client, upstream };
+      this.sockets.add(client);
+      this.sockets.add(upstream);
+      this.pairs.add(pair);
+      const drop = () => {
+        client.destroy();
+        upstream.destroy();
+        this.sockets.delete(client);
+        this.sockets.delete(upstream);
+        this.pairs.delete(pair);
+      };
+      client.on('error', drop).on('close', drop);
+      upstream.on('error', drop).on('close', drop);
+      if (this.frozen) this.unlink(pair);
+      else this.link(pair);
+    });
+    this.server = server;
+    return new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', () => {
+        this.port = (server.address() as net.AddressInfo).port;
+        resolve();
+      });
+    });
+  }
+}
+
+/** Redis behind a TcpOutageProxy (Milestone 5 outage tests). */
+export class RedisOutageProxy extends TcpOutageProxy {
   static async start(url = requireRedisUrl()): Promise<RedisOutageProxy> {
     const target = new URL(url);
     const proxy = new RedisOutageProxy(target.hostname, Number(target.port || 6379));
@@ -163,48 +258,35 @@ export class RedisOutageProxy {
   get url(): string {
     return `redis://127.0.0.1:${this.port}`;
   }
+}
 
-  async cut(): Promise<void> {
-    const server = this.server;
-    this.server = null;
-    for (const socket of this.sockets) socket.destroy();
-    this.sockets.clear();
-    if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+/** Postgres behind a TcpOutageProxy (Milestone 8 chaos tests). */
+export class PgOutageProxy extends TcpOutageProxy {
+  static async start(url = requireUrl()): Promise<PgOutageProxy> {
+    const target = new URL(url);
+    const proxy = new PgOutageProxy(target.hostname, Number(target.port || 5432));
+    await proxy.listen(0);
+    return proxy;
   }
 
-  async restore(): Promise<void> {
-    if (!this.server) await this.listen(this.port);
+  /**
+   * postgres:// URL for `db` that goes through the proxy, with the suite's
+   * search_path in the libpq startup options (also usable by child processes).
+   */
+  urlFor(db: TestDatabase): string {
+    const url = new URL(db.url);
+    url.hostname = '127.0.0.1';
+    url.port = String(this.port);
+    url.searchParams.set('options', `-c search_path=${db.schema}`);
+    return url.toString();
   }
+}
 
-  async stop(): Promise<void> {
-    await this.cut();
-  }
-
-  private listen(port: number): Promise<void> {
-    const server = net.createServer((client) => {
-      const upstream = net.connect(this.targetPort, this.targetHost);
-      this.sockets.add(client);
-      this.sockets.add(upstream);
-      const drop = () => {
-        client.destroy();
-        upstream.destroy();
-        this.sockets.delete(client);
-        this.sockets.delete(upstream);
-      };
-      client.on('error', drop).on('close', drop);
-      upstream.on('error', drop).on('close', drop);
-      client.pipe(upstream);
-      upstream.pipe(client);
-    });
-    this.server = server;
-    return new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => {
-        this.port = (server.address() as net.AddressInfo).port;
-        resolve();
-      });
-    });
-  }
+/** DATABASE_URL for a child process: the suite's schema via libpq startup options. */
+export function schemaUrl(db: TestDatabase): string {
+  const url = new URL(db.url);
+  url.searchParams.set('options', `-c search_path=${db.schema}`);
+  return url.toString();
 }
 
 /** Poll an (async) predicate until it holds. */

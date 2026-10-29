@@ -74,6 +74,27 @@ describeWithRedis('Redis building blocks (real Redis)', { timeout: 20_000 }, () 
     expect(String(list)).toContain('name=pulsequeue:test');
   });
 
+  it('a deliberate close is not logged as a lost connection (plain and subscribed)', async () => {
+    // Milestone 8: workers logged "Redis connection lost; reconnecting" on
+    // every clean shutdown (the QUIT closes the socket, 'close' fired the
+    // outage path). Only real outages may warn.
+    const lines: { level: number; event?: string }[] = [];
+    const capture = pino(
+      { level: 'debug' },
+      { write: (line: string) => lines.push(JSON.parse(line) as { level: number }) },
+    );
+    for (const subscribe of [false, true]) {
+      const c = createRedisClient(settings(), { logger: capture, name: 'pulsequeue:test-close' });
+      await waitUntil(() => c.status === 'ready');
+      if (subscribe) await c.subscribe(`${prefix}:close-test`);
+      await closeRedisClient(c);
+      await waitUntil(() => c.status === 'end');
+    }
+    await sleep(20);
+    expect(lines.filter((l) => l.event === 'redis.disconnected')).toEqual([]);
+    expect(lines.filter((l) => l.event === 'redis.closed')).toHaveLength(2);
+  });
+
   it('commands fail fast (no offline queue) while disconnected', async () => {
     const c = client('redis://127.0.0.1:1');
     await expect(pingRedis(c)).rejects.toThrow(/not connected/);
