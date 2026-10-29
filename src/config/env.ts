@@ -41,6 +41,21 @@ const databaseEnvShape = {
   PG_CONNECTION_TIMEOUT_MS: positiveInt.default(5_000),
   /** Server-side statement_timeout for every pooled connection. */
   PG_STATEMENT_TIMEOUT_MS: positiveInt.default(10_000),
+  /**
+   * Client-side read timeout per query (Milestone 8). statement_timeout is
+   * enforced by the server, so it cannot fire when the network silently drops
+   * packets (partition, dead NAT entry): the query would wait for TCP
+   * retransmits for many minutes. Unset = PG_STATEMENT_TIMEOUT_MS + 5000, so
+   * the server-side timeout normally wins and this is only the backstop.
+   */
+  PG_QUERY_TIMEOUT_MS: positiveInt.max(3_600_000).optional(),
+  /**
+   * Server-side idle_in_transaction_session_timeout (Milestone 8): a process
+   * that stalls inside a transaction (GC pause, frozen VM, bug) holding row
+   * locks is disconnected and its locks released instead of blocking every
+   * other worker of that queue indefinitely.
+   */
+  PG_IDLE_IN_TRANSACTION_TIMEOUT_MS: positiveInt.max(3_600_000).default(60_000),
 } as const;
 
 const databaseEnvSchema = z.object(databaseEnvShape);
@@ -235,6 +250,27 @@ const envSchema = z
     JOB_MAX_PAYLOAD_BYTES: positiveInt.max(10 * 1024 * 1024).default(256 * 1024),
     /** Readiness probe budget per dependency check. */
     READINESS_TIMEOUT_MS: positiveInt.max(30_000).default(2_000),
+    /**
+     * Milestone 8 HTTP hardening. Whole-request budget (headers + body) per
+     * request; a client that trickles bytes (slowloris) is cut off with 408
+     * instead of pinning a socket forever. Fastify's default is 0 (none).
+     * 0 disables, e.g. behind a proxy that already enforces it.
+     */
+    HTTP_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(0).max(600_000).default(30_000),
+    /**
+     * Idle keep-alive socket lifetime. Keep it above the load balancer's idle
+     * timeout (AWS ALB: 60 s) or the LB may reuse a socket we just closed (502).
+     */
+    HTTP_KEEP_ALIVE_TIMEOUT_MS: positiveInt.max(600_000).default(72_000),
+    /**
+     * Graceful shutdown: on SIGTERM /ready turns 503 at once, and the server
+     * keeps serving for this long before it stops accepting connections, so
+     * load balancers see the failing probe and drain the instance first.
+     * 0 locally; set it to ~2 readiness intervals in Kubernetes.
+     */
+    SHUTDOWN_DRAIN_DELAY_MS: z.coerce.number().int().min(0).max(120_000).default(0),
+    /** After the drain delay: budget for in-flight requests and closing pools, then exit 1. */
+    SHUTDOWN_TIMEOUT_MS: positiveInt.max(600_000).default(10_000),
     /**
      * A dirty entry younger than this is still served (x-cache: STALE), which
      * caps recomputes at ~1 per queue per interval across all API instances
