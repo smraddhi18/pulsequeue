@@ -139,3 +139,56 @@ describe('readiness with Redis configured but unreachable', () => {
     });
   });
 });
+
+describe('HTTP hardening and graceful drain (Milestone 8)', () => {
+  const baseEnv = {
+    NODE_ENV: 'test',
+    LOG_LEVEL: 'silent',
+    DATABASE_URL: 'postgres://pulsequeue:pulsequeue@127.0.0.1:1/pulsequeue',
+    PG_CONNECTION_TIMEOUT_MS: '500',
+    READINESS_TIMEOUT_MS: '1000',
+  };
+
+  it('applies the request and keep-alive timeouts to the Node server', async () => {
+    const app = await buildApp({
+      env: loadEnv({
+        ...baseEnv,
+        HTTP_REQUEST_TIMEOUT_MS: '12345',
+        HTTP_KEEP_ALIVE_TIMEOUT_MS: '65000',
+      }),
+      logger: false,
+    });
+    try {
+      await app.ready();
+      expect(app.server.requestTimeout).toBe(12_345);
+      expect(app.server.keepAliveTimeout).toBe(65_000);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('defaults to a 30 s request timeout (Fastify alone would have none)', async () => {
+    const app = await buildApp({ env: loadEnv(baseEnv), logger: false });
+    try {
+      await app.ready();
+      expect(app.server.requestTimeout).toBe(30_000);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('beginDraining flips /ready to 503 while other routes keep serving', async () => {
+    const app = await buildApp({ env: loadEnv(baseEnv), logger: false });
+    try {
+      await app.ready();
+      app.beginDraining();
+      const ready = await app.inject({ method: 'GET', url: '/ready' });
+      expect(ready.statusCode).toBe(503);
+      expect(ready.json()).toMatchObject({ status: 'not_ready', draining: true });
+      const health = await app.inject({ method: 'GET', url: '/health' });
+      expect(health.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+});

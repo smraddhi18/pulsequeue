@@ -67,6 +67,23 @@ describe('loadEnv', () => {
     expect(env.READINESS_TIMEOUT_MS).toBe(2_000);
   });
 
+  it('applies the Milestone 8 hardening defaults', () => {
+    const env = loadEnv({ ...validEnv });
+    expect(env.PG_QUERY_TIMEOUT_MS).toBeUndefined(); // derived: statement timeout + 5 s
+    expect(env.PG_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBe(60_000);
+    expect(env.HTTP_REQUEST_TIMEOUT_MS).toBe(30_000);
+    expect(env.HTTP_KEEP_ALIVE_TIMEOUT_MS).toBe(72_000);
+    expect(env.SHUTDOWN_DRAIN_DELAY_MS).toBe(0);
+    expect(env.SHUTDOWN_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it('accepts HTTP_REQUEST_TIMEOUT_MS=0 (disabled) but not a negative value', () => {
+    expect(loadEnv({ ...validEnv, HTTP_REQUEST_TIMEOUT_MS: '0' }).HTTP_REQUEST_TIMEOUT_MS).toBe(0);
+    expect(() => loadEnv({ ...validEnv, HTTP_REQUEST_TIMEOUT_MS: '-1' })).toThrow(
+      /Invalid environment configuration/,
+    );
+  });
+
   it('fails fast on an invalid pool size', () => {
     expect(() => loadEnv({ ...validEnv, PG_POOL_MAX: '0' })).toThrow(
       /Invalid environment configuration/,

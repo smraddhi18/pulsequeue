@@ -44,6 +44,14 @@ describe('mapDatabaseError', () => {
     expect(mapped).toBeInstanceOf(ServiceUnavailableError);
   });
 
+  it.each([
+    'Connection terminated unexpectedly',
+    'Client has encountered a connection error and is not queryable',
+    'Query read timeout',
+  ])('maps the code-less connection error %j to 503', (message) => {
+    expect(mapDatabaseError(new Error(message))).toBeInstanceOf(ServiceUnavailableError);
+  });
+
   it('returns unknown errors unchanged so they surface as a logged 500', () => {
     const syntax = pgError('42601');
     expect(mapDatabaseError(syntax)).toBe(syntax);

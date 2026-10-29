@@ -91,4 +91,30 @@ describe('HealthService.getReadiness', () => {
       ).toThrow(/registered twice/);
     });
   });
+
+  describe('draining (Milestone 8)', () => {
+    it('is not_ready once draining begins, without running any probe', async () => {
+      const probe = vi.fn(() => Promise.resolve());
+      const service = new HealthService({ probes: { postgres: probe } });
+      expect((await service.getReadiness()).status).toBe('ready');
+      expect(service.isDraining).toBe(false);
+
+      probe.mockClear();
+      service.beginDraining();
+      const result = await service.getReadiness();
+      expect(service.isDraining).toBe(true);
+      expect(result).toMatchObject({
+        status: 'not_ready',
+        checks: { app: 'fail' },
+        draining: true,
+      });
+      expect(probe).not.toHaveBeenCalled();
+    });
+
+    it('keeps liveness ok while draining', () => {
+      const service = new HealthService();
+      service.beginDraining();
+      expect(service.getLiveness().status).toBe('ok');
+    });
+  });
 });
