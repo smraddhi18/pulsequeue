@@ -24,6 +24,8 @@ export interface ReadinessResult {
   /** ready: all ok; degraded: only optional checks fail (still serving); not_ready: a required check fails. */
   status: 'ready' | 'degraded' | 'not_ready';
   checks: Record<string, CheckStatus>;
+  /** Present (true) once graceful shutdown began: not_ready without probing anything. */
+  draining?: true;
   timestamp: string;
 }
 
@@ -61,6 +63,21 @@ export class HealthService {
     this.onProbeFailure = options.onProbeFailure;
   }
 
+  private draining = false;
+
+  /**
+   * Graceful shutdown (Milestone 8): from now on readiness is not_ready, so
+   * load balancers stop routing here while in-flight and already-routed
+   * requests are still served. Liveness is unaffected (the process is fine).
+   */
+  beginDraining(): void {
+    this.draining = true;
+  }
+
+  get isDraining(): boolean {
+    return this.draining;
+  }
+
   getLiveness(): LivenessResult {
     return {
       status: 'ok',
@@ -70,6 +87,14 @@ export class HealthService {
   }
 
   async getReadiness(): Promise<ReadinessResult> {
+    if (this.draining) {
+      return {
+        status: 'not_ready',
+        checks: { app: 'fail' },
+        draining: true,
+        timestamp: new Date().toISOString(),
+      };
+    }
     const checks: Record<string, CheckStatus> = {
       app: this.bootedAt.getTime() <= Date.now() ? 'ok' : 'fail',
     };
