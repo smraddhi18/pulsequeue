@@ -58,6 +58,13 @@ export function reconnectDelay(
  * Pub/sub needs a dedicated connection (a subscribed connection cannot run
  * normal commands), so callers create one client per role.
  */
+/**
+ * Clients being closed on purpose (closeRedisClient). Their 'close' is the
+ * end of a shutdown, not an outage, so it is logged at info as redis.closed
+ * instead of warning that the connection was lost.
+ */
+const closingClients = new WeakSet<RedisClient>();
+
 export function createRedisClient(
   settings: RedisConnectionSettings,
   options: CreateRedisClientOptions,
@@ -98,6 +105,10 @@ export function createRedisClient(
   client.on('close', () => {
     if (!connected) return;
     connected = false;
+    if (closingClients.has(client)) {
+      log.info({ event: 'redis.closed' }, 'Redis connection closed');
+      return;
+    }
     log.warn({ event: 'redis.disconnected' }, 'Redis connection lost; reconnecting');
   });
   client.on('reconnecting', (delayMs: number) => {
@@ -134,6 +145,7 @@ export async function pingRedis(client: RedisClient): Promise<void> {
  */
 export async function closeRedisClient(client: RedisClient, timeoutMs = 1_000): Promise<void> {
   if (client.status === 'end') return;
+  closingClients.add(client);
   if (!isRedisReady(client)) {
     client.disconnect();
     return;
