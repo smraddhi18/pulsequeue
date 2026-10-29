@@ -179,6 +179,25 @@ jobs:
           wait "$worker"
           cat api-metrics.log worker-metrics.log
 
+      # Milestone 8: 10 s of k6 traffic (5 VUs: enqueue with idempotency keys,
+      # get, list, stats) against the compiled API plus one worker, started by
+      # the same runner used for the real load tests. Thresholds: zero failed
+      # requests, every check passes, p95 < 500 ms. A wiring check, not a
+      # benchmark: shared CI runners are too noisy for capacity numbers.
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: '2.3.0'
+
+      - name: Load-test smoke (k6)
+        env:
+          REDIS_URL: redis://localhost:6379
+          WORKERS: 1
+          OUT_DIR: k6-smoke
+        run: |
+          bash loadtest/run-local.sh smoke.js -e DURATION=10s
+          tail -n 20 k6-smoke/api.log
+
       # Unit tests plus integration tests (each suite migrates its own schema).
       - name: Test
         run: npm test
