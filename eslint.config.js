@@ -10,6 +10,13 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   prettier,
   {
+    // k6 scripts run in k6's JS runtime, not Node.
+    files: ['loadtest/**/*.js'],
+    languageOptions: {
+      globals: { __ENV: 'readonly', __VU: 'readonly', __ITER: 'readonly' },
+    },
+  },
+  {
     files: ['**/*.ts'],
     languageOptions: {
       parserOptions: {
