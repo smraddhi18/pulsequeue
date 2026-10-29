@@ -2,7 +2,7 @@
 
 A production-style distributed job queue for Node.js services, built in TypeScript with Fastify, PostgreSQL and Redis. Producers enqueue jobs over an HTTP API, workers lease and execute them with retries and exponential backoff, failed jobs go to a dead-letter queue, and a dashboard API reports queue health.
 
-This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 7 (tenant-scoped dashboard API for depth, throughput, latency percentiles and failure rate; Prometheus metrics from the API, workers and scheduler on a separate token-protected listener; OpenTelemetry traces from the HTTP request through `jobs.traceparent` into every execution attempt; Prometheus + Grafana + Jaeger in docker-compose) is done.**
+This project is being built milestone by milestone. See [ROADMAP.md](ROADMAP.md) for the plan and progress. **Current state: Milestone 8 (k6 load tests with thresholds and measured results, chaos tests that SIGKILL and freeze workers and cut Postgres under load, and production hardening: HTTP and query timeouts, a draining `/ready` with ordered shutdown, structured fatal handlers, and fixes for a pool crash and a misleading Redis warning found by the chaos tests) is done. Every milestone on the roadmap has landed.** Measured numbers: [docs/load-test-results.md](docs/load-test-results.md).
 
 ## Architecture
 
@@ -247,9 +247,19 @@ Metrics and traces are best-effort side channels: a failed scrape, an unreachabl
 - CI metrics smoke test: the compiled API and worker serve `/metrics` on their own ports, `401` without / with a wrong token, `200` with the HTTP histogram (route template), enqueue counter, queue depth and the worker's completion and queue-wait series, and `404` for `/metrics` on the API port
 - Tests: duration parsing and query schemas, the metrics listener (token, methods, collect failures), series limiter, tracing (disabled no-op, traceparent round trip, invalid input, sampling) and every metrics class as unit tests; real-Postgres tests for the dashboard (exact percentiles over 100 seeded attempts, aligned zero-filled buckets, tenant isolation, validation, truncation), migration `0008` (backfill, `CHECK`, index-only plan), the queue-depth collector (cache, single-flight, queue limit, lock timeout, database down), the metrics lifecycle enqueue -> execute -> retry -> dead-letter through the real API and worker runtime, scheduler leadership metrics on two replicas, and **trace propagation from an HTTP caller through `jobs.traceparent` into the worker span** with matching `trace_id` in logs
 
+**Milestone 8: load testing and hardening**
+
+- **k6 load tests** in `loadtest/` with pass/fail thresholds and env-configurable target and key: enqueue throughput (open model, constant arrival rate), mixed read/write, idempotent-retry storm, rate-limit accuracy and a CI smoke test; `loadtest/run-local.sh` boots a throwaway stack (migrate, tenants, API, workers) around any script and `loadtest/drain-benchmark.sh` measures worker drain throughput
+- **Measured results** on an 8 vCPU / 16 GB VM with k6 on the same box ([docs/load-test-results.md](docs/load-test-results.md)): one API process holds **1,000 enqueues/s at p95 8.4 ms / p99 71 ms with 0 errors** and saturates at about 1,950/s; mixed traffic at 1,000 req/s stays under p95 6.2 ms on every endpoint; 50 VUs racing 200 idempotency keys created exactly 200 jobs out of 30,000 requests; the rate limiter accepted 1,599 of an ideal 1,600; 4 workers x 10 drain 1,814 no-op jobs/s
+- **Chaos tests** (real processes, real Postgres): SIGKILL two of three workers mid-run and every job still succeeds exactly once; a worker frozen with SIGSTOP past its lease is fenced out when it resumes; Postgres cut and frozen through a TCP proxy gives fast `503`s and `/ready` `not_ready`, then full recovery without restarts; a manual `pg_ctlcluster restart` under 500 enqueues/s cost 193 fast `503`s (0.96%) and no crashes or stuck jobs
+- **Bugs found and fixed**: a checked-out Postgres client whose backend died emitted an unhandled `error` and **crashed the process** (pg-pool drops its listener on checkout; the pool now keeps a permanent per-client listener); every deliberate Redis close was logged as `redis.disconnected` "connection lost" (now `redis.closed` at info)
+- **Hardening**: `HTTP_REQUEST_TIMEOUT_MS` (slowloris cut-off, `408`) and `HTTP_KEEP_ALIVE_TIMEOUT_MS` above common load-balancer idle timeouts; a client-side `query_timeout` backstop above `statement_timeout` (catches a frozen server or dead TCP path) and `idle_in_transaction_session_timeout`; TCP keepalive on pool sockets; query timeouts and "not queryable" clients mapped to `503`; graceful shutdown that turns `/ready` into `503` (`draining: true`) first, waits `SHUTDOWN_DRAIN_DELAY_MS`, then closes with a forced exit after `SHUTDOWN_TIMEOUT_MS`; `unhandledRejection` / `uncaughtException` log one structured `fatal` line and exit in the API, worker and scheduler
+- CI: k6 smoke test (5 VUs, 10 s, zero failures) against the compiled API and a worker
+- Tests: fatal handlers, pool error listener and timeouts, draining readiness, new config and error mappings as unit tests; real-Postgres pool resilience through a connection-cutting proxy (terminated backends, frozen server, timeouts), worker chaos (SIGKILL, SIGSTOP / SIGCONT), Postgres outage and recovery with a real worker process, and the Redis close logging
+
 ### Planned
 
-- Load / chaos testing and capacity notes (M8)
+- Not scheduled. Next candidates: retention for succeeded jobs and time partitioning of `jobs` / `job_attempts`, minute rollup tables for the dashboard, a multi-replica load test with k6 on a separate machine, and PgBouncer in the compose stack
 
 ## Enqueue request flow
 
@@ -706,6 +716,20 @@ The integration suite runs `EXPLAIN` on the lease, reaper, pagination and dashbo
 
 ## Design decisions and trade-offs
 
+### Milestone 8
+
+| Decision                                                                                                                          | Why                                                                                                                                                                      | Trade-off                                                                                                  |
+| --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| k6 with an **open model** (constant arrival rate) for throughput                                                                  | A closed loop of VUs slows down with the server and hides overload; fixed arrivals show it as latency and `dropped_iterations`.                                          | Needs enough pre-allocated VUs; the script raises `maxVUs` to 4x.                                          |
+| **Thresholds in every script** (latency, error rate, dropped arrivals, exact idempotency and rate-limit counts)                   | A load test that cannot fail is a demo. Thresholds make k6 exit non-zero, so the same scripts gate CI and releases.                                                      | Thresholds are tuned for the documented box; slower hardware needs `-e P95_MS=...`.                        |
+| Publish **measured** numbers with the machine, config and tool, plus the knee where thresholds fail                               | Capacity is the highest rate that still meets the latency target, not the maximum achieved rate.                                                                         | Single-box numbers (k6 shares CPUs) understate a real deployment.                                          |
+| Chaos tests as **vitest suites with real processes** (SIGKILL / SIGSTOP worker children, TCP proxies that cut or freeze Postgres) | Recovery paths only matter if they run on every change; a proxy reproduces "connection reset" and "silent black hole" deterministically without root or Docker.          | Slower (about 15 s) and Linux-oriented; a proxy is not a real failover (covered once by the manual drill). |
+| Client-side `query_timeout` = `statement_timeout` + 5 s                                                                           | `statement_timeout` runs on the server, so it cannot fire when the server or the network is frozen; without a client timer a request hangs until TCP gives up (minutes). | A query that legitimately outlives the server timeout is cut client-side too (migrations disable both).    |
+| Permanent per-client `error` listener in the pool                                                                                 | pg-pool removes its idle-error listener on checkout, so a backend killed mid-request emitted an unhandled `error` and crashed the process (found by the chaos tests).    | One extra listener per client; the query itself still fails and maps to `503`.                             |
+| Shutdown order: `/ready` 503 -> drain delay -> stop accepting -> finish in-flight -> close Redis and Postgres -> forced exit      | Load balancers need a failing probe before connections are refused, and pools must close last so in-flight requests can finish.                                          | Shutdown takes up to `SHUTDOWN_DRAIN_DELAY_MS` longer; 0 by default locally.                               |
+| **Exit** on `unhandledRejection` / `uncaughtException` with one structured `fatal` line                                           | After an unexpected throw the in-memory state is unknown; leases expire, fencing rejects stale writes and the supervisor restarts the process, so crashing is safe.      | A bug crashes the process instead of being swallowed; the supervisor must restart it.                      |
+| CI k6 smoke, not the full load suite                                                                                              | 10 s at 5 VUs catches broken endpoints and startup issues reliably on shared runners; throughput on shared runners is too noisy to gate on.                              | CI does not catch performance regressions; the full suite is run by hand.                                  |
+
 ### Milestone 7
 
 | Decision                                                                          | Why                                                                                                                                                                                                                                                                                                                                                        | Trade-off                                                                                                                                                                                                                                                                                             |
@@ -836,6 +860,8 @@ The integration suite runs `EXPLAIN` on the lease, reaper, pagination and dashbo
 ## Project layout
 
 ```
+docs/                 # load-test results with environment and capacity plan (Milestone 8)
+loadtest/             # k6 scripts + run-local.sh / drain-benchmark.sh (Milestone 8)
 migrations/           # forward-only SQL migrations (NNNN_name.sql)
 observability/        # Prometheus scrape config, Grafana provisioning + dashboard JSON (Milestone 7)
 src/
@@ -850,7 +876,8 @@ src/
                       # tenant / API key / principal models, limits, lease + dead-letter types,
                       # QueueSignals contract
   lib/                # logger, error mapper, keyset cursor, request fingerprint, cron wrapper,
-                      # single-flight, log throttle, API key token format, TTL/LRU cache
+                      # single-flight, log throttle, API key token format, TTL/LRU cache,
+                      # fatal process handlers (Milestone 8)
   redis/              # ioredis client, keys, coalescer, wake-up publisher + subscriber,
                       # stats cache store (Lua CAS) + invalidator, QueueSignals (Milestone 5),
                       # token-bucket rate limit store (Lua, Milestone 6)
@@ -869,7 +896,8 @@ src/
                       # runtime (composition root), built-in handlers
 tests/                # unit tests (no database needed); tests/worker/, tests/scheduler/
 tests/integration/    # real-Postgres (+ real-Redis) tests (each suite migrates its own schema
-                      # and uses its own Redis key prefix)
+                      # and uses its own Redis key prefix), incl. chaos suites with TCP outage
+                      # proxies and real worker processes (Milestone 8)
 ```
 
 ## Setup
@@ -961,6 +989,29 @@ TEST_REDIS_URL=redis://localhost:6379 TEST_DATABASE_URL=... npm test
 # metrics listeners bind ephemeral ports (METRICS_PORT=0).
 ```
 
+### Load and chaos testing (Milestone 8)
+
+Load tests use [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and are documented in [loadtest/README.md](loadtest/README.md):
+
+```bash
+npm run build
+export DATABASE_URL=postgres://... REDIS_URL=redis://localhost:6379   # use a throwaway database
+bash loadtest/run-local.sh enqueue-throughput.js -e RATE=1000 -e DURATION=60s
+k6 run -e BASE_URL=https://... -e API_KEY=pq_... loadtest/mixed.js     # any deployment
+```
+
+Results, environment and the capacity plan: [docs/load-test-results.md](docs/load-test-results.md).
+
+The chaos suites run with the normal integration tests (they need `TEST_DATABASE_URL`; the Postgres outage suite also starts a real worker via `tsx`):
+
+| Suite                     | Failure injected                                                                                                                    | Expected behaviour                                                                                                                                 |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `worker-chaos.test.ts`    | SIGKILL two of three worker processes mid-run                                                                                       | every job succeeds exactly once (one successful attempt), the lost leases are reaped                                                               |
+| `worker-chaos.test.ts`    | SIGSTOP a worker past its lease, SIGCONT after another worker re-ran the job                                                        | the zombie's outcome write is rejected by `lease_token` fencing; still one success                                                                 |
+| `postgres-outage.test.ts` | Postgres connections cut (reset) through a proxy                                                                                    | `/ready` `503 not_ready`, enqueue `503` in under 2 s, worker stays up; after restore everything recovers without restarts                          |
+| `postgres-outage.test.ts` | Postgres frozen (packets swallowed)                                                                                                 | `503`s within the query timeout instead of hung requests; recovery after restore                                                                   |
+| `pool-resilience.test.ts` | backend of a checked-out client terminated; a stalled transaction; a silently dropped network (with and without the client timeout) | no process crash; the stalled session is ended by `idle_in_transaction_session_timeout`; the query fails within `query_timeout` instead of hanging |
+
 ### Worker configuration
 
 | Variable                         | Default        | Meaning                                                              |
@@ -1049,6 +1100,19 @@ Authentication cannot be switched off. Workers and the scheduler do not authenti
 | `OTEL_SERVICE_NAME`              | per role    | defaults to `pulsequeue-api` / `pulsequeue-worker`                                                      |
 | `OTEL_TRACES_SAMPLER_RATIO`      | `1`         | head sampling for new traces (0-1); parent-based, so a sampled inbound `traceparent` is always followed |
 
+### Timeouts and shutdown configuration (Milestone 8)
+
+| Variable                            | Default                          | Meaning                                                                                                                                                           |
+| ----------------------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HTTP_REQUEST_TIMEOUT_MS`           | `30000`                          | API: whole-request budget (headers + body); slow clients get `408`. `0` disables (e.g. a proxy enforces it)                                                       |
+| `HTTP_KEEP_ALIVE_TIMEOUT_MS`        | `72000`                          | API: idle keep-alive socket lifetime; keep it above the load balancer's idle timeout (ALB: 60 s) to avoid `502`s                                                  |
+| `SHUTDOWN_DRAIN_DELAY_MS`           | `0`                              | API: on SIGTERM `/ready` returns `503` (`draining: true`) and the server keeps serving this long before closing; set to about 2 readiness intervals in Kubernetes |
+| `SHUTDOWN_TIMEOUT_MS`               | `10000`                          | API: budget for in-flight requests and pool closing after the delay, then exit 1                                                                                  |
+| `PG_QUERY_TIMEOUT_MS`               | `PG_STATEMENT_TIMEOUT_MS + 5000` | all processes: client-side backstop that fails a query when the server or network is frozen (`statement_timeout` cannot fire then); maps to `503`                 |
+| `PG_IDLE_IN_TRANSACTION_TIMEOUT_MS` | `60000`                          | all processes: Postgres ends a session idle inside a transaction, so a stalled process cannot hold row locks                                                      |
+
+Every process also exits with one structured `fatal` log line (`process.unhandled_rejection` / `process.uncaught_exception`) on a programming error; the supervisor restarts it, and leases plus fencing make that safe.
+
 ### Scripts
 
 | Script                         | Purpose                                                                                   |
@@ -1072,7 +1136,7 @@ Authentication cannot be switched off. Workers and the scheduler do not authenti
 | `npm run format`               | Prettier write                                                                            |
 | `npm run format:check`         | Prettier check                                                                            |
 
-CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests, an API smoke test (bootstrap an admin key with the compiled CLI; public probes, `401` without a key, `201, 201, 429 + Retry-After` at burst 2), a metrics smoke test (API and worker `/metrics` listeners: `401` without the token, expected series with it, `404` on the API port) and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
+CI runs format check, lint, typecheck, build, migrations, worker (must subscribe to wake-ups) and scheduler SIGTERM smoke tests, an API smoke test (bootstrap an admin key with the compiled CLI; public probes, `401` without a key, `201, 201, 429 + Retry-After` at burst 2), a metrics smoke test (API and worker `/metrics` listeners: `401` without the token, expected series with it, `404` on the API port), a k6 load-test smoke run (`loadtest/smoke.js`: 5 VUs for 10 s against the compiled API and a worker, zero failures allowed) and tests on Node 20 against `postgres:16-alpine` and `redis:7-alpine` service containers (see `.github/workflows/ci.yml`).
 
 ## API
 
@@ -1620,11 +1684,12 @@ Liveness probe. Does **not** check Postgres or Redis.
 
 Readiness probe. Each check has a `READINESS_TIMEOUT_MS` budget; failure reasons are logged, not returned.
 
-| `status`    | HTTP  | When                                                                               |
-| ----------- | ----- | ---------------------------------------------------------------------------------- |
-| `ready`     | `200` | every check passes                                                                 |
-| `degraded`  | `200` | only optional checks fail (Redis): still serving, workers poll, stats are uncached |
-| `not_ready` | `503` | a required check fails (Postgres)                                                  |
+| `status`    | HTTP  | When                                                                                                             |
+| ----------- | ----- | ---------------------------------------------------------------------------------------------------------------- |
+| `ready`     | `200` | every check passes                                                                                               |
+| `degraded`  | `200` | only optional checks fail (Redis): still serving, workers poll, stats are uncached                               |
+| `not_ready` | `503` | a required check fails (Postgres)                                                                                |
+| `not_ready` | `503` | the API is shutting down (`"draining": true`, Milestone 8): load balancers stop routing before connections close |
 
 ```json
 {
@@ -1673,7 +1738,8 @@ Codes: `VALIDATION_ERROR` / `BAD_REQUEST` (400), `UNAUTHORIZED` (401, with `WWW-
 - **Dashboard API (M7)** queries are index-only range scans of `job_attempts_queue_finished_idx` bounded by the window, so their cost is proportional to the attempts of one queue in that window, not to table size; latency percentiles sort at most `DASHBOARD_LATENCY_MAX_SAMPLES` rows. Throughput over 7 days of a very busy queue is the most expensive call; at that volume, minute rollup tables maintained by the worker (or a materialized view refreshed per minute) would make every dashboard query O(buckets).
 - **Metrics (M7)**: a scrape is in-memory except `queue_depth`, which costs at most one grouped count per `METRICS_QUEUE_DEPTH_CACHE_MS` per API instance (scrapers beyond the first hit the cache). Series count is roughly (queues x statuses x histogram buckets) per process, capped by `METRICS_MAX_QUEUE_SERIES`; with 1000 queues the worker's histograms dominate (about 1000 x 2 histograms x 15 series), well within one Prometheus. Beyond that, drop the per-queue label on histograms or use recording rules.
 - **Tracing (M7)** adds two spans per enqueue and one per attempt, batched and exported off the hot path; at high volume set `OTEL_TRACES_SAMPLER_RATIO` (for example `0.05`) or tail-sample in an OTel collector. Writing `traceparent` is 55 bytes per job.
-- Capacity numbers and k6 results land in Milestone 8.
+- **Measured capacity (M8)**, one 8 vCPU / 16 GB VM with k6, Postgres 16 (stock config) and Redis on the same box ([details](docs/load-test-results.md)): one API process sustains **1,000 enqueues/s at p95 8.4 ms, p99 71 ms** using about 63% of a core and saturates at about **1,950/s** (one core, p95 179 ms, still 0 errors); Postgres used about 1.25 cores at 1,000 enqueues + completions per second and 2.6 at 2,000. Workers spend about **25 ms of queue overhead per job slot** (1 x 10 drained 435 no-op jobs/s, 4 x 10 1,814/s, 8 x 10 2,539/s, where the shared CPUs and Postgres became the limit). A finished job costs about **770 bytes** of table and index space.
+- **Capacity plan** (assumptions: 1,000 enqueues/s per API process as the planning figure, `1 / (handler time + 25 ms)` jobs/s per worker slot, peak = 5 x average). Example, 10M jobs/day with 200 ms handlers: peak 580 jobs/s -> **2 API replicas** (one is enough, two for availability), **131 worker slots** (14 workers x 10 or 4 x 40), about **160 Postgres connections** at default pool sizes (raise `max_connections` or add PgBouncer in transaction mode for the API and workers) and **about 7.7 GB/day** of storage, which makes retention of succeeded jobs the first operational job to build. As volume grows the limits arrive in this order: one API process (add replicas), Postgres write and WAL throughput (faster disks, `synchronous_commit` trade-offs, batching), then bloat of finished rows (retention, partitioning).
 
 ## License
 
