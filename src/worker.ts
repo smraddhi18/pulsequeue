@@ -1,5 +1,6 @@
 import { loadWorkerEnv } from './config/env.js';
 import { createLogger } from './lib/logger.js';
+import { installFatalHandlers } from './lib/process-handlers.js';
 import { registerBuiltinHandlers } from './worker/handlers/index.js';
 import { HandlerRegistry } from './worker/registry.js';
 import { createWorkerRuntime } from './worker/runtime.js';
@@ -18,6 +19,8 @@ const SHUTDOWN_GRACE_MS = 5_000;
 async function main(): Promise<void> {
   const env = loadWorkerEnv();
   const logger = createLogger(env);
+  // Milestone 8: log unhandled rejections / uncaught exceptions as fatal, exit 1.
+  installFatalHandlers(logger);
   const registry = registerBuiltinHandlers(new HandlerRegistry());
 
   const runtime = createWorkerRuntime(env, {

@@ -68,6 +68,8 @@ export interface AppObservability {
 declare module 'fastify' {
   interface FastifyInstance {
     observability: AppObservability;
+    /** Graceful shutdown step 1 (Milestone 8): /ready turns 503, traffic keeps being served. */
+    beginDraining(): void;
   }
 }
 
@@ -96,6 +98,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
             ...(options.logStream ? { stream: options.logStream } : {}),
           },
     trustProxy: true,
+    // Milestone 8: bound every request (slowloris -> 408) and keep idle
+    // keep-alive sockets open longer than the load balancer's idle timeout.
+    requestTimeout: env.HTTP_REQUEST_TIMEOUT_MS,
+    keepAliveTimeout: env.HTTP_KEEP_ALIVE_TIMEOUT_MS,
   });
 
   const ownsPool = options.pool === undefined;
@@ -210,6 +216,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     });
   }
   app.decorate('observability', { registry, metrics, metricsServer, tracing });
+  app.decorate('beginDraining', () => {
+    if (!healthService.isDraining) app.log.info({ event: 'shutdown.draining' }, 'Draining');
+    healthService.beginDraining();
+  });
 
   const statsService = new StatsService(
     new QueueStatsRepository(pool),
